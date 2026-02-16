@@ -79,8 +79,10 @@ chmod +x "$SKUA"
 INSTALL_DIR=""
 for candidate in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
     if echo "$PATH" | tr ':' '\n' | grep -qx "$candidate"; then
-        INSTALL_DIR="$candidate"
-        break
+        if [ -w "$candidate" ] || [ ! -e "$candidate" -a -w "$(dirname "$candidate")" ]; then
+            INSTALL_DIR="$candidate"
+            break
+        fi
     fi
 done
 
