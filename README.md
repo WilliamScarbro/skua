@@ -8,6 +8,20 @@ Dockerized Claude Code environment with multi-project support, persistent authen
 
 ## Quick Start
 
+### Option A: Install from .deb package
+
+Download the latest `.deb` from [GitHub Releases](https://github.com/WilliamScarbro/skua/releases) and install:
+
+```bash
+sudo dpkg -i skua_0.1.0_all.deb
+skua config --git-name "Your Name" --git-email "you@example.com"
+skua build
+```
+
+To uninstall: `sudo dpkg -r skua`
+
+### Option B: Install from source
+
 ```bash
 git clone https://github.com/WilliamScarbro/skua.git
 cd skua

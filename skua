@@ -13,6 +13,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def get_version():
+    """Read version from VERSION file next to this script or in /usr/lib/skua/."""
+    for base in (Path(__file__).resolve().parent, Path("/usr/lib/skua")):
+        version_file = base / "VERSION"
+        if version_file.is_file():
+            return version_file.read_text().strip()
+    return "unknown"
+
 # ── Constants ──────────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".config" / "skua"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -541,6 +550,8 @@ def main():
         prog="skua",
         description="Skua - Dockerized Claude Code Manager",
     )
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {get_version()}")
     sub = parser.add_subparsers(dest="command")
 
     # build

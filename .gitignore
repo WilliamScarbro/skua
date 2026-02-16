@@ -1,3 +1,5 @@
 # Build artifacts
 .build-context/
 __pycache__/
+*.deb
+deb-build/
