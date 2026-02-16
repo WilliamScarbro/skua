@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""cdev - Claude Dev Environment Manager
+
+A CLI tool for building, running, and managing Dockerized Claude Code
+development environments across multiple projects.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# ── Constants ──────────────────────────────────────────────────────────────
+CONFIG_DIR = Path.home() / ".config" / "cdev"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CLAUDE_DATA_DIR = CONFIG_DIR / "claude-data"
+DEFAULT_IMAGE = "cdev-base"
+
+
+# ── Config helpers ─────────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {"global": {}, "projects": {}}
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def get_tool_dir(config):
+    """Find the directory containing Dockerfile and entrypoint.sh."""
+    # 1. Explicit config
+    tool_dir = config.get("global", {}).get("tool_dir")
+    if tool_dir:
+        p = Path(tool_dir)
+        if (p / "Dockerfile").exists():
+            return p
+
+    # 2. Directory containing this script
+    script_dir = Path(__file__).resolve().parent
+    if (script_dir / "Dockerfile").exists():
+        return script_dir
+
+    print("Error: Cannot find Dockerfile. Set tool_dir with: cdev config --tool-dir PATH")
+    sys.exit(1)
+
+
+def detect_git_identity():
+    """Auto-detect git name/email from global git config."""
+    name = ""
+    email = ""
+    try:
+        name = subprocess.check_output(
+            ["git", "config", "--global", "user.name"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    try:
+        email = subprocess.check_output(
+            ["git", "config", "--global", "user.email"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return name, email
+
+
+def ensure_global_config(config):
+    """Ensure global config has git identity, prompting if needed."""
+    g = config.setdefault("global", {})
+    if g.get("git_name") and g.get("git_email"):
+        return config
+
+    print("Global configuration needed (one-time setup):\n")
+    default_name, default_email = detect_git_identity()
+
+    if not g.get("git_name"):
+        prompt = f"Git user name [{default_name}]: " if default_name else "Git user name: "
+        val = input(prompt).strip()
+        g["git_name"] = val or default_name
+
+    if not g.get("git_email"):
+        prompt = f"Git user email [{default_email}]: " if default_email else "Git user email: "
+        val = input(prompt).strip()
+        g["git_email"] = val or default_email
+
+    if not g["git_name"] or not g["git_email"]:
+        print("Error: Git name and email are required.")
+        sys.exit(1)
+
+    save_config(config)
+    print()
+    return config
+
+
+# ── Docker helpers ─────────────────────────────────────────────────────────
+
+def is_container_running(name):
+    result = subprocess.run(
+        ["docker", "ps", "-q", "--filter", f"name=^{name}$"],
+        capture_output=True, text=True
+    )
+    return bool(result.stdout.strip())
+
+
+def get_running_cdev_containers():
+    """Return list of running cdev container names."""
+    result = subprocess.run(
+        ["docker", "ps", "--filter", "name=^cdev-", "--format", "{{.Names}}"],
+        capture_output=True, text=True
+    )
+    if result.stdout.strip():
+        return result.stdout.strip().split("\n")
+    return []
+
+
+# ── Commands ───────────────────────────────────────────────────────────────
+
+def cmd_build(args):
+    config = load_config()
+    config = ensure_global_config(config)
+    tool_dir = get_tool_dir(config)
+    image_name = config.get("global", {}).get("image_name", DEFAULT_IMAGE)
+
+    print(f"Building Docker image '{image_name}'...")
+    print(f"  Dockerfile: {tool_dir / 'Dockerfile'}")
+    print()
+
+    build_path = tool_dir / ".build-context"
+    try:
+        if build_path.exists():
+            shutil.rmtree(build_path)
+        build_path.mkdir()
+
+        # Copy Dockerfile and entrypoint
+        shutil.copy2(tool_dir / "Dockerfile", build_path / "Dockerfile")
+        shutil.copy2(tool_dir / "entrypoint.sh", build_path / "entrypoint.sh")
+
+        # Copy Claude settings (no credentials)
+        settings_dir = build_path / "claude-settings"
+        settings_dir.mkdir()
+        claude_home = Path.home() / ".claude"
+        for fname in ("settings.json", "settings.local.json"):
+            src = claude_home / fname
+            if src.exists():
+                shutil.copy2(src, settings_dir / fname)
+
+        # Build
+        uid = os.getuid()
+        gid = os.getgid()
+        cmd = [
+            "docker", "build",
+            "--build-arg", f"USER_UID={uid}",
+            "--build-arg", f"USER_GID={gid}",
+            "-t", image_name,
+            str(build_path),
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print("\nBuild failed.")
+            sys.exit(1)
+
+    finally:
+        if build_path.exists():
+            shutil.rmtree(build_path, ignore_errors=True)
+
+    # Save tool_dir if not set
+    if not config.get("global", {}).get("tool_dir"):
+        config["global"]["tool_dir"] = str(tool_dir)
+        save_config(config)
+
+    print(f"\nBuild complete: {image_name}")
+    print("Run 'cdev add <name> --dir <path>' to add a project.")
+
+
+def cmd_add(args):
+    config = load_config()
+    config = ensure_global_config(config)
+    projects = config.setdefault("projects", {})
+    name = args.name
+
+    # Validate name
+    if not all(c.isalnum() or c in "-_" for c in name):
+        print("Error: Project name must be alphanumeric (hyphens and underscores allowed).")
+        sys.exit(1)
+
+    if name in projects:
+        print(f"Error: Project '{name}' already exists. Remove it first with 'cdev remove {name}'.")
+        sys.exit(1)
+
+    # Project directory
+    project_dir = args.dir
+    if not project_dir:
+        project_dir = input("Project directory path: ").strip()
+    if project_dir:
+        project_dir = str(Path(project_dir).expanduser().resolve())
+        if not Path(project_dir).is_dir():
+            print(f"Error: Directory does not exist: {project_dir}")
+            sys.exit(1)
+
+    # SSH key
+    ssh_key = args.ssh_key or ""
+    if not ssh_key and not args.no_prompt:
+        ssh_dir = Path.home() / ".ssh"
+        if ssh_dir.is_dir():
+            keys = [f for f in ssh_dir.iterdir()
+                    if f.is_file() and not f.name.endswith(".pub")
+                    and f.name not in ("known_hosts", "config", "authorized_keys")]
+            if keys:
+                print("\nAvailable SSH keys:")
+                for k in sorted(keys):
+                    print(f"  {k}")
+                print()
+        ssh_key = input("SSH private key path (leave empty to skip): ").strip()
+
+    if ssh_key:
+        ssh_key = str(Path(ssh_key).expanduser().resolve())
+        if not Path(ssh_key).is_file():
+            print(f"Warning: SSH key not found: {ssh_key}")
+
+    # Network and persist modes
+    network = args.network or "bridge"
+    persist = args.persist or "bind"
+
+    projects[name] = {
+        "dir": project_dir,
+        "ssh_key": ssh_key,
+        "network": network,
+        "persist": persist,
+    }
+    save_config(config)
+
+    # Create Claude data dir for bind persist
+    if persist == "bind":
+        data_dir = CLAUDE_DATA_DIR / name
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nProject '{name}' added.")
+    print(f"  Directory: {project_dir or '(none)'}")
+    print(f"  SSH key:   {ssh_key or '(none)'}")
+    print(f"  Network:   {network}")
+    print(f"  Persist:   {persist}")
+    print(f"\nRun with: cdev run {name}")
+
+
+def cmd_remove(args):
+    config = load_config()
+    projects = config.get("projects", {})
+    name = args.name
+
+    if name not in projects:
+        print(f"Error: Project '{name}' not found.")
+        sys.exit(1)
+
+    container_name = f"cdev-{name}"
+    if is_container_running(container_name):
+        print(f"Error: Container '{container_name}' is running. Stop it first.")
+        sys.exit(1)
+
+    project = projects[name]
+    del projects[name]
+    save_config(config)
+    print(f"Project '{name}' removed from config.")
+
+    # Offer to clean data
+    if project.get("persist") == "bind":
+        data_dir = CLAUDE_DATA_DIR / name
+        if data_dir.exists():
+            answer = input(f"Also remove Claude data at {data_dir}? [y/N]: ").strip().lower()
+            if answer == "y":
+                shutil.rmtree(data_dir)
+                print("  Claude data removed.")
+    elif project.get("persist") == "volume":
+        vol_name = f"cdev-{name}-claude"
+        answer = input(f"Also remove Docker volume '{vol_name}'? [y/N]: ").strip().lower()
+        if answer == "y":
+            subprocess.run(["docker", "volume", "rm", vol_name], capture_output=True)
+            print("  Docker volume removed.")
+
+
+def cmd_run(args):
+    config = load_config()
+    projects = config.get("projects", {})
+    name = args.name
+
+    if name not in projects:
+        print(f"Error: Project '{name}' not found. Add it with: cdev add {name}")
+        sys.exit(1)
+
+    project = projects[name]
+    image_name = config.get("global", {}).get("image_name", DEFAULT_IMAGE)
+    container_name = f"cdev-{name}"
+    git_name = config.get("global", {}).get("git_name", "")
+    git_email = config.get("global", {}).get("git_email", "")
+
+    # Check if already running
+    if is_container_running(container_name):
+        print(f"Container '{container_name}' is already running.")
+        answer = input("Attach to it? [Y/n]: ").strip().lower()
+        if answer != "n":
+            os.execvp("docker", ["docker", "exec", "-it", container_name, "/bin/bash"])
+        return
+
+    # Build docker run command
+    docker_cmd = [
+        "docker", "run", "-it", "--rm",
+        "--name", container_name,
+    ]
+
+    # Environment variables
+    docker_cmd.extend(["-e", f"GIT_AUTHOR_NAME={git_name}"])
+    docker_cmd.extend(["-e", f"GIT_AUTHOR_EMAIL={git_email}"])
+    docker_cmd.extend(["-e", f"GIT_COMMITTER_NAME={git_name}"])
+    docker_cmd.extend(["-e", f"GIT_COMMITTER_EMAIL={git_email}"])
+
+    # SSH key mounts
+    ssh_key = project.get("ssh_key", "")
+    if ssh_key and Path(ssh_key).is_file():
+        key_name = Path(ssh_key).name
+        docker_cmd.extend(["-v", f"{ssh_key}:/home/dev/.ssh-mount/{key_name}:ro"])
+        pub_key = f"{ssh_key}.pub"
+        if Path(pub_key).is_file():
+            docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+        known_hosts = Path(ssh_key).parent / "known_hosts"
+        if known_hosts.is_file():
+            docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
+
+    # Project directory mount
+    project_dir = project.get("dir", "")
+    if project_dir and Path(project_dir).is_dir():
+        docker_cmd.extend(["-v", f"{project_dir}:/home/dev/project"])
+
+    # Claude persistence mount
+    persist = project.get("persist", "bind")
+    if persist == "bind":
+        data_dir = CLAUDE_DATA_DIR / name
+        data_dir.mkdir(parents=True, exist_ok=True)
+        docker_cmd.extend(["-v", f"{data_dir}:/home/dev/.claude"])
+        # Seed .claude.json from host if credentials exist
+        claude_json_dest = data_dir / ".claude.json"
+        creds_file = data_dir / ".credentials.json"
+        host_claude_json = Path.home() / ".claude.json"
+        if not claude_json_dest.exists() and creds_file.exists() and host_claude_json.exists():
+            shutil.copy2(host_claude_json, claude_json_dest)
+            print("Seeded .claude.json from host.")
+    else:
+        vol_name = f"cdev-{name}-claude"
+        docker_cmd.extend(["-v", f"{vol_name}:/home/dev/.claude"])
+
+    # Network mode
+    network = project.get("network", "bridge")
+    if network == "host":
+        docker_cmd.append("--network=host")
+
+    docker_cmd.append(image_name)
+
+    # Print summary
+    print(f"Starting cdev-{name}...")
+    print(f"  Project:  {project_dir or '(none)'}")
+    print(f"  SSH key:  {Path(ssh_key).name if ssh_key else '(none)'}")
+    print(f"  Network:  {network}")
+    if persist == "bind":
+        print(f"  Claude:   {CLAUDE_DATA_DIR / name}")
+    else:
+        print(f"  Claude:   volume cdev-{name}-claude")
+    print()
+
+    # Exec into docker run (replaces this process)
+    os.execvp("docker", docker_cmd)
+
+
+def cmd_list(args):
+    config = load_config()
+    projects = config.get("projects", {})
+    running = get_running_cdev_containers()
+
+    if not projects:
+        print("No projects configured. Add one with: cdev add <name> --dir <path>")
+        return
+
+    # Header
+    print(f"{'NAME':<16} {'DIRECTORY':<40} {'NETWORK':<10} {'STATUS':<10}")
+    print("-" * 76)
+
+    for name, project in sorted(projects.items()):
+        container_name = f"cdev-{name}"
+        status = "running" if container_name in running else "stopped"
+        proj_dir = project.get("dir", "(none)")
+        # Shorten home paths
+        try:
+            proj_dir = str(Path(proj_dir).relative_to(Path.home()))
+            proj_dir = f"~/{proj_dir}"
+        except (ValueError, TypeError):
+            pass
+        network = project.get("network", "bridge")
+        print(f"{name:<16} {proj_dir:<40} {network:<10} {status:<10}")
+
+    print()
+    running_count = sum(1 for name in projects if f"cdev-{name}" in running)
+    print(f"{len(projects)} project(s), {running_count} running")
+
+
+def cmd_clean(args):
+    config = load_config()
+    projects = config.get("projects", {})
+    name = args.name
+
+    if name:
+        if name not in projects:
+            print(f"Error: Project '{name}' not found.")
+            sys.exit(1)
+        _clean_project(name, projects[name])
+    else:
+        if not projects:
+            print("No projects configured.")
+            return
+        answer = input("Clean Claude credentials for ALL projects? [y/N]: ").strip().lower()
+        if answer != "y":
+            return
+        for pname, project in projects.items():
+            _clean_project(pname, project)
+
+
+def _clean_project(name, project):
+    persist = project.get("persist", "bind")
+    if persist == "bind":
+        data_dir = CLAUDE_DATA_DIR / name
+        if data_dir.exists():
+            for fname in (".credentials.json", ".claude.json"):
+                f = data_dir / fname
+                if f.exists():
+                    f.unlink()
+            print(f"Cleaned credentials for '{name}'.")
+        else:
+            print(f"No data to clean for '{name}'.")
+    else:
+        vol_name = f"cdev-{name}-claude"
+        result = subprocess.run(
+            ["docker", "volume", "rm", vol_name],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            print(f"Removed volume '{vol_name}' for '{name}'.")
+        else:
+            print(f"Volume '{vol_name}' not found or in use.")
+
+
+def cmd_config(args):
+    config = load_config()
+    g = config.setdefault("global", {})
+    changed = False
+
+    if args.git_name:
+        g["git_name"] = args.git_name
+        changed = True
+    if args.git_email:
+        g["git_email"] = args.git_email
+        changed = True
+    if args.tool_dir:
+        p = Path(args.tool_dir).expanduser().resolve()
+        if not (p / "Dockerfile").exists():
+            print(f"Warning: No Dockerfile found in {p}")
+        g["tool_dir"] = str(p)
+        changed = True
+
+    if changed:
+        save_config(config)
+        print("Config updated.")
+
+    # Display current config
+    print(f"\nGlobal config ({CONFIG_FILE}):")
+    print(f"  git_name:   {g.get('git_name', '(not set)')}")
+    print(f"  git_email:  {g.get('git_email', '(not set)')}")
+    print(f"  tool_dir:   {g.get('tool_dir', '(auto-detect)')}")
+    print(f"  image_name: {g.get('image_name', DEFAULT_IMAGE)}")
+
+
+# ── CLI setup ──────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="cdev",
+        description="Claude Dev Environment Manager - manage Dockerized Claude Code environments",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # build
+    sub.add_parser("build", help="Build the base Docker image")
+
+    # add
+    p_add = sub.add_parser("add", help="Add a project configuration")
+    p_add.add_argument("name", help="Project name (alphanumeric, hyphens, underscores)")
+    p_add.add_argument("--dir", help="Project directory path")
+    p_add.add_argument("--ssh-key", help="SSH private key path")
+    p_add.add_argument("--network", choices=["bridge", "host"], default="bridge",
+                       help="Docker network mode (default: bridge)")
+    p_add.add_argument("--persist", choices=["bind", "volume"], default="bind",
+                       help="Claude data persistence mode (default: bind)")
+    p_add.add_argument("--no-prompt", action="store_true",
+                       help="Skip interactive prompts for missing values")
+
+    # remove
+    p_rm = sub.add_parser("remove", help="Remove a project configuration")
+    p_rm.add_argument("name", help="Project name to remove")
+
+    # run
+    p_run = sub.add_parser("run", help="Run a container for a project")
+    p_run.add_argument("name", help="Project name to run")
+
+    # list
+    sub.add_parser("list", help="List projects and running containers")
+
+    # clean
+    p_clean = sub.add_parser("clean", help="Clean Claude credentials")
+    p_clean.add_argument("name", nargs="?", help="Project name (omit for all)")
+
+    # config
+    p_cfg = sub.add_parser("config", help="Show or edit global configuration")
+    p_cfg.add_argument("--git-name", help="Set git user name")
+    p_cfg.add_argument("--git-email", help="Set git user email")
+    p_cfg.add_argument("--tool-dir", help="Set path to directory containing Dockerfile")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    commands = {
+        "build": cmd_build,
+        "add": cmd_add,
+        "remove": cmd_remove,
+        "run": cmd_run,
+        "list": cmd_list,
+        "clean": cmd_clean,
+        "config": cmd_config,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
