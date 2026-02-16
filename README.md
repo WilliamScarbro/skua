@@ -1,12 +1,12 @@
-# cdev — Claude Dev Environment Manager
+# Skua — Dockerized Claude Code Manager
 
 Dockerized Claude Code environment with multi-project support, persistent authentication, and host-mounted projects.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/WilliamScarbro/Claude_in_Docker.git
-cd Claude_in_Docker
+git clone https://github.com/WilliamScarbro/skua.git
+cd skua
 ./install.sh
 ```
 
@@ -14,20 +14,20 @@ The installer will:
 1. Check prerequisites (Docker, Python 3, git)
 2. Collect your git name and email
 3. Optionally configure an SSH key for git operations
-4. Install the `cdev` CLI to your PATH
+4. Install the `skua` CLI to your PATH
 5. Build the base Docker image
 
 Then add a project and start working:
 
 ```bash
-cdev add myapp --dir ~/projects/myapp
-cdev run myapp
+skua add myapp --dir ~/projects/myapp
+skua run myapp
 
 # On first run inside the container:
 claude login
 ```
 
-Subsequent `cdev run` invocations reuse saved credentials — no re-login needed.
+Subsequent `skua run` invocations reuse saved credentials — no re-login needed.
 
 ### Prerequisites
 
@@ -40,31 +40,31 @@ Subsequent `cdev run` invocations reuse saved credentials — no re-login needed
 If you prefer not to use the install script:
 
 ```bash
-ln -s /path/to/this/repo/cdev ~/.local/bin/cdev
-cdev config --git-name "Your Name" --git-email "you@example.com"
-cdev build
+ln -s /path/to/this/repo/skua ~/.local/bin/skua
+skua config --git-name "Your Name" --git-email "you@example.com"
+skua build
 ```
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `cdev build` | Build the base Docker image (`cdev-base`) |
-| `cdev add <name>` | Add a project configuration |
-| `cdev remove <name>` | Remove a project configuration |
-| `cdev run <name>` | Start a container for a project (or attach if already running) |
-| `cdev list` | List all projects and their running status |
-| `cdev clean [<name>]` | Remove saved Claude credentials for a project (or all) |
-| `cdev config` | Show or edit global configuration |
+| `skua build` | Build the base Docker image (`skua-base`) |
+| `skua add <name>` | Add a project configuration |
+| `skua remove <name>` | Remove a project configuration |
+| `skua run <name>` | Start a container for a project (or attach if already running) |
+| `skua list` | List all projects and their running status |
+| `skua clean [<name>]` | Remove saved Claude credentials for a project (or all) |
+| `skua config` | Show or edit global configuration |
 
 ## Adding Projects
 
 ```bash
 # Interactive (prompts for missing values)
-cdev add myapp --dir ~/projects/myapp
+skua add myapp --dir ~/projects/myapp
 
 # Fully specified (no prompts)
-cdev add myapp \
+skua add myapp \
   --dir ~/projects/myapp \
   --ssh-key ~/.ssh/id_ed25519 \
   --network host \
@@ -77,42 +77,42 @@ cdev add myapp \
 - **`--dir`** — Host directory bind-mounted to `/home/dev/project` (read-write)
 - **`--ssh-key`** — SSH private key mounted read-only for git operations
 - **`--network`** — `bridge` (default) or `host` (shares host network stack, may help with OAuth)
-- **`--persist`** — `bind` (default, stored at `~/.config/cdev/claude-data/<name>/`) or `volume` (Docker named volume)
+- **`--persist`** — `bind` (default, stored at `~/.config/skua/claude-data/<name>/`) or `volume` (Docker named volume)
 
 ## Multi-Project Workflow
 
-Each project gets its own container (`cdev-<name>`) and its own Claude credentials, so you can work on multiple projects simultaneously:
+Each project gets its own container (`skua-<name>`) and its own Claude credentials, so you can work on multiple projects simultaneously:
 
 ```bash
-cdev add frontend --dir ~/projects/frontend
-cdev add backend --dir ~/projects/backend --ssh-key ~/.ssh/id_ed25519
+skua add frontend --dir ~/projects/frontend
+skua add backend --dir ~/projects/backend --ssh-key ~/.ssh/id_ed25519
 
 # Run in separate terminals
-cdev run frontend
-cdev run backend
+skua run frontend
+skua run backend
 
 # See what's running
-cdev list
+skua list
 ```
 
 ## Configuration
 
-Global config is stored at `~/.config/cdev/config.json` and serves as the default for all projects.
+Global config is stored at `~/.config/skua/config.json` and serves as the default for all projects.
 
 ```bash
 # Set git identity
-cdev config --git-name "Your Name" --git-email "you@example.com"
+skua config --git-name "Your Name" --git-email "you@example.com"
 
 # Set global defaults (inherited by all projects)
-cdev config --ssh-key ~/.ssh/id_ed25519
-cdev config --network host
-cdev config --persist bind
+skua config --ssh-key ~/.ssh/id_ed25519
+skua config --network host
+skua config --persist bind
 
 # Set tool directory (auto-detected by default)
-cdev config --tool-dir /path/to/this/repo
+skua config --tool-dir /path/to/this/repo
 
 # View current config
-cdev config
+skua config
 ```
 
 ### Global Defaults
@@ -143,14 +143,14 @@ Project 'myapp' added.
 
 Claude Code credentials are stored per-project:
 
-- **Bind mode** (default): `~/.config/cdev/claude-data/<project>/`
-- **Volume mode**: Docker named volume `cdev-<project>-claude`
+- **Bind mode** (default): `~/.config/skua/claude-data/<project>/`
+- **Volume mode**: Docker named volume `skua-<project>-claude`
 
 To wipe credentials and force a fresh login:
 
 ```bash
-cdev clean myapp      # one project
-cdev clean            # all projects
+skua clean myapp      # one project
+skua clean            # all projects
 ```
 
 ## Container Commands

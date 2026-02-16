@@ -2,11 +2,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CDEV="$SCRIPT_DIR/cdev"
+SKUA="$SCRIPT_DIR/skua"
 
 echo "============================================"
-echo "  cdev installer"
-echo "  Claude Dev Environment Manager"
+echo "  skua installer"
+echo "  Dockerized Claude Code Manager"
 echo "============================================"
 echo ""
 
@@ -70,10 +70,10 @@ fi
 
 echo ""
 
-# ── Install cdev to PATH ─────────────────────────────────────────────
-echo "Installing cdev CLI..."
+# ── Install skua to PATH ─────────────────────────────────────────────
+echo "Installing skua CLI..."
 
-chmod +x "$CDEV"
+chmod +x "$SKUA"
 
 # Find a suitable bin directory that's already in PATH
 INSTALL_DIR=""
@@ -86,14 +86,14 @@ done
 
 if [ -n "$INSTALL_DIR" ]; then
     mkdir -p "$INSTALL_DIR"
-    ln -sf "$CDEV" "$INSTALL_DIR/cdev"
-    echo "[OK] Symlinked cdev -> $INSTALL_DIR/cdev"
+    ln -sf "$SKUA" "$INSTALL_DIR/skua"
+    echo "[OK] Symlinked skua -> $INSTALL_DIR/skua"
 else
     # None of the standard dirs are in PATH — use ~/.local/bin and warn
     INSTALL_DIR="$HOME/.local/bin"
     mkdir -p "$INSTALL_DIR"
-    ln -sf "$CDEV" "$INSTALL_DIR/cdev"
-    echo "[!!] Symlinked cdev -> $INSTALL_DIR/cdev"
+    ln -sf "$SKUA" "$INSTALL_DIR/skua"
+    echo "[!!] Symlinked skua -> $INSTALL_DIR/skua"
     echo ""
     echo "  WARNING: $INSTALL_DIR is not in your PATH."
     echo "  Add it by appending this to your shell profile:"
@@ -112,20 +112,20 @@ fi
 
 echo ""
 
-# ── Configure cdev ────────────────────────────────────────────────────
+# ── Configure skua ────────────────────────────────────────────────────
 echo "Saving configuration..."
 
 CONFIG_ARGS="--git-name \"$GIT_NAME\" --git-email \"$GIT_EMAIL\" --tool-dir \"$SCRIPT_DIR\""
 if [ -n "$SSH_KEY" ]; then
     CONFIG_ARGS="$CONFIG_ARGS --ssh-key \"$SSH_KEY\""
 fi
-eval python3 "$CDEV" config $CONFIG_ARGS
+eval python3 "$SKUA" config $CONFIG_ARGS
 echo ""
 
 # ── Build the Docker image ────────────────────────────────────────────
 echo "Building Docker image (this may take a few minutes)..."
 echo ""
-python3 "$CDEV" build
+python3 "$SKUA" build
 
 echo ""
 
@@ -138,11 +138,11 @@ echo ""
 echo "Next steps:"
 echo ""
 if [ -n "$SSH_KEY" ]; then
-    echo "  cdev add <project-name> --dir /path/to/project --ssh-key $SSH_KEY"
+    echo "  skua add <project-name> --dir /path/to/project --ssh-key $SSH_KEY"
 else
-    echo "  cdev add <project-name> --dir /path/to/project"
+    echo "  skua add <project-name> --dir /path/to/project"
 fi
-echo "  cdev run <project-name>"
+echo "  skua run <project-name>"
 echo ""
 echo "On first run inside the container:"
 echo "  claude login    (copy the URL into your host browser)"

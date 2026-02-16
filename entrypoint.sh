@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================"
-echo "  cdev — Claude Dev Environment"
+echo "  skua — Dockerized Claude Code"
 echo "============================================"
 echo ""
 

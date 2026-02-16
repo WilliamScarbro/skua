@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cdev - Claude Dev Environment Manager
+"""skua - Dockerized Claude Code Manager
 
 A CLI tool for building, running, and managing Dockerized Claude Code
 development environments across multiple projects.
@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────────────
-CONFIG_DIR = Path.home() / ".config" / "cdev"
+CONFIG_DIR = Path.home() / ".config" / "skua"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CLAUDE_DATA_DIR = CONFIG_DIR / "claude-data"
-DEFAULT_IMAGE = "cdev-base"
+DEFAULT_IMAGE = "skua-base"
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────
@@ -49,7 +49,7 @@ def get_tool_dir(config):
     if (script_dir / "Dockerfile").exists():
         return script_dir
 
-    print("Error: Cannot find Dockerfile. Set tool_dir with: cdev config --tool-dir PATH")
+    print("Error: Cannot find Dockerfile. Set tool_dir with: skua config --tool-dir PATH")
     sys.exit(1)
 
 
@@ -136,10 +136,10 @@ def is_container_running(name):
     return bool(result.stdout.strip())
 
 
-def get_running_cdev_containers():
-    """Return list of running cdev container names."""
+def get_running_skua_containers():
+    """Return list of running skua container names."""
     result = subprocess.run(
-        ["docker", "ps", "--filter", "name=^cdev-", "--format", "{{.Names}}"],
+        ["docker", "ps", "--filter", "name=^skua-", "--format", "{{.Names}}"],
         capture_output=True, text=True
     )
     if result.stdout.strip():
@@ -203,7 +203,7 @@ def cmd_build(args):
         save_config(config)
 
     print(f"\nBuild complete: {image_name}")
-    print("Run 'cdev add <name> --dir <path>' to add a project.")
+    print("Run 'skua add <name> --dir <path>' to add a project.")
 
 
 def cmd_add(args):
@@ -218,7 +218,7 @@ def cmd_add(args):
         sys.exit(1)
 
     if name in projects:
-        print(f"Error: Project '{name}' already exists. Remove it first with 'cdev remove {name}'.")
+        print(f"Error: Project '{name}' already exists. Remove it first with 'skua remove {name}'.")
         sys.exit(1)
 
     # Project directory
@@ -283,7 +283,7 @@ def cmd_add(args):
     print(_show("ssh_key", resolved["ssh_key"], "SSH key:"))
     print(_show("network", resolved["network"], "Network:"))
     print(_show("persist", resolved["persist"], "Persist:"))
-    print(f"\nRun with: cdev run {name}")
+    print(f"\nRun with: skua run {name}")
 
 
 def cmd_remove(args):
@@ -295,7 +295,7 @@ def cmd_remove(args):
         print(f"Error: Project '{name}' not found.")
         sys.exit(1)
 
-    container_name = f"cdev-{name}"
+    container_name = f"skua-{name}"
     if is_container_running(container_name):
         print(f"Error: Container '{container_name}' is running. Stop it first.")
         sys.exit(1)
@@ -314,7 +314,7 @@ def cmd_remove(args):
                 shutil.rmtree(data_dir)
                 print("  Claude data removed.")
     elif resolved["persist"] == "volume":
-        vol_name = f"cdev-{name}-claude"
+        vol_name = f"skua-{name}-claude"
         answer = input(f"Also remove Docker volume '{vol_name}'? [y/N]: ").strip().lower()
         if answer == "y":
             subprocess.run(["docker", "volume", "rm", vol_name], capture_output=True)
@@ -327,12 +327,12 @@ def cmd_run(args):
     name = args.name
 
     if name not in projects:
-        print(f"Error: Project '{name}' not found. Add it with: cdev add {name}")
+        print(f"Error: Project '{name}' not found. Add it with: skua add {name}")
         sys.exit(1)
 
     project = resolve_project(config, projects[name])
     image_name = config.get("global", {}).get("image_name", DEFAULT_IMAGE)
-    container_name = f"cdev-{name}"
+    container_name = f"skua-{name}"
     git_name = config.get("global", {}).get("git_name", "")
     git_email = config.get("global", {}).get("git_email", "")
 
@@ -387,7 +387,7 @@ def cmd_run(args):
             shutil.copy2(host_claude_json, claude_json_dest)
             print("Seeded .claude.json from host.")
     else:
-        vol_name = f"cdev-{name}-claude"
+        vol_name = f"skua-{name}-claude"
         docker_cmd.extend(["-v", f"{vol_name}:/home/dev/.claude"])
 
     # Network mode
@@ -398,14 +398,14 @@ def cmd_run(args):
     docker_cmd.append(image_name)
 
     # Print summary
-    print(f"Starting cdev-{name}...")
+    print(f"Starting skua-{name}...")
     print(f"  Project:  {project_dir or '(none)'}")
     print(f"  SSH key:  {Path(ssh_key).name if ssh_key else '(none)'}")
     print(f"  Network:  {network}")
     if persist == "bind":
         print(f"  Claude:   {CLAUDE_DATA_DIR / name}")
     else:
-        print(f"  Claude:   volume cdev-{name}-claude")
+        print(f"  Claude:   volume skua-{name}-claude")
     print()
 
     # Exec into docker run (replaces this process)
@@ -415,10 +415,10 @@ def cmd_run(args):
 def cmd_list(args):
     config = load_config()
     projects = config.get("projects", {})
-    running = get_running_cdev_containers()
+    running = get_running_skua_containers()
 
     if not projects:
-        print("No projects configured. Add one with: cdev add <name> --dir <path>")
+        print("No projects configured. Add one with: skua add <name> --dir <path>")
         return
 
     # Header
@@ -427,7 +427,7 @@ def cmd_list(args):
 
     for name, project in sorted(projects.items()):
         resolved = resolve_project(config, project)
-        container_name = f"cdev-{name}"
+        container_name = f"skua-{name}"
         status = "running" if container_name in running else "stopped"
         proj_dir = resolved.get("dir", "(none)")
         # Shorten home paths
@@ -440,7 +440,7 @@ def cmd_list(args):
         print(f"{name:<16} {proj_dir:<40} {network:<10} {status:<10}")
 
     print()
-    running_count = sum(1 for name in projects if f"cdev-{name}" in running)
+    running_count = sum(1 for name in projects if f"skua-{name}" in running)
     print(f"{len(projects)} project(s), {running_count} running")
 
 
@@ -478,7 +478,7 @@ def _clean_project(name, project):
         else:
             print(f"No data to clean for '{name}'.")
     else:
-        vol_name = f"cdev-{name}-claude"
+        vol_name = f"skua-{name}-claude"
         result = subprocess.run(
             ["docker", "volume", "rm", vol_name],
             capture_output=True, text=True
@@ -538,8 +538,8 @@ def cmd_config(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="cdev",
-        description="Claude Dev Environment Manager - manage Dockerized Claude Code environments",
+        prog="skua",
+        description="Skua - Dockerized Claude Code Manager",
     )
     sub = parser.add_subparsers(dest="command")
 
