@@ -1,71 +1,116 @@
-# AI Dev Container
+# cdev — Claude Dev Environment Manager
 
-Dockerized Claude Code environment with persistent authentication and host-mounted projects.
+Dockerized Claude Code environment with multi-project support, persistent authentication, and host-mounted projects.
 
 ## Quick Start
 
 ```bash
-# 1. Build the image (interactive prompts for config)
-./build.sh
+# 1. Set up git identity
+cdev config --git-name "Your Name" --git-email "you@example.com"
 
-# 2. Run the container
-./run.sh
+# 2. Build the base image
+cdev build
 
-# 3. On first run, log in inside the container
+# 3. Add a project
+cdev add myapp --dir ~/projects/myapp
+
+# 4. Run it
+cdev run myapp
+
+# 5. On first run, log in inside the container
 claude login
 # Copy the URL into your host browser to complete OAuth
-
-# 4. Use Claude Code
-claude
 ```
 
-Subsequent `./run.sh` invocations will reuse the saved credentials — no re-login needed.
+Subsequent `cdev run` invocations reuse saved credentials — no re-login needed.
 
-## Scripts
+## Installation
 
-| Script | Purpose |
-|----------|---------|
-| `build.sh` | Build the Docker image and configure runtime settings |
-| `run.sh [project-dir]` | Start the container with configured mounts |
-| `clean.sh` | Remove saved Claude credentials for a fresh start |
+Symlink `cdev` into your PATH:
+
+```bash
+ln -s /path/to/this/repo/cdev ~/.local/bin/cdev
+```
+
+No dependencies beyond Python 3 (stdlib only).
+
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `cdev build` | Build the base Docker image (`cdev-base`) |
+| `cdev add <name>` | Add a project configuration |
+| `cdev remove <name>` | Remove a project configuration |
+| `cdev run <name>` | Start a container for a project (or attach if already running) |
+| `cdev list` | List all projects and their running status |
+| `cdev clean [<name>]` | Remove saved Claude credentials for a project (or all) |
+| `cdev config` | Show or edit global configuration |
+
+## Adding Projects
+
+```bash
+# Interactive (prompts for missing values)
+cdev add myapp --dir ~/projects/myapp
+
+# Fully specified (no prompts)
+cdev add myapp \
+  --dir ~/projects/myapp \
+  --ssh-key ~/.ssh/id_ed25519 \
+  --network host \
+  --persist bind \
+  --no-prompt
+```
+
+### Options
+
+- **`--dir`** — Host directory bind-mounted to `/home/dev/project` (read-write)
+- **`--ssh-key`** — SSH private key mounted read-only for git operations
+- **`--network`** — `bridge` (default) or `host` (shares host network stack, may help with OAuth)
+- **`--persist`** — `bind` (default, stored at `~/.config/cdev/claude-data/<name>/`) or `volume` (Docker named volume)
+
+## Multi-Project Workflow
+
+Each project gets its own container (`cdev-<name>`) and its own Claude credentials, so you can work on multiple projects simultaneously:
+
+```bash
+cdev add frontend --dir ~/projects/frontend
+cdev add backend --dir ~/projects/backend --ssh-key ~/.ssh/id_ed25519
+
+# Run in separate terminals
+cdev run frontend
+cdev run backend
+
+# See what's running
+cdev list
+```
 
 ## Configuration
 
-`build.sh` prompts for the following and saves them to `.runtime/` (gitignored):
-
-- **SSH key** — Mounted read-only into the container for git operations
-- **Git identity** — Name and email passed via environment variables
-- **Project directory** — Host directory bind-mounted to `/home/dev/project` (read-write)
-- **Persistence mode** — How Claude auth/config is stored between runs:
-  - **Mode 1 (default):** Host bind mount at `~/.claude-docker` — files are visible and inspectable on the host
-  - **Mode 2:** Docker named volume (`ai-dev-claude`) — managed by Docker, less visible
-- **Network mode** — Container networking:
-  - **Mode 1 (default):** Bridge — standard Docker networking
-  - **Mode 2:** Host — shares host network stack (may help with OAuth callbacks on some setups)
-
-## Project Mount
-
-The project directory is bind-mounted read-write, so changes made inside the container are immediately visible on the host and vice versa. No need to use git to sync.
-
-You can override the project directory at runtime:
+Global config is stored at `~/.config/cdev/config.json`:
 
 ```bash
-./run.sh /path/to/other/project
+# Set git identity
+cdev config --git-name "Your Name" --git-email "you@example.com"
+
+# Set tool directory (auto-detected by default)
+cdev config --tool-dir /path/to/this/repo
+
+# View current config
+cdev config
 ```
 
 ## Auth Persistence
 
-Claude Code requires two files for authentication:
+Claude Code credentials are stored per-project:
 
-- `~/.claude/.credentials.json` — OAuth tokens (access + refresh)
-- `~/.claude.json` — Account metadata (onboarding state, account info)
-
-Both are stored inside the persistent mount (`~/.claude-docker/` or the named volume). The entrypoint symlinks `~/.claude.json` into the volume so writes are captured across container restarts.
+- **Bind mode** (default): `~/.config/cdev/claude-data/<project>/`
+- **Volume mode**: Docker named volume `cdev-<project>-claude`
 
 To wipe credentials and force a fresh login:
 
 ```bash
-./clean.sh
+cdev clean myapp      # one project
+cdev clean            # all projects
 ```
 
 ## Container Commands
@@ -77,7 +122,8 @@ To wipe credentials and force a fresh login:
 
 ## Architecture
 
-- **Base image:** `debian:bookworm-slim`
+- **Base image:** `debian:bookworm-slim` — one shared image for all projects
 - **Claude install:** Native installer (`~/.local/bin/claude`)
 - **User:** `dev` (UID/GID matched to host to avoid permission issues)
-- **No secrets in the image** — credentials are only in the runtime mount, never baked in
+- **No secrets in the image** — credentials live only in runtime mounts
+- **Project isolation** — each project has its own container name, credentials, and mount

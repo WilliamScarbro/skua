@@ -2,8 +2,7 @@
 set -e
 
 echo "============================================"
-echo "  AI Dev Environment"
-echo "  Claude Code"
+echo "  cdev — Claude Dev Environment"
 echo "============================================"
 echo ""
 
