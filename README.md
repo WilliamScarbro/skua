@@ -97,17 +97,46 @@ cdev list
 
 ## Configuration
 
-Global config is stored at `~/.config/cdev/config.json`:
+Global config is stored at `~/.config/cdev/config.json` and serves as the default for all projects.
 
 ```bash
 # Set git identity
 cdev config --git-name "Your Name" --git-email "you@example.com"
+
+# Set global defaults (inherited by all projects)
+cdev config --ssh-key ~/.ssh/id_ed25519
+cdev config --network host
+cdev config --persist bind
 
 # Set tool directory (auto-detected by default)
 cdev config --tool-dir /path/to/this/repo
 
 # View current config
 cdev config
+```
+
+### Global Defaults
+
+The following settings can be configured globally and are inherited by all projects unless overridden:
+
+| Setting | Flag | Default | Description |
+|---------|------|---------|-------------|
+| SSH key | `--ssh-key` | (none) | Default SSH private key for git operations |
+| Network | `--network` | `bridge` | Docker network mode (`bridge` or `host`) |
+| Persist | `--persist` | `bind` | Claude credential storage (`bind` or `volume`) |
+
+When adding a project, only explicitly provided values are stored. Missing values fall through the resolution chain:
+
+**project local** → **global config** → **hardcoded default**
+
+The `add` command shows where each resolved value comes from:
+
+```
+Project 'myapp' added.
+  Directory:   ~/projects/myapp
+  SSH key:     ~/.ssh/id_ed25519 (global)
+  Network:     bridge (local)
+  Persist:     bind (default)
 ```
 
 ## Auth Persistence
