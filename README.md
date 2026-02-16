@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="skua_with_lobster.png" alt="Skua logo" width="300">
+</p>
+
 # Skua — Dockerized Claude Code Manager
 
 Dockerized Claude Code environment with multi-project support, persistent authentication, and host-mounted projects.
