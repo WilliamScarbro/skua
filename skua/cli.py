@@ -9,7 +9,7 @@ from skua import __version__
 def main():
     parser = argparse.ArgumentParser(
         prog="skua",
-        description="Skua - Dockerized Claude Code Manager",
+        description="Skua - Dockerized Coding Agent Manager",
     )
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
@@ -21,7 +21,7 @@ def main():
                         help="Re-initialize even if already configured")
 
     # build
-    sub.add_parser("build", help="Build the base Docker image")
+    sub.add_parser("build", help="Build images required by configured projects")
 
     # add
     p_add = sub.add_parser("add", help="Add a project configuration")
@@ -49,8 +49,12 @@ def main():
     sub.add_parser("list", help="List projects and running containers")
 
     # clean
-    p_clean = sub.add_parser("clean", help="Clean Claude credentials")
+    p_clean = sub.add_parser("clean", help="Clean persisted agent credentials")
     p_clean.add_argument("name", nargs="?", help="Project name (omit for all)")
+
+    # purge
+    p_purge = sub.add_parser("purge", help="Remove all skua local state")
+    p_purge.add_argument("--yes", action="store_true", help="Skip confirmation prompts")
 
     # config
     p_cfg = sub.add_parser("config", help="Show or edit global configuration")
@@ -79,7 +83,7 @@ def main():
     # Lazy import commands to keep startup fast
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run,
-        cmd_list, cmd_clean, cmd_config, cmd_validate,
+        cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe,
     )
 
@@ -91,6 +95,7 @@ def main():
         "run": cmd_run,
         "list": cmd_list,
         "clean": cmd_clean,
+        "purge": cmd_purge,
         "config": cmd_config,
         "validate": cmd_validate,
         "describe": cmd_describe,
