@@ -35,6 +35,10 @@ skua build
 # Add a project
 skua add myapp --dir ~/projects/myapp --agent codex
 
+# Optional: ask codex/claude to update .skua/image-request.yaml,
+# then apply project-specific image config
+skua prep myapp
+
 # Launch the container
 skua run myapp
 

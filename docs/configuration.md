@@ -312,9 +312,15 @@ spec:
 
   # Project-specific image extensions
   image:
+    # Optional: switch generated Dockerfile base image
+    baseImage: debian:bookworm-slim
+    # Optional: adapt an existing working image as FROM
+    fromImage: ""
     extraPackages: [nodejs, npm]
     extraCommands:
       - "npm install -g typescript"
+    # Auto-incremented by `skua prep` when request changes are applied
+    version: 1
 
   # Git identity (inherits from global if not set)
   git:
@@ -325,6 +331,12 @@ spec:
   ssh:
     privateKey: ~/.ssh/id_ed25519
 ```
+
+Image prep workflow:
+
+1. Ask your agent to update `.skua/image-request.yaml`
+2. Run `skua prep <project>`
+3. Run `skua run <project>`
 
 ---
 

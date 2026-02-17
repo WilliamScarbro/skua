@@ -21,7 +21,7 @@ skua init --force   # re-initialize (overwrites global config)
 
 ### `skua build`
 
-Build agent Docker images required by currently configured projects. Skua tags each image as `<imageName>-<agent>` (for example `skua-base-codex` and `skua-base-claude`). By default, Codex uses a lightweight Debian-based image and installs only Codex CLI dependencies.
+Build Docker images required by currently configured projects. For default projects, Skua tags images as `<imageName>-<agent>` (for example `skua-base-codex`). Projects with image customizations use project-scoped tags (`...-<project>-vN`).
 
 ```bash
 skua build
@@ -32,6 +32,21 @@ The image name, base image, and extra packages are configured in global config:
 ```bash
 skua config --tool-dir /path/to/skua
 ```
+
+### `skua prep <name>`
+
+Apply a project image request template (`.skua/image-request.yaml`) into project config, and optionally build the resulting image.
+
+```bash
+skua prep myapp                    # apply template request
+skua prep myapp --build            # apply + build now
+skua prep myapp --from-image ghcr.io/acme/app:dev
+skua prep myapp --base-image debian:bookworm-slim --package libpq-dev
+skua prep myapp --command "npm ci" --command "npm run build"
+skua prep myapp --clear            # remove project-specific image customization
+```
+
+This workflow lets the agent suggest image changes through a template instead of writing a Dockerfile directly.
 
 ### `skua add <name>`
 
@@ -71,6 +86,7 @@ skua remove myapp
 Start a container for a project. Validates configuration before launching. If the container is already running, offers to attach to it.
 
 For bind persistence, Skua auto-seeds missing agent auth files from host home into the project's persisted auth directory on first run (for example Codex `~/.codex/auth.json`).
+For image adaptation, run `skua prep <name>` after the agent updates `.skua/image-request.yaml`.
 
 ```bash
 skua run myapp

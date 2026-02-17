@@ -14,10 +14,11 @@ from skua.docker import (
     build_run_command,
     build_image,
     image_exists,
-    image_name_for_agent,
-    base_image_for_agent,
+    image_name_for_project,
+    resolve_project_image_inputs,
     run_container,
 )
+from skua.project_prep import ensure_prep_workspace
 
 
 def _seed_auth_from_host(data_dir: Path, auth_dir: str, auth_files: list) -> int:
@@ -120,10 +121,13 @@ def cmd_run(args):
             print(f"Using existing clone at {clone_dir}")
         project.directory = str(clone_dir)
 
+    if project.directory and Path(project.directory).is_dir():
+        ensure_prep_workspace(Path(project.directory), project.name, project.agent)
+
     # Determine image name
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
-    image_name = image_name_for_agent(image_name_base, project.agent)
+    image_name = image_name_for_project(image_name_base, project)
     if not image_exists(image_name):
         print(f"Image '{image_name}' not found for agent '{project.agent}'.")
         print("Building image lazily...")
@@ -138,16 +142,22 @@ def cmd_run(args):
         build_security_name = defaults.get("security", "open")
         build_security = store.load_security(build_security_name) or sec
         image_config = g.get("image", {})
-        extra_packages = image_config.get("extraPackages", [])
-        extra_commands = image_config.get("extraCommands", [])
-        agent_base_image = base_image_for_agent(base_image, agent)
+        global_extra_packages = image_config.get("extraPackages", [])
+        global_extra_commands = image_config.get("extraCommands", [])
+        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+            default_base_image=base_image,
+            agent=agent,
+            project=project,
+            global_extra_packages=global_extra_packages,
+            global_extra_commands=global_extra_commands,
+        )
 
         success = build_image(
             container_dir=container_dir,
             image_name=image_name,
             security=build_security,
             agent=agent,
-            base_image=agent_base_image,
+            base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
         )

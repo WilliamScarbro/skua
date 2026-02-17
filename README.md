@@ -29,13 +29,28 @@ Or use a GitHub repo URL:
 skua add myapp --repo git@github.com:your-org/myapp.git
 ```
 
-### 3. Run the project container
+### 3. (Optional) Prepare a project-specific image
+Each project gets a `.skua/` prep guide and image request template:
+
+- `.skua/PREP.md`
+- `.skua/image-request.yaml`
+
+Workflow:
+
+1. Ask your agent to inspect the project and update `.skua/image-request.yaml`
+2. Apply it:
+
+```bash
+skua prep myapp
+```
+
+### 4. Run the project container
 
 ```bash
 skua run myapp
 ```
 
-### 4. Start Claude in the container
+### 5. Start Claude in the container
 Inside the container shell:
 
 ```bash
@@ -50,19 +65,19 @@ claude login
 
 Credentials are persisted, so later runs usually do not require login again.
 
-### 5. Detach from the running container
+### 6. Detach from the running container
 Keep the container running and detach your terminal:
 
 - Press `Ctrl-p`, then `Ctrl-q`
 
-### 6. Reattach later
+### 7. Reattach later
 Run the same command again and accept the attach prompt:
 
 ```bash
 skua run myapp
 ```
 
-### 7. Stop the container when done
+### 8. Stop the container when done
 If attached, run `exit`.  
 If detached, stop it from the host:
 
@@ -107,6 +122,7 @@ skua build
 | `skua init` | First-time setup wizard |
 | `skua build` | Build images required by configured projects |
 | `skua add <name>` | Add a project (`--dir` or `--repo`) |
+| `skua prep <name>` | Apply `.skua/image-request.yaml` to project image config |
 | `skua run <name>` | Start a container (or attach if already running) |
 | `skua list` | List projects and running status |
 | `skua config` | Show or edit global configuration |

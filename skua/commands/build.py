@@ -3,17 +3,22 @@
 import sys
 
 from skua.config import ConfigStore
-from skua.docker import build_image, image_exists, image_name_for_agent, base_image_for_agent
+from skua.docker import (
+    build_image,
+    image_exists,
+    image_name_for_project,
+    resolve_project_image_inputs,
+)
 
 
-def _required_project_agents(store: ConfigStore) -> list:
-    """Return sorted unique agent names required by configured projects."""
-    required = set()
+def _required_projects(store: ConfigStore) -> list:
+    """Return all resolvable projects in stable name order."""
+    required = []
     for name in store.list_resources("Project"):
         project = store.resolve_project(name)
-        if project and project.agent:
-            required.add(project.agent)
-    return sorted(required)
+        if project:
+            required.append(project)
+    return required
 
 
 def cmd_build(args):
@@ -38,61 +43,74 @@ def cmd_build(args):
     defaults = g.get("defaults", {})
     security_name = defaults.get("security", "open")
     security = store.load_security(security_name)
-    required_agent_names = _required_project_agents(store)
-    if not required_agent_names:
+    required_projects = _required_projects(store)
+    if not required_projects:
         print("No projects configured, so no agent images are required.")
         print("Add a project with 'skua add <name> --dir <path>' or --repo first.")
         return
 
-    agents = []
-    missing_agents = []
-    for name in required_agent_names:
-        agent = store.load_agent(name)
+    missing_agents = set()
+    project_specs = []
+    for project in required_projects:
+        agent = store.load_agent(project.agent)
         if agent is None:
-            missing_agents.append(name)
-        else:
-            agents.append(agent)
+            missing_agents.add(project.agent)
+            continue
+        project_specs.append((project, agent))
 
     if missing_agents:
         print("Error: missing agent configs referenced by projects:")
-        for name in missing_agents:
+        for name in sorted(missing_agents):
             print(f"  - {name}")
         print("Run 'skua init' to install default presets, or fix project configs.")
         sys.exit(1)
 
     # Collect extra packages/commands from global config
     image_config = g.get("image", {})
-    extra_packages = image_config.get("extraPackages", [])
-    extra_commands = image_config.get("extraCommands", [])
+    global_packages = image_config.get("extraPackages", [])
+    global_commands = image_config.get("extraCommands", [])
 
     print("Building Docker images...")
     print(f"  Base image:  {base_image}")
     print(f"  Image base:  {image_name_base}")
     print(f"  Security:    {security_name}")
-    print(f"  Agents:      {', '.join(a.name for a in agents)}")
-    if extra_packages:
-        print(f"  Extra pkgs:  {', '.join(extra_packages)}")
+    print(f"  Projects:    {len(project_specs)}")
+    if global_packages:
+        print(f"  Global pkgs: {', '.join(global_packages)}")
     print(f"  Source:      {container_dir}")
     print()
 
     built = []
     existing = []
     failed = []
-    for agent in agents:
-        image_name = image_name_for_agent(image_name_base, agent.name)
-        agent_base_image = base_image_for_agent(base_image, agent)
+    seen_images = set()
+    for project, agent in project_specs:
+        image_name = image_name_for_project(image_name_base, project)
+        if image_name in seen_images:
+            continue
+        seen_images.add(image_name)
+        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+            default_base_image=base_image,
+            agent=agent,
+            project=project,
+            global_extra_packages=global_packages,
+            global_extra_commands=global_commands,
+        )
         if image_exists(image_name):
-            print(f"-> Using existing image '{image_name}'")
+            print(f"-> Using existing image '{image_name}' (project: {project.name})")
             existing.append(image_name)
             continue
 
-        print(f"-> Image '{image_name}' missing; building for agent '{agent.name}' from '{agent_base_image}'...")
+        print(
+            f"-> Image '{image_name}' missing; building for project "
+            f"'{project.name}' (agent '{agent.name}') from '{resolved_base_image}'..."
+        )
         success = build_image(
             container_dir=container_dir,
             image_name=image_name,
             security=security,
             agent=agent,
-            base_image=agent_base_image,
+            base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
         )
@@ -112,4 +130,4 @@ def cmd_build(args):
         print(f"  - {name} (existing)")
     for name in built:
         print(f"  - {name} (built)")
-    print("Run 'skua add <name> --dir <path>' to add a project.")
+    print("Use 'skua prep <name>' to apply project image-request updates before running.")

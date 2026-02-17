@@ -231,8 +231,11 @@ class ProjectSshSpec:
 
 @dataclass
 class ProjectImageSpec:
+    base_image: str = ""
+    from_image: str = ""
     extra_packages: list = field(default_factory=list)
     extra_commands: list = field(default_factory=list)
+    version: int = 0
 
 
 @dataclass

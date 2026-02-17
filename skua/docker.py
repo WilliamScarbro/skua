@@ -62,6 +62,18 @@ def image_name_for_agent(base_image_name: str, agent_name: str) -> str:
     return f"{repo}{suffix}{tag}"
 
 
+def _split_image_ref_tag(image_ref: str) -> tuple:
+    """Split an image reference into (repository, optional_tag_with_colon)."""
+    ref = (image_ref or "").strip()
+    if not ref:
+        return "skua-base", ""
+    slash_idx = ref.rfind("/")
+    colon_idx = ref.rfind(":")
+    if colon_idx > slash_idx:
+        return ref[:colon_idx], ref[colon_idx:]
+    return ref, ""
+
+
 def image_exists(name: str) -> bool:
     """Check if a Docker image exists locally."""
     try:
@@ -72,6 +84,72 @@ def image_exists(name: str) -> bool:
         return result.returncode == 0
     except FileNotFoundError:
         return False
+
+
+def project_has_image_customizations(project: Project) -> bool:
+    """Return True if project image config overrides agent/global defaults."""
+    if not project or not getattr(project, "image", None):
+        return False
+    img = project.image
+    return bool(
+        str(getattr(img, "base_image", "") or "").strip()
+        or str(getattr(img, "from_image", "") or "").strip()
+        or list(getattr(img, "extra_packages", []) or [])
+        or list(getattr(img, "extra_commands", []) or [])
+    )
+
+
+def image_name_for_project(base_image_name: str, project: Project) -> str:
+    """Return the image tag to use for a specific project."""
+    agent_name = (project.agent or "claude") if project else "claude"
+    agent_image = image_name_for_agent(base_image_name, agent_name)
+    if not project_has_image_customizations(project):
+        return agent_image
+
+    repo, tag = _split_image_ref_tag(agent_image)
+    project_part = _sanitize_mount_name(project.name or "project")
+    version = int(getattr(project.image, "version", 0) or 0)
+    if version < 1:
+        version = 1
+    return f"{repo}-{project_part}-v{version}{tag}"
+
+
+def _merge_unique(items: list) -> list:
+    """Return unique non-empty strings in order."""
+    out = []
+    seen = set()
+    for item in items or []:
+        value = str(item).strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def resolve_project_image_inputs(
+    default_base_image: str,
+    agent: AgentConfig,
+    project: Project,
+    global_extra_packages: list = None,
+    global_extra_commands: list = None,
+) -> tuple:
+    """Resolve base image and build extras for a project image build."""
+    agent_default_base = base_image_for_agent(default_base_image, agent)
+    project_base_image = ""
+    project_from_image = ""
+    project_packages = []
+    project_commands = []
+
+    if project and getattr(project, "image", None):
+        project_base_image = str(getattr(project.image, "base_image", "") or "").strip()
+        project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+        project_packages = list(getattr(project.image, "extra_packages", []) or [])
+        project_commands = list(getattr(project.image, "extra_commands", []) or [])
+
+    resolved_base_image = project_from_image or project_base_image or agent_default_base
+    extra_packages = _merge_unique(list(global_extra_packages or []) + project_packages)
+    extra_commands = _merge_unique(list(global_extra_commands or []) + project_commands)
+    return resolved_base_image, extra_packages, extra_commands
 
 
 def _sanitize_mount_name(name: str) -> str:
@@ -427,6 +505,8 @@ def build_run_command(
     if project.directory and Path(project.directory).is_dir():
         docker_cmd.extend(["-v", f"{project.directory}:{project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_DIR={project_mount_path}"])
+    docker_cmd.extend(["-e", f"SKUA_IMAGE_REQUEST_FILE={project_mount_path}/.skua/image-request.yaml"])
+    docker_cmd.extend(["-e", f"SKUA_PREP_GUIDE_FILE={project_mount_path}/.skua/PREP.md"])
 
     # Persistence mount
     auth_dir = ".claude"

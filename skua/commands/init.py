@@ -85,8 +85,9 @@ def cmd_init(args):
 
     print()
     print("Next steps:")
-    print("  skua build                          Build the Docker image")
+    print("  skua build                          Build required project images")
     print("  skua add <name> --dir /path          Add a project")
+    print("  skua prep <name>                     Apply image-request template changes")
     print("  skua run <name>                      Start a container")
     print()
     print("Available security profiles:")

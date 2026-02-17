@@ -134,25 +134,71 @@ class TestAgentImageNaming(unittest.TestCase):
         )
 
 
-class TestBuildRequiredAgents(unittest.TestCase):
-    """Test agent selection for lazy project-scoped builds."""
+class TestProjectImageNaming(unittest.TestCase):
+    """Test project image naming and build input resolution."""
 
-    def test_no_projects_requires_no_agents(self):
+    def test_project_without_customizations_uses_agent_image(self):
+        from skua.docker import image_name_for_project
+        project = Project(name="myproj", agent="codex")
+        self.assertEqual(image_name_for_project("skua-base", project), "skua-base-codex")
+
+    def test_project_customizations_get_project_version_suffix(self):
+        from skua.docker import image_name_for_project
+        project = Project(
+            name="myproj",
+            agent="codex",
+            image=ProjectImageSpec(extra_packages=["libpq-dev"], version=3),
+        )
+        self.assertEqual(
+            image_name_for_project("myorg/skua-base:latest", project),
+            "myorg/skua-base-codex-myproj-v3:latest",
+        )
+
+    def test_resolve_project_image_inputs_prefers_from_image(self):
+        from skua.docker import resolve_project_image_inputs
+        project = Project(
+            name="myproj",
+            agent="codex",
+            image=ProjectImageSpec(
+                base_image="debian:stable-slim",
+                from_image="ghcr.io/example/myapp:dev",
+                extra_packages=["git", "jq"],
+                extra_commands=["echo hi"],
+            ),
+        )
+        agent = AgentConfig(name="codex", install=AgentInstallSpec(base_image="debian:bookworm-slim"))
+        base_image, packages, commands = resolve_project_image_inputs(
+            default_base_image="debian:bookworm-slim",
+            agent=agent,
+            project=project,
+            global_extra_packages=["curl"],
+            global_extra_commands=["echo global"],
+        )
+        self.assertEqual(base_image, "ghcr.io/example/myapp:dev")
+        self.assertEqual(packages, ["curl", "git", "jq"])
+        self.assertEqual(commands, ["echo global", "echo hi"])
+
+
+class TestBuildRequiredProjects(unittest.TestCase):
+    """Test project selection for lazy project-scoped builds."""
+
+    def test_no_projects_requires_no_projects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ConfigStore(config_dir=Path(tmpdir))
             store.ensure_dirs()
-            from skua.commands.build import _required_project_agents
-            self.assertEqual(_required_project_agents(store), [])
+            from skua.commands.build import _required_projects
+            self.assertEqual(_required_projects(store), [])
 
-    def test_collects_unique_project_agents(self):
+    def test_collects_all_projects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ConfigStore(config_dir=Path(tmpdir))
             store.ensure_dirs()
             store.save_resource(Project(name="a", directory="/tmp/a", agent="codex"))
             store.save_resource(Project(name="b", directory="/tmp/b", agent="claude"))
             store.save_resource(Project(name="c", directory="/tmp/c", agent="codex"))
-            from skua.commands.build import _required_project_agents
-            self.assertEqual(_required_project_agents(store), ["claude", "codex"])
+            from skua.commands.build import _required_projects
+            required = _required_projects(store)
+            self.assertEqual([p.name for p in required], ["a", "b", "c"])
 
 
 class TestAgentBaseImages(unittest.TestCase):
