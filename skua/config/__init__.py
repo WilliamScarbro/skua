@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Configuration system — YAML resource loading, validation, and management."""
 
 from skua.config.resources import Environment, SecurityProfile, AgentConfig, Project

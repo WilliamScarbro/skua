@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua remove — remove a project configuration."""
 
 import shutil

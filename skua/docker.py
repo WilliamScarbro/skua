@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Docker operations — build images, run containers, query state."""
 
 import os

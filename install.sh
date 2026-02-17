@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: BUSL-1.1
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Resource dataclasses for skua configuration.
 
 Each resource type corresponds to a Kubernetes-style YAML file with

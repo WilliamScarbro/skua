@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Command implementations for skua CLI."""
 
 from skua.commands.build import cmd_build

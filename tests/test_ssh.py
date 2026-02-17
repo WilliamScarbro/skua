@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for SSH key integration in skua containers.
 
 Validates that SSH keys are properly mounted, permissions are correct,

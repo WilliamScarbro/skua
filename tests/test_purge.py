@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for skua purge helper selection logic."""
 
 import sys

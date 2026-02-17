@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua clean — clean persisted agent credentials."""
 
 import subprocess

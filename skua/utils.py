@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Shared utilities for skua."""
 
 import subprocess

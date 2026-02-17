@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua build — ensure required project Docker images exist."""
 import sys
 

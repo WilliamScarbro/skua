@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BUSL-1.1
 """Skua CLI entry point."""
 import os
 import sys

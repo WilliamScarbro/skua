@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua config — show or edit global configuration."""
 
 from pathlib import Path

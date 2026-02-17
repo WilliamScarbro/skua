@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua list — list projects and running containers."""
 
 from pathlib import Path

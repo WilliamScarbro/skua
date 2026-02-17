@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua add — add a project configuration."""
 
 import sys

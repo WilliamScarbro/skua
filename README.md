@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: BUSL-1.1 -->
 <p align="center">
   <img src="docs/logo.png" alt="Skua logo" width="300">
 </p>

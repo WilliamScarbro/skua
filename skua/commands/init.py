@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua init — first-run wizard and preset installation."""
 
 import sys

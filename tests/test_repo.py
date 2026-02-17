@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """Tests for git repository support in skua projects.
 
 Validates:

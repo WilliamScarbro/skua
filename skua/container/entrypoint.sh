@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: BUSL-1.1
 set -e
 
 AGENT_NAME="${SKUA_AGENT_NAME:-agent}"

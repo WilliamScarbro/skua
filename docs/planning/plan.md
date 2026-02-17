@@ -1,3 +1,4 @@
+<!-- SPDX-License-Identifier: BUSL-1.1 -->
 # immediate:
 * add license file (restr. comercial)
 

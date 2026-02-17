@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """YAML resource file discovery, loading, and saving."""
 
 import shutil

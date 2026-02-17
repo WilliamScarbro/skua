@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua run — start or attach to a container for a project."""
 
 import os

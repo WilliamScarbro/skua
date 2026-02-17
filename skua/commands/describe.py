@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BUSL-1.1
 """skua describe — show resolved configuration for a project."""
 
 import sys
