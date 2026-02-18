@@ -12,12 +12,15 @@ Validates:
 """
 
 import argparse
+import base64
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -27,11 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from skua.config.resources import (
     Project, ProjectGitSpec, ProjectSshSpec, ProjectImageSpec,
     Environment, SecurityProfile, AgentAuthSpec, AgentRuntimeSpec,
-    AgentConfig, AgentInstallSpec,
+    AgentConfig, AgentInstallSpec, Credential,
     resource_to_dict, resource_from_dict,
 )
 from skua.config.loader import ConfigStore
-from skua.commands.add import _is_git_url
+from skua.commands.add import _is_git_url, _https_repo_to_ssh, _normalize_repo_url_for_ssh
 
 
 class TestProjectRepoField(unittest.TestCase):
@@ -342,8 +345,35 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn("SKUA_AGENT_LOGIN_COMMAND=codex login", joined)
             self.assertIn("SKUA_AUTH_DIR=.codex", joined)
             self.assertIn("SKUA_AUTH_FILES=auth.json", joined)
+            self.assertIn("SKUA_CREDENTIAL_NAME=(none)", joined)
             self.assertIn(f"{data_dir}:/home/dev/.codex", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/p1", joined)
+
+    def test_build_run_command_sets_credential_and_ssh_key_env(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_file = Path(tmpdir) / "id_ed25519"
+            key_file.write_text("test-key")
+            project = Project(
+                name="p1",
+                directory="",
+                agent="codex",
+                credential="cred-main",
+                ssh=ProjectSshSpec(private_key=str(key_file)),
+            )
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="codex",
+                runtime=AgentRuntimeSpec(command="codex"),
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            joined = " ".join(cmd)
+            self.assertIn("SKUA_CREDENTIAL_NAME=cred-main", joined)
+            self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
 
     def test_build_run_command_mounts_host_directory_name(self):
         from skua.docker import build_run_command
@@ -399,6 +429,10 @@ class TestRunCommandEnv(unittest.TestCase):
         self.assertEqual(detached[-3], "bash")
         self.assertEqual(detached[-2], "-lc")
         self.assertIn("tmux", detached[-1])
+        self.assertIn("tmux new-session -d -s", detached[-1])
+        self.assertIn("/bin/bash", detached[-1])
+        self.assertIn("/tmp/skua-entrypoint-info.txt", detached[-1])
+        self.assertIn("tmux send-keys", detached[-1])
 
 
 class TestBuildCommandImageDrift(unittest.TestCase):
@@ -468,10 +502,25 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             mock_match.assert_called_once()
 
 
+class TestContainerAttachCommand(unittest.TestCase):
+    """Test docker exec attach command wiring."""
+
+    @mock.patch("skua.docker.os.execvp")
+    def test_exec_into_container_attaches_cleanly(self, mock_execvp):
+        from skua.docker import exec_into_container
+
+        exec_into_container("skua-demo")
+        args = mock_execvp.call_args[0][1]
+        joined = " ".join(args)
+        self.assertIn('tmux new-session -A -s "$session"', joined)
+        self.assertNotIn("/tmp/skua-entrypoint-info.txt", joined)
+        self.assertNotIn("tmux send-keys", joined)
+
+
 class TestAuthSeeding(unittest.TestCase):
     """Test host -> persisted auth file seeding for run command."""
 
-    @mock.patch("skua.commands.run.Path.home")
+    @mock.patch("skua.commands.credential.Path.home")
     def test_seed_auth_from_host_prefers_auth_dir(self, mock_home):
         from skua.commands.run import _seed_auth_from_host
 
@@ -483,11 +532,12 @@ class TestAuthSeeding(unittest.TestCase):
             (home / ".codex" / "auth.json").write_text('{"token":"abc"}')
             mock_home.return_value = home
 
-            copied = _seed_auth_from_host(data, ".codex", ["auth.json"])
+            agent = AgentConfig(name="codex", auth=AgentAuthSpec(dir=".codex", files=["auth.json"]))
+            copied = _seed_auth_from_host(data, None, agent)
             self.assertEqual(copied, 1)
             self.assertTrue((data / "auth.json").is_file())
 
-    @mock.patch("skua.commands.run.Path.home")
+    @mock.patch("skua.commands.credential.Path.home")
     def test_seed_auth_from_host_falls_back_to_home_root(self, mock_home):
         from skua.commands.run import _seed_auth_from_host
 
@@ -499,11 +549,12 @@ class TestAuthSeeding(unittest.TestCase):
             (home / ".claude.json").write_text("{}")
             mock_home.return_value = home
 
-            copied = _seed_auth_from_host(data, ".claude", [".claude.json"])
+            agent = AgentConfig(name="claude", auth=AgentAuthSpec(dir=".claude", files=[".claude.json"]))
+            copied = _seed_auth_from_host(data, None, agent)
             self.assertEqual(copied, 1)
             self.assertTrue((data / ".claude.json").is_file())
 
-    @mock.patch("skua.commands.run.Path.home")
+    @mock.patch("skua.commands.credential.Path.home")
     def test_seed_auth_does_not_overwrite_existing_file(self, mock_home):
         from skua.commands.run import _seed_auth_from_host
 
@@ -516,9 +567,114 @@ class TestAuthSeeding(unittest.TestCase):
             (data / "auth.json").write_text('{"token":"existing"}')
             mock_home.return_value = home
 
-            copied = _seed_auth_from_host(data, ".codex", ["auth.json"])
+            agent = AgentConfig(name="codex", auth=AgentAuthSpec(dir=".codex", files=["auth.json"]))
+            copied = _seed_auth_from_host(data, None, agent)
             self.assertEqual(copied, 0)
             self.assertIn("existing", (data / "auth.json").read_text())
+
+    @mock.patch("skua.commands.credential.Path.home")
+    def test_seed_auth_overwrites_existing_file_when_enabled(self, mock_home):
+        from skua.commands.run import _seed_auth_from_host
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            data = Path(tmpdir) / "data"
+            (home / ".codex").mkdir(parents=True)
+            data.mkdir(parents=True)
+            (home / ".codex" / "auth.json").write_text('{"token":"host"}')
+            (data / "auth.json").write_text('{"token":"existing"}')
+            mock_home.return_value = home
+
+            agent = AgentConfig(name="codex", auth=AgentAuthSpec(dir=".codex", files=["auth.json"]))
+            copied = _seed_auth_from_host(data, None, agent, overwrite=True)
+            self.assertEqual(copied, 1)
+            self.assertIn("host", (data / "auth.json").read_text())
+
+
+class TestCredentialRefreshChecks(unittest.TestCase):
+    """Test staleness/missing detection for local credential files."""
+
+    @staticmethod
+    def _agent() -> AgentConfig:
+        return AgentConfig(name="codex", auth=AgentAuthSpec(dir=".codex", files=["auth.json"]))
+
+    @staticmethod
+    def _jwt(payload: dict) -> str:
+        def _enc(obj):
+            raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return f"{_enc({'alg': 'none', 'typ': 'JWT'})}.{_enc(payload)}.sig"
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_when_no_files_found(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        mock_sources.return_value = [(Path("/missing/auth.json"), "auth.json")]
+        reason = _credential_refresh_reason(cred=None, agent=self._agent())
+        self.assertIn("no local credential files", reason)
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_detects_expired_json(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth = Path(tmpdir) / "auth.json"
+            auth.write_text('{"expiresAt":"2000-01-01T00:00:00Z"}')
+            mock_sources.return_value = [(auth, "auth.json")]
+            reason = _credential_refresh_reason(
+                cred=None,
+                agent=self._agent(),
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertIn("expired/near-expiry", reason)
+            self.assertIn("auth.json", reason)
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_allows_future_expiry(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth = Path(tmpdir) / "auth.json"
+            auth.write_text('{"expiresAt":"2099-01-01T00:00:00Z"}')
+            mock_sources.return_value = [(auth, "auth.json")]
+            reason = _credential_refresh_reason(
+                cred=None,
+                agent=self._agent(),
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(reason, "")
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_detects_expired_jwt_token(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth = Path(tmpdir) / "auth.json"
+            token = self._jwt({"exp": 946684800})  # 2000-01-01T00:00:00Z
+            auth.write_text(json.dumps({"tokens": {"access_token": token}}))
+            mock_sources.return_value = [(auth, "auth.json")]
+            reason = _credential_refresh_reason(
+                cred=None,
+                agent=self._agent(),
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertIn("expired/near-expiry", reason)
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_allows_future_jwt_token(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth = Path(tmpdir) / "auth.json"
+            token = self._jwt({"exp": 4070908800})  # 2099-01-01T00:00:00Z
+            auth.write_text(json.dumps({"tokens": {"id_token": token}}))
+            mock_sources.return_value = [(auth, "auth.json")]
+            reason = _credential_refresh_reason(
+                cred=None,
+                agent=self._agent(),
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(reason, "")
 
 
 class TestGitUrlValidation(unittest.TestCase):
@@ -551,6 +707,22 @@ class TestGitUrlValidation(unittest.TestCase):
     def test_ftp_rejected(self):
         self.assertFalse(_is_git_url("ftp://server/repo.git"))
 
+    def test_https_repo_is_normalized_to_ssh(self):
+        self.assertEqual(
+            _normalize_repo_url_for_ssh("https://github.com/user/repo.git"),
+            "git@github.com:user/repo.git",
+        )
+
+    def test_http_repo_with_port_is_normalized_to_ssh_url(self):
+        self.assertEqual(
+            _https_repo_to_ssh("http://git.example.com:8443/team/repo.git"),
+            "ssh://git@git.example.com:8443/team/repo.git",
+        )
+
+    def test_invalid_https_repo_cannot_be_normalized(self):
+        with self.assertRaises(ValueError):
+            _normalize_repo_url_for_ssh("https://github.com/user")
+
 
 class TestAddMutualExclusivity(unittest.TestCase):
     """Test that --dir and --repo are mutually exclusive in cmd_add."""
@@ -564,6 +736,7 @@ class TestAddMutualExclusivity(unittest.TestCase):
             env=None,
             security=None,
             agent=None,
+            credential=None,
             quick=True,
             no_prompt=True,
         )
@@ -591,11 +764,14 @@ class TestAddMutualExclusivity(unittest.TestCase):
         mock_store.is_initialized.return_value = True
         mock_store.load_project.return_value = None
         mock_store.load_global.return_value = {"defaults": {}}
+        mock_store.list_resources.side_effect = lambda kind: ["claude"] if kind == "AgentConfig" else []
+        mock_store.load_agent.return_value = AgentConfig(name="claude")
+        mock_store.load_credential.return_value = Credential(name="cred1", agent="claude")
         mock_store.load_environment.return_value = None
 
         from skua.commands.add import cmd_add
 
-        args = self._make_args(repo="https://github.com/u/r.git")
+        args = self._make_args(repo="https://github.com/u/r.git", credential="cred1")
         # Should not raise SystemExit for mutual exclusivity
         # (may raise for other reasons like missing environment, but that's fine)
         try:
@@ -607,7 +783,7 @@ class TestAddMutualExclusivity(unittest.TestCase):
         # Verify save_resource was called with a Project containing the repo
         mock_store.save_resource.assert_called_once()
         saved_project = mock_store.save_resource.call_args[0][0]
-        self.assertEqual(saved_project.repo, "https://github.com/u/r.git")
+        self.assertEqual(saved_project.repo, "git@github.com:u/r.git")
         self.assertEqual(saved_project.directory, "")
 
     @mock.patch("skua.commands.add.ConfigStore")
@@ -839,8 +1015,7 @@ class TestValidationWithRepo(unittest.TestCase):
     """Test that validation handles projects with repo set."""
 
     def test_no_directory_warning_with_repo_only(self):
-        """A project with repo but no directory should still warn about no directory.
-        (directory is populated at runtime by cmd_run, not at add time)."""
+        """A project with repo but no directory should not warn about no directory."""
         from skua.config.resources import Environment, SecurityProfile, AgentConfig
         from skua.config.validation import validate_project
 
@@ -850,9 +1025,9 @@ class TestValidationWithRepo(unittest.TestCase):
         agent = AgentConfig(name="claude")
 
         result = validate_project(project, env, sec, agent)
-        # Should warn about missing directory (it's set at runtime)
+        # Repo-only projects are valid at add time; directory is set at runtime.
         dir_warnings = [w for w in result.warnings if "no directory" in w]
-        self.assertTrue(len(dir_warnings) > 0)
+        self.assertEqual(dir_warnings, [])
 
 
 if __name__ == "__main__":

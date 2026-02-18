@@ -4,11 +4,13 @@
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from skua.config import ConfigStore, Project
+from skua.commands.credential import agent_default_source_dir, resolve_credential_sources
+from skua.config import ConfigStore, Credential, Project
 from skua.config.resources import ProjectGitSpec, ProjectSshSpec, ProjectImageSpec
 from skua.project_adapt import ADAPT_GUIDE_NAME, ensure_adapt_workspace
-from skua.utils import find_ssh_keys, parse_ssh_config_hosts
+from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
 
 
 def cmd_add(args):
@@ -62,6 +64,16 @@ def cmd_add(args):
         print(f"Error: '{repo_url}' does not look like a git URL.")
         print("  Expected: https://... or git@...:...")
         sys.exit(1)
+    if repo_url:
+        try:
+            normalized_repo = _normalize_repo_url_for_ssh(repo_url)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        if normalized_repo != repo_url:
+            print("Warning: HTTPS git integration is not supported; converting repo URL to SSH.")
+            print(f"  {repo_url} -> {normalized_repo}")
+        repo_url = normalized_repo
 
     g = store.load_global()
     defaults = g.get("defaults", {})
@@ -85,15 +97,19 @@ def cmd_add(args):
     # SSH key
     ssh_key = args.ssh_key or ""
     if not ssh_key and not quick and not args.no_prompt:
+        keys = [str(p) for p in find_ssh_keys()]
         global_ssh = defaults.get("sshKey", "")
-        hint = f" (global default: {Path(global_ssh).name})" if global_ssh else ""
-        keys = find_ssh_keys()
+        if global_ssh:
+            global_ssh_path = str(Path(global_ssh).expanduser().resolve())
+            if Path(global_ssh_path).is_file() and global_ssh_path not in keys:
+                keys.append(global_ssh_path)
         if keys:
-            print("\nAvailable SSH keys:")
-            for k in keys:
-                print(f"  {k}")
-            print()
-        ssh_key = input(f"SSH private key path{hint} (leave empty for global default): ").strip()
+            keys = sorted(keys)
+            options = keys + ["None"]
+            selected = select_option("Select SSH private key:", options, default_index=len(options) - 1)
+            ssh_key = "" if selected == "None" else selected
+        else:
+            ssh_key = input("SSH private key path (leave empty for none): ").strip()
 
     if ssh_key:
         ssh_key = str(Path(ssh_key).expanduser().resolve())
@@ -109,17 +125,17 @@ def cmd_add(args):
 
     if not agent_name and not quick and not args.no_prompt:
         if available_agents:
-            print("\nAvailable agents:")
-            for a in available_agents:
-                print(f"  {a}")
-            print()
-        agent_input = input(f"Agent [{default_agent}]: ").strip()
-        agent_name = agent_input or default_agent
+            default_idx = available_agents.index(default_agent) if default_agent in available_agents else 0
+            agent_name = select_option("Select agent:", available_agents, default_idx)
+        else:
+            agent_input = input(f"Agent [{default_agent}]: ").strip()
+            agent_name = agent_input or default_agent
 
     if not agent_name:
         agent_name = default_agent
 
-    if store.load_agent(agent_name) is None:
+    agent = store.load_agent(agent_name)
+    if agent is None:
         print(f"Error: Agent '{agent_name}' not found.")
         if available_agents:
             print("Available agents:")
@@ -129,26 +145,29 @@ def cmd_add(args):
             print("No agent presets installed. Run 'skua init' first.")
         sys.exit(1)
 
-    # Credential selection
+    # Credential selection (required)
     cred_name = getattr(args, "credential", None) or ""
-    if not cred_name and not quick and not getattr(args, "no_prompt", False):
-        available_creds = [
-            c for c in store.list_resources("Credential")
-            if _cred_matches_agent(store, c, agent_name)
-        ]
-        if available_creds:
-            print("\nAvailable credentials:")
-            for c in available_creds:
-                print(f"  {c}")
-            print()
-            cred_input = input("Credential name (leave empty to skip): ").strip()
-            cred_name = cred_input
-        # If no credentials exist, silently skip (user can add later with skua credential add)
+    available_creds = sorted(
+        c for c in store.list_resources("Credential")
+        if _cred_matches_agent(store, c, agent_name)
+    )
 
-    if cred_name and store.load_credential(cred_name) is None:
-        print(f"Error: Credential '{cred_name}' not found.")
-        print("Run 'skua credential list' to see available credentials.")
-        sys.exit(1)
+    if cred_name:
+        cred = store.load_credential(cred_name)
+        if cred is None:
+            print(f"Error: Credential '{cred_name}' not found.")
+            print("Run 'skua credential list' to see available credentials.")
+            sys.exit(1)
+        if cred.agent and cred.agent != agent_name:
+            print(
+                f"Error: Credential '{cred_name}' is for agent '{cred.agent}', "
+                f"not '{agent_name}'."
+            )
+            sys.exit(1)
+    elif available_creds:
+        cred_name = _select_existing_credential(available_creds, quick, args.no_prompt)
+    else:
+        cred_name = _auto_add_local_credential(store, agent_name, agent)
 
     project = Project(
         name=name,
@@ -190,15 +209,14 @@ def cmd_add(args):
     # Print summary
     print(f"\nProject '{name}' added.")
     if host:
-        print(f"  {'Host:':<14} {host} (remote)")
-    if repo_url:
-        print(f"  {'Repo:':<14} {repo_url}")
+        _print_summary_attr("Host", f"{host} (remote)")
+    _print_summary_attr("Repo", repo_url)
     if not host:
-        print(f"  {'Directory:':<14} {project_dir or '(none)'}")
-    print(f"  {'Environment:':<14} {env_name}")
-    print(f"  {'Security:':<14} {sec_name}")
-    print(f"  {'Agent:':<14} {agent_name}")
-    print(f"  {'Credential:':<14} {cred_name or '(auto-detect)'}")
+        _print_summary_attr("Directory", project_dir)
+    _print_summary_attr("Environment", env_name)
+    _print_summary_attr("Security", sec_name)
+    _print_summary_attr("Agent", agent_name)
+    _print_summary_attr("Credential", cred_name)
     if project_dir and Path(project_dir).is_dir():
         print(f"  {'Adapt guide:':<14} {Path(project_dir) / '.skua' / ADAPT_GUIDE_NAME}")
     if ssh_key:
@@ -217,6 +235,71 @@ def _cred_matches_agent(store, cred_name: str, agent_name: str) -> bool:
     return not cred.agent or cred.agent == agent_name
 
 
+def _print_summary_attr(label: str, value: str):
+    """Print a summary row only when value is set."""
+    if value:
+        print(f"  {f'{label}:':<14} {value}")
+
+
+def _select_existing_credential(available_creds: list, quick: bool, no_prompt: bool) -> str:
+    """Choose a credential from existing agent-compatible entries."""
+    if quick or no_prompt:
+        selected = available_creds[0]
+        print(f"Using credential: {selected}")
+        return selected
+
+    return select_option("Select credential:", available_creds, default_index=0)
+
+
+def _auto_add_local_credential(store, agent_name: str, agent) -> str:
+    """Detect local credentials for agent and create a named credential resource."""
+    sources = resolve_credential_sources(None, agent)
+    found = [str(src) for src, _ in sources if src.is_file()]
+    if not found:
+        print(f"Error: No local credentials detected for agent '{agent_name}'.")
+        print(f"Run '{agent.auth.login_command or f'{agent_name} login'}' first, then retry.")
+        print(
+            "Or add one explicitly with: "
+            f"skua credential add <name> --agent {agent_name} --source-dir <dir>"
+        )
+        sys.exit(1)
+
+    default_name = _default_credential_name(store, f"{agent_name}-local")
+    print(f"\nNo credentials configured for agent '{agent_name}'.")
+    print("Found local credential files:")
+    for path in found:
+        print(f"  {path}")
+
+    while True:
+        name_input = input(f"Name for imported credential [{default_name}]: ").strip()
+        cred_name = name_input or default_name
+        if not all(c.isalnum() or c in "-_" for c in cred_name):
+            print("Credential name must be alphanumeric (hyphens and underscores allowed).")
+            continue
+        if store.load_credential(cred_name) is not None:
+            print(f"Credential '{cred_name}' already exists. Choose another name.")
+            continue
+        break
+
+    source_dir = str(agent_default_source_dir(agent))
+    cred = Credential(name=cred_name, agent=agent_name, source_dir=source_dir, files=[])
+    store.save_resource(cred)
+    print(f"Added credential '{cred_name}' from local files.")
+    return cred_name
+
+
+def _default_credential_name(store, base_name: str) -> str:
+    """Generate a unique default credential name."""
+    if store.load_credential(base_name) is None:
+        return base_name
+    i = 2
+    while True:
+        candidate = f"{base_name}-{i}"
+        if store.load_credential(candidate) is None:
+            return candidate
+        i += 1
+
+
 def _is_git_url(url: str) -> bool:
     """Check if a string looks like a git URL."""
     return (
@@ -226,6 +309,31 @@ def _is_git_url(url: str) -> bool:
         or url.startswith("git@")
         or url.startswith("ssh://")
     )
+
+
+def _normalize_repo_url_for_ssh(url: str) -> str:
+    """Normalize repo URLs to SSH form when HTTP(S) is provided."""
+    if url.startswith("https://") or url.startswith("http://"):
+        ssh_url = _https_repo_to_ssh(url)
+        if not ssh_url:
+            raise ValueError(f"Cannot convert HTTPS repo URL to SSH: {url}")
+        return ssh_url
+    return url
+
+
+def _https_repo_to_ssh(url: str) -> str:
+    """Convert an HTTP(S) git URL to SSH format."""
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").strip()
+    path = parsed.path.strip().strip("/")
+    if not host or not path:
+        return ""
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return ""
+    if parsed.port:
+        return f"ssh://git@{host}:{parsed.port}/{path}"
+    return f"git@{host}:{path}"
 
 
 def _try_validate(store, project):

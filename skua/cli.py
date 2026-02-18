@@ -78,7 +78,17 @@ def main():
     _add_adapt_args(p_adapt)
 
     # list
-    sub.add_parser("list", help="List projects and running containers")
+    p_list = sub.add_parser("list", help="List projects and running containers")
+    p_list.add_argument(
+        "-a", "--agent",
+        action="store_true",
+        help="Include agent configuration columns (agent, credential)",
+    )
+    p_list.add_argument(
+        "-s", "--security",
+        action="store_true",
+        help="Include security columns (security profile, network mode)",
+    )
 
     # clean
     p_clean = sub.add_parser("clean", help="Clean persisted agent credentials")

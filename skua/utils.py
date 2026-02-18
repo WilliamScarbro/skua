@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 
 
@@ -74,3 +75,112 @@ def parse_ssh_config_hosts() -> list:
     except OSError:
         return []
     return sorted(set(hosts))
+
+
+def select_option(prompt: str, options: list, default_index: int = 0) -> str:
+    """Select one option, using inline arrow-key UI when running in a TTY."""
+    if not options:
+        raise ValueError("select_option requires at least one option")
+
+    opts = [str(o) for o in options]
+    default_index = max(0, min(default_index, len(opts) - 1))
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return _select_option_tty(prompt, opts, default_index)
+        except Exception:
+            pass
+
+    return _select_option_fallback(prompt, opts, default_index)
+
+
+def _select_option_tty(prompt: str, options: list, default_index: int) -> str:
+    import termios
+    import tty
+
+    selected = default_index
+    count = len(options)
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def _render_label(text: str, selected_row: bool) -> str:
+        cols = max(20, shutil.get_terminal_size((80, 20)).columns)
+        prefix = "> " if selected_row else "  "
+        # Keep one spare column to avoid terminal autowrap edge cases.
+        max_len = max(1, cols - len(prefix) - 1)
+        if len(text) > max_len:
+            text = text[:max_len - 1] + "..."
+        line = f"{prefix}{text}"
+        if selected_row:
+            return f"\x1b[7m{line}\x1b[0m"
+        return line
+
+    def _draw(redraw: bool):
+        if redraw:
+            sys.stdout.write(f"\x1b[{count}A")
+        for i, option in enumerate(options):
+            line = _render_label(option, i == selected)
+            sys.stdout.write(f"\r\x1b[2K{line}\n")
+        sys.stdout.flush()
+
+    # Keep a blank separator before each interactive selector header.
+    print()
+    print(prompt)
+    sys.stdout.write("\x1b[?25l")
+    sys.stdout.flush()
+
+    try:
+        tty.setraw(fd)
+        _draw(redraw=False)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                return options[selected]
+            if ch == "\x03":
+                raise KeyboardInterrupt
+
+            changed = False
+            if ch in ("k", "K"):
+                selected = (selected - 1) % count
+                changed = True
+            elif ch in ("j", "J"):
+                selected = (selected + 1) % count
+                changed = True
+            elif ch == "\x1b":
+                seq1 = sys.stdin.read(1)
+                if seq1 == "[":
+                    seq2 = sys.stdin.read(1)
+                    if seq2 == "A":
+                        selected = (selected - 1) % count
+                        changed = True
+                    elif seq2 == "B":
+                        selected = (selected + 1) % count
+                        changed = True
+            if changed:
+                _draw(redraw=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        # Ensure the next prompt starts at column 1 even after raw-mode redraws.
+        sys.stdout.write("\x1b[?25h\r\x1b[2K")
+        sys.stdout.flush()
+
+
+def _select_option_fallback(prompt: str, options: list, default_index: int) -> str:
+    default = options[default_index]
+    print()
+    print(prompt)
+    for i, option in enumerate(options, start=1):
+        suffix = " (default)" if i - 1 == default_index else ""
+        print(f"  {i}. {option}{suffix}")
+
+    while True:
+        raw = input(f"Choose option [{default}]: ").strip()
+        if not raw:
+            return default
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        if raw in options:
+            return raw
+        print("Invalid selection. Enter a number from the list.")

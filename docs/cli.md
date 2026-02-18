@@ -102,9 +102,12 @@ List all configured projects and their running status.
 
 ```bash
 skua list
+skua list -a        # include agent/credential columns
+skua list -s        # include security/network columns
+skua list -a -s     # full view
 ```
 
-Output columns: NAME, SOURCE, AGENT, SECURITY, NETWORK, STATUS.
+Default columns: NAME, SOURCE, STATUS.
 
 ### `skua clean [<name>]`
 

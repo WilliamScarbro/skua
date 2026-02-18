@@ -60,14 +60,22 @@ def cmd_list(args):
     store = ConfigStore()
     project_names = store.list_resources("Project")
     running = get_running_skua_containers()
+    show_agent = bool(getattr(args, "agent", False))
+    show_security = bool(getattr(args, "security", False))
 
     if not project_names:
         print("No projects configured. Add one with: skua add <name> --dir <path> or --repo <url>")
         return
 
-    # Header
-    print(f"{'NAME':<16} {'SOURCE':<42} {'AGENT':<10} {'SECURITY':<12} {'NETWORK':<10} {'STATUS':<10}")
-    print("-" * 106)
+    columns = [("NAME", 16), ("SOURCE", 38)]
+    if show_agent:
+        columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
+    if show_security:
+        columns.extend([("SECURITY", 12), ("NETWORK", 10)])
+    columns.append(("STATUS", 10))
+
+    print(" ".join(f"{title:<{width}}" for title, width in columns))
+    print("-" * (sum(width for _, width in columns) + (len(columns) - 1)))
 
     for name in project_names:
         project = store.resolve_project(name)
@@ -76,11 +84,18 @@ def cmd_list(args):
         container_name = f"skua-{name}"
         status = "running" if container_name in running else "stopped"
         source = _format_project_source(project)
+        row = [f"{name:<16}", f"{source:<38}"]
 
-        env = store.load_environment(project.environment)
-        network = env.network.mode if env else "?"
+        if show_agent:
+            credential = project.credential or "(none)"
+            row.extend([f"{project.agent:<10}", f"{credential:<20}"])
+        if show_security:
+            env = store.load_environment(project.environment)
+            network = env.network.mode if env else "?"
+            row.extend([f"{project.security:<12}", f"{network:<10}"])
 
-        print(f"{name:<16} {source:<42} {project.agent:<10} {project.security:<12} {network:<10} {status:<10}")
+        row.append(f"{status:<10}")
+        print(" ".join(row))
 
     print()
     running_count = sum(1 for n in project_names if f"skua-{n}" in running)

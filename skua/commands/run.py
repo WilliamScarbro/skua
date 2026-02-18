@@ -6,6 +6,10 @@ import os
 import shutil
 import subprocess
 import sys
+import json
+import shlex
+import base64
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from skua.config import ConfigStore, validate_project
@@ -57,7 +61,7 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
         sys.exit(1)
 
 
-def _seed_auth_from_host(data_dir: Path, cred, agent) -> int:
+def _seed_auth_from_host(data_dir: Path, cred, agent, overwrite: bool = False) -> int:
     """Seed missing auth files from the host into the container persistence directory.
 
     Uses :func:`resolve_credential_sources` to determine which host files map
@@ -68,12 +72,179 @@ def _seed_auth_from_host(data_dir: Path, cred, agent) -> int:
     copied = 0
     for src, dest_name in sources:
         dest = data_dir / dest_name
-        if dest.exists():
+        if dest.exists() and not overwrite:
             continue
         if src.is_file():
             shutil.copy2(src, dest)
             copied += 1
     return copied
+
+
+def _parse_expiry_datetime(value):
+    """Parse common expiry value formats into a UTC datetime."""
+    if isinstance(value, (int, float)):
+        ts = int(value)
+        if ts <= 0:
+            return None
+        # Heuristic: values above 1e12 are very likely milliseconds.
+        if ts > 1_000_000_000_000:
+            ts = ts / 1000.0
+        elif ts < 1_000_000_000:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return _parse_expiry_datetime(int(text))
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def _jwt_expiry_datetime(token: str):
+    """Best-effort parse of JWT `exp` claim without signature verification."""
+    if not isinstance(token, str):
+        return None
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        return None
+    payload_b64 = parts[1]
+    if not payload_b64:
+        return None
+    pad = "=" * (-len(payload_b64) % 4)
+    try:
+        payload_raw = base64.urlsafe_b64decode(payload_b64 + pad)
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    exp = payload.get("exp")
+    if isinstance(exp, (int, float)):
+        if exp <= 0:
+            return None
+        return datetime.fromtimestamp(float(exp), tz=timezone.utc)
+    return _parse_expiry_datetime(exp)
+
+
+def _extract_expiry_values(obj) -> list:
+    """Recursively collect datetime values from common expiry keys."""
+    values = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_l = str(key).strip().lower()
+            is_expiry_key = (
+                "expir" in key_l
+                or key_l in {"exp", "expires", "expires_at", "expiresat", "expires_on", "expireson"}
+                or key_l.endswith("_exp")
+            )
+            if is_expiry_key:
+                parsed = _parse_expiry_datetime(value)
+                if parsed is not None:
+                    values.append(parsed)
+            # Codex-style auth JSON may only expose JWT tokens. Extract `exp`.
+            if isinstance(value, str) and "token" in key_l:
+                jwt_exp = _jwt_expiry_datetime(value)
+                if jwt_exp is not None:
+                    values.append(jwt_exp)
+            values.extend(_extract_expiry_values(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            values.extend(_extract_expiry_values(item))
+    return values
+
+
+def _credential_file_expiry(path: Path):
+    """Return earliest detected expiry in a JSON credential file, else None."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    expiries = _extract_expiry_values(data)
+    return min(expiries) if expiries else None
+
+
+def _credential_refresh_reason(cred, agent, now=None) -> str:
+    """Return a reason to refresh local credentials, or empty string if healthy/unknown."""
+    now = now or datetime.now(timezone.utc)
+    stale_cutoff = now + timedelta(minutes=2)
+    sources = resolve_credential_sources(cred, agent)
+    if not sources:
+        return ""
+    existing = [(src, dest_name) for src, dest_name in sources if src.is_file()]
+
+    if not existing:
+        return "no local credential files were found"
+
+    stale = []
+    for src, dest_name in existing:
+        expiry = _credential_file_expiry(src)
+        if expiry and expiry <= stale_cutoff:
+            stale.append((dest_name, expiry))
+
+    if stale:
+        parts = []
+        for dest_name, expiry in stale:
+            ts = expiry.strftime("%Y-%m-%d %H:%M:%S %Z")
+            parts.append(f"{dest_name} (expires {ts})")
+        return "credential appears expired/near-expiry: " + ", ".join(parts)
+
+    return ""
+
+
+def _run_local_login(login_cmd: str) -> bool:
+    """Run local agent login flow. Returns True when command was run (even non-zero exit)."""
+    cmd_parts = shlex.split(login_cmd)
+    if not cmd_parts:
+        print("Warning: cannot run local login; login command is empty.")
+        return False
+    if not shutil.which(cmd_parts[0]):
+        print(f"Warning: '{cmd_parts[0]}' is not installed; skipping local login refresh.")
+        return False
+
+    print(f"Running local login: {login_cmd}")
+    print("Complete the sign-in flow, then return here.")
+    try:
+        subprocess.run(cmd_parts, check=True)
+    except subprocess.CalledProcessError:
+        print(f"Warning: '{login_cmd}' exited non-zero. Continuing with detected credential files.")
+    except KeyboardInterrupt:
+        print("\nCancelled local login refresh.")
+        return False
+    return True
+
+
+def _maybe_refresh_local_credentials(agent, cred) -> bool:
+    """Prompt for local re-login if credentials look missing/stale."""
+    reason = _credential_refresh_reason(cred, agent)
+    if not reason:
+        return False
+
+    login_cmd = (agent.auth.login_command or f"{agent.runtime.command or agent.name} login").strip()
+    if not login_cmd:
+        print(f"Warning: {reason}. No login command is configured for agent '{agent.name}'.")
+        return False
+
+    print(f"Warning: {reason}.")
+    answer = input(f"Run '{login_cmd}' locally to refresh now? [Y/n]: ").strip().lower()
+    if answer == "n":
+        return False
+
+    if not _run_local_login(login_cmd):
+        return False
+
+    post_reason = _credential_refresh_reason(cred, agent)
+    if post_reason:
+        print(f"Warning: credentials still look stale after login: {post_reason}")
+    return True
 
 
 def _detached_run_command(docker_cmd: list) -> list:
@@ -90,6 +261,9 @@ def _detached_run_command(docker_cmd: list) -> list:
         '[ -d "$start_dir" ] || start_dir="/home/dev"; '
         'if ! tmux has-session -t "$session" 2>/dev/null; then '
         '  tmux new-session -d -s "$session" -c "$start_dir" /bin/bash; '
+        '  if [ -f /tmp/skua-entrypoint-info.txt ]; then '
+        '    tmux send-keys -t "$session" "cat /tmp/skua-entrypoint-info.txt; echo" C-m; '
+        "  fi; "
         "fi; "
         'while tmux has-session -t "$session" 2>/dev/null; do sleep 1; done'
     )
@@ -233,12 +407,19 @@ def cmd_run(args):
         if cred is None:
             print(f"Warning: Credential '{project.credential}' not found.")
 
-    # Seed persisted auth files from host (local projects only; remote uses named volumes)
-    if not host and env.persistence.mode == "bind":
+    # Seed/sync persisted auth files from host if needed
+    if env.persistence.mode == "bind":
         data_dir.mkdir(parents=True, exist_ok=True)
-        copied = _seed_auth_from_host(data_dir=data_dir, cred=cred, agent=agent)
+        refreshed = _maybe_refresh_local_credentials(agent=agent, cred=cred)
+        copied = _seed_auth_from_host(
+            data_dir=data_dir,
+            cred=cred,
+            agent=agent,
+            overwrite=refreshed,
+        )
         if copied:
-            print(f"Seeded {copied} auth file(s).")
+            action = "Synced" if refreshed else "Seeded"
+            print(f"{action} {copied} auth file(s).")
 
     # Build and exec docker command
     docker_cmd = build_run_command(
