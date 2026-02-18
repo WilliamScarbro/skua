@@ -136,7 +136,7 @@ skua build
 For advanced security/environment setup, go to:
 - `docs/security.md`
 - `docs/configuration.md`
-
+  
 ## License
 
 Business Source License 1.1 — see [LICENSE](LICENSE).
