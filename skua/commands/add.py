@@ -106,6 +106,27 @@ def cmd_add(args):
             print("No agent presets installed. Run 'skua init' first.")
         sys.exit(1)
 
+    # Credential selection
+    cred_name = getattr(args, "credential", None) or ""
+    if not cred_name and not quick and not getattr(args, "no_prompt", False):
+        available_creds = [
+            c for c in store.list_resources("Credential")
+            if _cred_matches_agent(store, c, agent_name)
+        ]
+        if available_creds:
+            print("\nAvailable credentials:")
+            for c in available_creds:
+                print(f"  {c}")
+            print()
+            cred_input = input("Credential name (leave empty to skip): ").strip()
+            cred_name = cred_input
+        # If no credentials exist, silently skip (user can add later with skua credential add)
+
+    if cred_name and store.load_credential(cred_name) is None:
+        print(f"Error: Credential '{cred_name}' not found.")
+        print("Run 'skua credential list' to see available credentials.")
+        sys.exit(1)
+
     project = Project(
         name=name,
         directory=project_dir or "",
@@ -113,6 +134,7 @@ def cmd_add(args):
         environment=env_name,
         security=sec_name,
         agent=agent_name,
+        credential=cred_name,
         git=ProjectGitSpec(),
         ssh=ProjectSshSpec(private_key=ssh_key),
         image=ProjectImageSpec(),
@@ -135,6 +157,7 @@ def cmd_add(args):
     print(f"  {'Environment:':<14} {env_name}")
     print(f"  {'Security:':<14} {sec_name}")
     print(f"  {'Agent:':<14} {agent_name}")
+    print(f"  {'Credential:':<14} {cred_name or '(auto-detect)'}")
     if project_dir and Path(project_dir).is_dir():
         print(f"  {'Prep guide:':<14} {Path(project_dir) / '.skua' / 'PREP.md'}")
     if ssh_key:
@@ -143,6 +166,14 @@ def cmd_add(args):
 
     # Auto-validate
     _try_validate(store, project)
+
+
+def _cred_matches_agent(store, cred_name: str, agent_name: str) -> bool:
+    """Return True if the credential is compatible with the given agent."""
+    cred = store.load_credential(cred_name)
+    if cred is None:
+        return False
+    return not cred.agent or cred.agent == agent_name
 
 
 def _is_git_url(url: str) -> bool:

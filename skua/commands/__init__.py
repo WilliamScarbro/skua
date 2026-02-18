@@ -13,8 +13,9 @@ from skua.commands.purge import cmd_purge
 from skua.commands.config_cmd import cmd_config
 from skua.commands.validate_cmd import cmd_validate
 from skua.commands.describe import cmd_describe
+from skua.commands.credential import cmd_credential
 __all__ = [
     "cmd_build", "cmd_init", "cmd_add", "cmd_remove", "cmd_run", "cmd_prep",
     "cmd_list", "cmd_clean", "cmd_purge", "cmd_config", "cmd_validate",
-    "cmd_describe",
+    "cmd_describe", "cmd_credential",
 ]

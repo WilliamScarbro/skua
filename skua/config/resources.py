@@ -216,6 +216,17 @@ class AgentConfig:
     auth: AgentAuthSpec = field(default_factory=AgentAuthSpec)
 
 
+# ── Credential ───────────────────────────────────────────────────────────
+
+@dataclass
+class Credential:
+    """Named credential set for an agent, pointing to host credential files."""
+    name: str = ""
+    agent: str = "claude"       # references AgentConfig by name
+    source_dir: str = ""        # host directory containing auth files
+    files: list = field(default_factory=list)   # explicit file paths (takes priority over source_dir)
+
+
 # ── Project ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -247,6 +258,7 @@ class Project:
     environment: str = "local-docker"     # references Environment by name
     security: str = "open"                # references SecurityProfile by name
     agent: str = "claude"                 # references AgentConfig by name
+    credential: str = ""                  # references Credential by name (optional)
     git: ProjectGitSpec = field(default_factory=ProjectGitSpec)
     ssh: ProjectSshSpec = field(default_factory=ProjectSshSpec)
     image: ProjectImageSpec = field(default_factory=ProjectImageSpec)
@@ -260,6 +272,7 @@ KIND_MAP = {
     "Environment": Environment,
     "SecurityProfile": SecurityProfile,
     "AgentConfig": AgentConfig,
+    "Credential": Credential,
     "Project": Project,
 }
 

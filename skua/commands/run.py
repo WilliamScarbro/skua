@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua run — start or attach to a container for a project."""
 
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from skua.config import ConfigStore, validate_project
+from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
 from skua.docker import (
     is_container_running,
     exec_into_container,
@@ -21,38 +21,22 @@ from skua.docker import (
 from skua.project_prep import ensure_prep_workspace
 
 
-def _seed_auth_from_host(data_dir: Path, auth_dir: str, auth_files: list) -> int:
-    """Seed missing persisted auth files from host HOME.
+def _seed_auth_from_host(data_dir: Path, cred, agent) -> int:
+    """Seed missing auth files from the host into the container persistence directory.
 
-    For each auth file, checks:
-      1) ~/auth_dir/<file>
-      2) ~/<file>
-    and copies the first match into data_dir.
+    Uses :func:`resolve_credential_sources` to determine which host files map
+    to which destination names, so all credential-resolution logic lives in one
+    place (``skua.commands.credential``).
     """
+    sources = resolve_credential_sources(cred, agent)
     copied = 0
-    home = Path.home()
-    rel_auth_dir = (auth_dir or ".claude").lstrip("/")
-    codex_home = os.environ.get("CODEX_HOME", "").strip()
-
-    for fname in auth_files or []:
-        name = Path(fname).name
-        if not name:
-            continue
-
-        dest = data_dir / name
+    for src, dest_name in sources:
+        dest = data_dir / dest_name
         if dest.exists():
             continue
-
-        candidates = [home / rel_auth_dir / name]
-        if rel_auth_dir == ".codex" and codex_home:
-            candidates.append(Path(codex_home).expanduser() / name)
-        candidates.append(home / name)
-        for src in candidates:
-            if src.is_file():
-                shutil.copy2(src, dest)
-                copied += 1
-                break
-
+        if src.is_file():
+            shutil.copy2(src, dest)
+            copied += 1
     return copied
 
 
@@ -167,25 +151,20 @@ def cmd_run(args):
 
     # Build persistence path
     data_dir = store.project_data_dir(name, project.agent)
-    auth_dir = (agent.auth.dir or ".claude").lstrip("/")
-    auth_files = list(agent.auth.files)
-    # Backward-compat for older installed presets that had no auth.files.
-    if not auth_files:
-        if project.agent == "codex":
-            auth_files = ["auth.json"]
-        elif project.agent == "claude":
-            auth_files = [".credentials.json", ".claude.json"]
+
+    # Resolve credential (None is fine — resolve_credential_sources falls back to agent default dir)
+    cred = None
+    if project.credential:
+        cred = store.load_credential(project.credential)
+        if cred is None:
+            print(f"Warning: Credential '{project.credential}' not found.")
 
     # Seed persisted auth files from host if needed
     if env.persistence.mode == "bind":
         data_dir.mkdir(parents=True, exist_ok=True)
-        copied = _seed_auth_from_host(
-            data_dir=data_dir,
-            auth_dir=auth_dir,
-            auth_files=auth_files,
-        )
+        copied = _seed_auth_from_host(data_dir=data_dir, cred=cred, agent=agent)
         if copied:
-            print(f"Seeded {copied} auth file(s) from host.")
+            print(f"Seeded {copied} auth file(s).")
 
     # Build and exec docker command
     docker_cmd = build_run_command(
@@ -203,6 +182,17 @@ def cmd_run(args):
     print(f"  Environment: {project.environment}")
     print(f"  Security:    {project.security}")
     print(f"  Agent:       {project.agent}")
+    if project.credential:
+        if cred and cred.files:
+            cred_label = f"{project.credential} ({len(cred.files)} explicit file(s))"
+        elif cred and cred.source_dir:
+            cred_label = f"{project.credential} ({cred.source_dir})"
+        elif cred:
+            cred_label = f"{project.credential} (default: {agent_default_source_dir(agent)})"
+        else:
+            cred_label = f"{project.credential} (not found)"
+        print(f"  Credential:  {cred_label}")
+    auth_dir = (agent.auth.dir or f".{project.agent}").lstrip("/")
     print(f"  Image:       {image_name}")
     ssh_display = Path(project.ssh.private_key).name if project.ssh.private_key else "(none)"
     print(f"  SSH key:     {ssh_display}")

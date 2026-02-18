@@ -12,6 +12,7 @@ from skua.config.resources import (
     Environment,
     SecurityProfile,
     AgentConfig,
+    Credential,
     Project,
     ProjectGitSpec,
     resource_from_dict,
@@ -26,6 +27,7 @@ KIND_DIRS = {
     "Environment": "environments",
     "SecurityProfile": "security",
     "AgentConfig": "agents",
+    "Credential": "credentials",
     "Project": "projects",
 }
 
@@ -145,6 +147,9 @@ class ConfigStore:
 
     def load_agent(self, name: str) -> Optional[AgentConfig]:
         return self.load_resource("AgentConfig", name)
+
+    def load_credential(self, name: str) -> Optional[Credential]:
+        return self.load_resource("Credential", name)
 
     def load_project(self, name: str) -> Optional[Project]:
         return self.load_resource("Project", name)

@@ -33,6 +33,7 @@ def main():
     p_add.add_argument("--env", help="Environment resource name (default: from global)")
     p_add.add_argument("--security", help="Security profile name (default: from global)")
     p_add.add_argument("--agent", help="Agent config name (default: from global)")
+    p_add.add_argument("--credential", help="Named credential set to use for this project")
     p_add.add_argument("--quick", action="store_true",
                         help="Use all defaults, skip interactive prompts")
     p_add.add_argument("--no-prompt", action="store_true",
@@ -95,6 +96,38 @@ def main():
     p_desc = sub.add_parser("describe", help="Show resolved configuration for a project")
     p_desc.add_argument("name", help="Project name to describe")
 
+    # credential
+    p_cred = sub.add_parser("credential", help="Manage named credential sets")
+    cred_sub = p_cred.add_subparsers(dest="action")
+
+    cred_sub.add_parser("list", help="List configured credentials")
+
+    p_cred_add = cred_sub.add_parser("add", help="Add a credential set")
+    p_cred_add.add_argument("name", nargs="?", help="Credential name")
+    p_cred_add.add_argument("--agent", help="Agent name (e.g. claude, codex)")
+    src_group = p_cred_add.add_mutually_exclusive_group()
+    src_group.add_argument(
+        "--source-dir",
+        metavar="DIR",
+        help="Directory on the host containing credential files",
+    )
+    src_group.add_argument(
+        "--file",
+        action="append",
+        dest="files",
+        default=[],
+        metavar="PATH",
+        help="Explicit credential file path (repeatable; alternative to --source-dir)",
+    )
+    src_group.add_argument(
+        "--login",
+        action="store_true",
+        help="Sign in locally using the agent's login command, then auto-detect credentials",
+    )
+
+    p_cred_rm = cred_sub.add_parser("remove", help="Remove a credential set")
+    p_cred_rm.add_argument("name", help="Credential name to remove")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -105,7 +138,7 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run,
         cmd_prep, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe,
+        cmd_describe, cmd_credential,
     )
 
     commands = {
@@ -121,8 +154,23 @@ def main():
         "config": cmd_config,
         "validate": cmd_validate,
         "describe": cmd_describe,
+        "credential": _handle_credential,
     }
     commands[args.command](args)
+
+
+def _handle_credential(args):
+    """Dispatch credential subcommands, showing help if no action given."""
+    from skua.commands import cmd_credential
+    if not args.action:
+        print("usage: skua credential <action> [options]")
+        print()
+        print("actions:")
+        print("  list            List configured credentials")
+        print("  add [name]      Add a credential set")
+        print("  remove <name>   Remove a credential set")
+        sys.exit(1)
+    cmd_credential(args)
 
 
 if __name__ == "__main__":
