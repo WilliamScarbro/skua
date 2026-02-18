@@ -22,6 +22,7 @@ skua init --force   # re-initialize (overwrites global config)
 ### `skua build`
 
 Build Docker images required by currently configured projects. For default projects, Skua tags images as `<imageName>-<agent>` (for example `skua-base-codex`). Projects with image customizations use project-scoped tags (`...-<project>-vN`).
+If an image already exists, Skua compares its saved build-context hash (generated Dockerfile + entrypoint/default config inputs) and rebuilds automatically when drift is detected.
 
 ```bash
 skua build
@@ -84,7 +85,7 @@ skua remove myapp
 
 ### `skua run <name>`
 
-Start a container for a project. Validates configuration before launching. If the container is already running, offers to attach to it.
+Start a container for a project. Validates configuration before launching. Skua starts the container in detached mode and attaches to a persistent in-container `tmux` session by default.
 
 For bind persistence, Skua auto-seeds missing agent auth files from host home into the project's persisted auth directory on first run (for example Codex `~/.codex/auth.json`).
 Use `skua adapt <name>` to have the agent generate/apply image updates in one command.
@@ -92,6 +93,8 @@ Use `skua adapt <name>` to have the agent generate/apply image updates in one co
 ```bash
 skua run myapp
 ```
+
+Detach while keeping container/session alive with `Ctrl-b`, then `d`. Re-run `skua run myapp` to reattach.
 
 ### `skua list`
 

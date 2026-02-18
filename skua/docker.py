@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: BUSL-1.1
 """Docker operations — build images, run containers, query state."""
 
+import hashlib
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -209,7 +211,7 @@ CORE_PACKAGES = [
 DEFAULT_PACKAGES = [
     "python3", "python3-pip",
     "procps", "coreutils", "findutils", "grep", "gawk", "sed",
-    "less", "tree", "file", "htop", "jq",
+    "less", "tree", "file", "htop", "jq", "tmux",
     "zip", "unzip", "tar", "gzip", "bzip2", "xz-utils",
     "diffutils", "patch", "man-db", "manpages",
     "net-tools", "iputils-ping", "dnsutils",
@@ -227,6 +229,8 @@ DEFAULT_AGENT_REQUIRED_PACKAGES = {
 }
 
 LEGACY_CODEX_UNIVERSAL_IMAGE = "ghcr.io/openai/codex-universal:latest"
+BUILD_CONTEXT_HASH_LABEL = "skua.build-context-hash"
+MANAGED_IMAGE_LABEL = "skua.managed"
 
 
 def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
@@ -412,6 +416,16 @@ def build_image(
 
     Uses container_dir for entrypoint.sh and default agent settings.
     """
+    context_hash = compute_build_context_hash(
+        container_dir=container_dir,
+        security=security,
+        agent=agent,
+        agents=agents,
+        base_image=base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+
     build_path = container_dir / ".build-context"
     try:
         if build_path.exists():
@@ -447,6 +461,8 @@ def build_image(
             "docker", "build",
             "--build-arg", f"USER_UID={uid}",
             "--build-arg", f"USER_GID={gid}",
+            "--label", f"{MANAGED_IMAGE_LABEL}=true",
+            "--label", f"{BUILD_CONTEXT_HASH_LABEL}={context_hash}",
             "-t", image_name,
             str(build_path),
         ]
@@ -565,10 +581,137 @@ def build_run_command(
 # ── Container operations ─────────────────────────────────────────────────
 
 def exec_into_container(container_name: str):
-    """Exec into a running container, replacing this process."""
-    os.execvp("docker", ["docker", "exec", "-it", container_name, "/bin/bash"])
+    """Exec into a running container, replacing this process.
+
+    Defaults to attaching to the container tmux session when available.
+    """
+    attach_cmd = (
+        'if [ "${SKUA_TMUX_ENABLE:-1}" = "0" ] || ! command -v tmux >/dev/null 2>&1; then '
+        "  exec /bin/bash; "
+        "fi; "
+        'session="${SKUA_TMUX_SESSION:-skua}"; '
+        'tmux new-session -A -s "$session"'
+    )
+    os.execvp(
+        "docker",
+        ["docker", "exec", "-it", container_name, "bash", "-lc", attach_cmd],
+    )
 
 
 def run_container(docker_cmd: list):
     """Replace this process with docker run (execvp)."""
     os.execvp("docker", docker_cmd)
+
+
+def _hash_with_marker(hasher, marker: str, value):
+    """Update a hash with a marker and optional bytes payload."""
+    hasher.update(marker.encode("utf-8"))
+    hasher.update(b"\0")
+    if value is None:
+        hasher.update(b"<missing>")
+    elif isinstance(value, str):
+        hasher.update(value.encode("utf-8"))
+    else:
+        hasher.update(value)
+    hasher.update(b"\0")
+
+
+def compute_build_context_hash(
+    container_dir: Path,
+    security: SecurityProfile = None,
+    agent: AgentConfig = None,
+    agents: list = None,
+    base_image: str = "debian:bookworm-slim",
+    extra_packages: list = None,
+    extra_commands: list = None,
+) -> str:
+    """Compute deterministic hash for skua-managed Docker build context."""
+    dockerfile_content = generate_dockerfile(
+        agent=agent,
+        agents=agents,
+        security=security,
+        base_image=base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    entrypoint_path = container_dir / "entrypoint.sh"
+
+    hasher = hashlib.sha256()
+    _hash_with_marker(hasher, "version", "v1")
+    _hash_with_marker(hasher, "dockerfile", dockerfile_content)
+    _hash_with_marker(hasher, "entrypoint", entrypoint_path.read_bytes() if entrypoint_path.exists() else None)
+    _hash_with_marker(hasher, "uid", str(os.getuid()))
+    _hash_with_marker(hasher, "gid", str(os.getgid()))
+
+    claude_home = Path.home() / ".claude"
+    for fname in ("settings.json", "settings.local.json"):
+        src = claude_home / fname
+        _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
+
+    return hasher.hexdigest()
+
+
+def _image_label(image_name: str, label_key: str) -> str:
+    """Return a docker image label value, or empty string when unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                f'{{{{ index .Config.Labels "{label_key}" }}}}',
+                image_name,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+
+    if result.returncode != 0:
+        return ""
+    value = result.stdout.strip()
+    if value in ("", "<no value>", "<nil>"):
+        return ""
+    return value
+
+
+def image_matches_build_context(
+    image_name: str,
+    container_dir: Path,
+    security: SecurityProfile = None,
+    agent: AgentConfig = None,
+    agents: list = None,
+    base_image: str = "debian:bookworm-slim",
+    extra_packages: list = None,
+    extra_commands: list = None,
+) -> bool:
+    """Return True when image label hash matches current generated build context."""
+    expected_hash = compute_build_context_hash(
+        container_dir=container_dir,
+        security=security,
+        agent=agent,
+        agents=agents,
+        base_image=base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    actual_hash = _image_label(image_name, BUILD_CONTEXT_HASH_LABEL)
+    return bool(actual_hash) and actual_hash == expected_hash
+
+
+def start_container(docker_cmd: list) -> bool:
+    """Run docker command and return success."""
+    result = subprocess.run(docker_cmd)
+    return result.returncode == 0
+
+
+def wait_for_running_container(name: str, timeout_seconds: float = 10.0) -> bool:
+    """Wait for a container to appear in docker ps."""
+    deadline = time.time() + max(timeout_seconds, 0.1)
+    while time.time() < deadline:
+        if is_container_running(name):
+            return True
+        time.sleep(0.2)
+    return is_container_running(name)

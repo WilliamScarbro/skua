@@ -6,6 +6,7 @@ from skua.config import ConfigStore
 from skua.docker import (
     build_image,
     image_exists,
+    image_matches_build_context,
     image_name_for_project,
     resolve_project_image_inputs,
 )
@@ -81,6 +82,7 @@ def cmd_build(args):
     print()
 
     built = []
+    rebuilt = []
     existing = []
     failed = []
     seen_images = set()
@@ -96,15 +98,28 @@ def cmd_build(args):
             global_extra_packages=global_packages,
             global_extra_commands=global_commands,
         )
+        needs_rebuild = False
         if image_exists(image_name):
-            print(f"-> Using existing image '{image_name}' (project: {project.name})")
-            existing.append(image_name)
-            continue
+            if image_matches_build_context(
+                image_name=image_name,
+                container_dir=container_dir,
+                security=security,
+                agent=agent,
+                base_image=resolved_base_image,
+                extra_packages=extra_packages,
+                extra_commands=extra_commands,
+            ):
+                print(f"-> Using existing image '{image_name}' (project: {project.name})")
+                existing.append(image_name)
+                continue
+            print(f"-> Image '{image_name}' is out-of-date; rebuilding (project: {project.name})")
+            needs_rebuild = True
 
-        print(
-            f"-> Image '{image_name}' missing; building for project "
-            f"'{project.name}' (agent '{agent.name}') from '{resolved_base_image}'..."
-        )
+        if not needs_rebuild:
+            print(
+                f"-> Image '{image_name}' missing; building for project "
+                f"'{project.name}' (agent '{agent.name}') from '{resolved_base_image}'..."
+            )
         success = build_image(
             container_dir=container_dir,
             image_name=image_name,
@@ -115,7 +130,10 @@ def cmd_build(args):
             extra_commands=extra_commands,
         )
         if success:
-            built.append(image_name)
+            if needs_rebuild:
+                rebuilt.append(image_name)
+            else:
+                built.append(image_name)
         else:
             failed.append(image_name)
 
@@ -130,4 +148,6 @@ def cmd_build(args):
         print(f"  - {name} (existing)")
     for name in built:
         print(f"  - {name} (built)")
+    for name in rebuilt:
+        print(f"  - {name} (rebuilt)")
     print("Use 'skua adapt <name>' to apply project image-request updates before running.")

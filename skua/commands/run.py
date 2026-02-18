@@ -16,7 +16,8 @@ from skua.docker import (
     image_exists,
     image_name_for_project,
     resolve_project_image_inputs,
-    run_container,
+    start_container,
+    wait_for_running_container,
 )
 from skua.project_adapt import ensure_adapt_workspace
 
@@ -40,6 +41,27 @@ def _seed_auth_from_host(data_dir: Path, cred, agent) -> int:
     return copied
 
 
+def _detached_run_command(docker_cmd: list) -> list:
+    """Convert `docker run -it ...` into detached mode."""
+    cmd = [token for token in docker_cmd if token != "-it"]
+    if len(cmd) >= 2 and cmd[0] == "docker" and cmd[1] == "run" and "-d" not in cmd:
+        cmd.insert(2, "-d")
+    detached_entry = (
+        'if [ "${SKUA_TMUX_ENABLE:-1}" = "0" ] || ! command -v tmux >/dev/null 2>&1; then '
+        "  while true; do sleep 3600; done; "
+        "fi; "
+        'session="${SKUA_TMUX_SESSION:-skua}"; '
+        'start_dir="${SKUA_PROJECT_DIR:-/home/dev/project}"; '
+        '[ -d "$start_dir" ] || start_dir="/home/dev"; '
+        'if ! tmux has-session -t "$session" 2>/dev/null; then '
+        '  tmux new-session -d -s "$session" -c "$start_dir" /bin/bash; '
+        "fi; "
+        'while tmux has-session -t "$session" 2>/dev/null; do sleep 1; done'
+    )
+    cmd.extend(["bash", "-lc", detached_entry])
+    return cmd
+
+
 def cmd_run(args):
     store = ConfigStore()
     name = args.name
@@ -56,6 +78,7 @@ def cmd_run(args):
         print(f"Container '{container_name}' is already running.")
         answer = input("Attach to it? [Y/n]: ").strip().lower()
         if answer != "n":
+            print("Attaching to container tmux session (detach: Ctrl-b then d)...")
             exec_into_container(container_name)
         return
 
@@ -203,4 +226,12 @@ def cmd_run(args):
         print(f"  Auth dir:    volume skua-{name}-{project.agent} -> /home/dev/{auth_dir}")
     print()
 
-    run_container(docker_cmd)
+    detached_cmd = _detached_run_command(docker_cmd)
+    if not start_container(detached_cmd):
+        print(f"Error: failed to start container '{container_name}'.")
+        sys.exit(1)
+    if not wait_for_running_container(container_name):
+        print(f"Error: container '{container_name}' did not start correctly.")
+        sys.exit(1)
+    print("Attaching to container tmux session (detach: Ctrl-b then d)...")
+    exec_into_container(container_name)

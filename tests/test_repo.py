@@ -276,6 +276,48 @@ class TestDockerfileAgentInstall(unittest.TestCase):
         dockerfile = generate_dockerfile(agent=agent)
         self.assertIn("npm install -g --prefix /home/dev/.local @openai/codex", dockerfile)
 
+    def test_tmux_is_included_in_default_runtime_packages(self):
+        from skua.docker import generate_dockerfile
+        dockerfile = generate_dockerfile(agent=AgentConfig(name="claude"))
+        self.assertIn("tmux", dockerfile)
+
+    @mock.patch("skua.docker.Path.home")
+    def test_build_context_hash_changes_when_entrypoint_changes(self, mock_home):
+        from skua.docker import compute_build_context_hash
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            container_dir = root / "container"
+            container_dir.mkdir()
+            (container_dir / "entrypoint.sh").write_text("#!/bin/bash\necho first\n")
+
+            home = root / "home"
+            (home / ".claude").mkdir(parents=True)
+            (home / ".claude" / "settings.json").write_text('{"theme":"x"}')
+            mock_home.return_value = home
+
+            h1 = compute_build_context_hash(
+                container_dir=container_dir,
+                security=SecurityProfile(name="open"),
+                agent=AgentConfig(name="claude"),
+            )
+            (container_dir / "entrypoint.sh").write_text("#!/bin/bash\necho second\n")
+            h2 = compute_build_context_hash(
+                container_dir=container_dir,
+                security=SecurityProfile(name="open"),
+                agent=AgentConfig(name="claude"),
+            )
+            self.assertNotEqual(h1, h2)
+
+    @mock.patch("skua.docker.compute_build_context_hash")
+    @mock.patch("skua.docker._image_label")
+    def test_image_matches_build_context_uses_hash_label(self, mock_label, mock_hash):
+        from skua.docker import image_matches_build_context
+        mock_hash.return_value = "abc123"
+        mock_label.return_value = "abc123"
+        self.assertTrue(image_matches_build_context("img", Path("/tmp")))
+        mock_label.return_value = "different"
+        self.assertFalse(image_matches_build_context("img", Path("/tmp")))
+
 
 class TestRunCommandEnv(unittest.TestCase):
     """Test runtime env injection for agent-aware entrypoint behavior."""
@@ -347,6 +389,83 @@ class TestRunCommandEnv(unittest.TestCase):
             joined = " ".join(cmd)
             self.assertIn(f"{clone_dir}:/home/dev/platform-api", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/platform-api", joined)
+
+    def test_detached_run_command_replaces_interactive_flags(self):
+        from skua.commands.run import _detached_run_command
+        cmd = ["docker", "run", "-it", "--rm", "--name", "skua-p1", "skua-base"]
+        detached = _detached_run_command(cmd)
+        self.assertEqual(detached[:4], ["docker", "run", "-d", "--rm"])
+        self.assertNotIn("-it", detached)
+        self.assertEqual(detached[-3], "bash")
+        self.assertEqual(detached[-2], "-lc")
+        self.assertIn("tmux", detached[-1])
+
+
+class TestBuildCommandImageDrift(unittest.TestCase):
+    """Test skua build rebuilding logic for stale managed images."""
+
+    def _setup_store(self, tmpdir):
+        store = mock.Mock()
+        store.is_initialized.return_value = True
+
+        container_dir = Path(tmpdir) / "container"
+        container_dir.mkdir(parents=True)
+        (container_dir / "entrypoint.sh").write_text("#!/bin/bash\n")
+        store.get_container_dir.return_value = container_dir
+
+        store.load_global.return_value = {
+            "imageName": "skua-base",
+            "baseImage": "debian:bookworm-slim",
+            "defaults": {"security": "open"},
+            "image": {"extraPackages": [], "extraCommands": []},
+        }
+        store.load_security.return_value = SecurityProfile(name="open")
+        project = Project(name="proj", agent="codex")
+        agent = AgentConfig(name="codex")
+        store.load_agent.return_value = agent
+        return store, project
+
+    @mock.patch("skua.commands.build.build_image")
+    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_exists")
+    @mock.patch("skua.commands.build._required_projects")
+    @mock.patch("skua.commands.build.ConfigStore")
+    def test_rebuilds_existing_image_when_context_drifted(
+        self, MockStore, mock_required, mock_exists, mock_match, mock_build
+    ):
+        from skua.commands.build import cmd_build
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, project = self._setup_store(tmpdir)
+            MockStore.return_value = store
+            mock_required.return_value = [project]
+            mock_exists.return_value = True
+            mock_match.return_value = False
+            mock_build.return_value = True
+
+            cmd_build(argparse.Namespace())
+            mock_build.assert_called_once()
+            mock_match.assert_called_once()
+
+    @mock.patch("skua.commands.build.build_image")
+    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_exists")
+    @mock.patch("skua.commands.build._required_projects")
+    @mock.patch("skua.commands.build.ConfigStore")
+    def test_skips_rebuild_when_existing_image_matches_context(
+        self, MockStore, mock_required, mock_exists, mock_match, mock_build
+    ):
+        from skua.commands.build import cmd_build
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, project = self._setup_store(tmpdir)
+            MockStore.return_value = store
+            mock_required.return_value = [project]
+            mock_exists.return_value = True
+            mock_match.return_value = True
+            mock_build.return_value = True
+
+            cmd_build(argparse.Namespace())
+            mock_build.assert_not_called()
+            mock_match.assert_called_once()
 
 
 class TestAuthSeeding(unittest.TestCase):

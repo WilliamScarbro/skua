@@ -11,6 +11,8 @@ AUTH_FILES_RAW="${SKUA_AUTH_FILES:-}"
 PROJECT_DIR="${SKUA_PROJECT_DIR:-/home/dev/project}"
 IMAGE_REQUEST_FILE="${SKUA_IMAGE_REQUEST_FILE:-$PROJECT_DIR/.skua/image-request.yaml}"
 ADAPT_GUIDE_FILE="${SKUA_ADAPT_GUIDE_FILE:-$PROJECT_DIR/.skua/ADAPT.md}"
+TMUX_ENABLE="${SKUA_TMUX_ENABLE:-1}"
+TMUX_SESSION="${SKUA_TMUX_SESSION:-skua}"
 
 echo "============================================"
 echo "  skua — Dockerized Coding Agent"
@@ -143,12 +145,32 @@ echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
 if [ "$AGENT_COMMAND" = "claude" ]; then
     echo "  claude-dsp     -> Start with --dangerously-skip-permissions"
 fi
+if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
+    echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
+    echo "  tmux detach: Ctrl-b then d"
+fi
 echo ""
 echo "============================================"
 echo ""
 
 # Drop into interactive shell or run provided command
 if [ $# -eq 0 ]; then
+    if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
+        TMUX_START_DIR="/home/dev"
+        if [ -d "$PROJECT_DIR" ]; then
+            TMUX_START_DIR="$PROJECT_DIR"
+        fi
+
+        if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            tmux new-session -d -s "$TMUX_SESSION" -c "$TMUX_START_DIR" /bin/bash
+        fi
+
+        # Keep PID 1 alive while the tmux session exists.
+        while tmux has-session -t "$TMUX_SESSION" 2>/dev/null; do
+            sleep 1
+        done
+        exit 0
+    fi
     exec /bin/bash
 else
     exec "$@"

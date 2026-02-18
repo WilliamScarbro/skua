@@ -51,8 +51,8 @@ skua adapt myapp
 skua run myapp
 ```
 
-### 5. Start Claude in the container
-Inside the container shell:
+### 5. Start Claude in the tmux session
+`skua run` auto-attaches you to a persistent `tmux` session in the container. Run:
 
 ```bash
 claude
@@ -66,13 +66,13 @@ claude login
 
 Credentials are persisted, so later runs usually do not require login again.
 
-### 6. Detach from the running container
-Keep the container running and detach your terminal:
+### 6. Detach and keep the session alive
+Detach from `tmux` and return to your host shell:
 
-- Press `Ctrl-p`, then `Ctrl-q`
+- Press `Ctrl-b`, then `d`
 
 ### 7. Reattach later
-Run the same command again and accept the attach prompt:
+Run the same command again to reattach to the same tmux session:
 
 ```bash
 skua run myapp

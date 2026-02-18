@@ -41,12 +41,13 @@ skua adapt myapp
 # Launch the container
 skua run myapp
 
-# Inside the container:
+# Inside the tmux session in the container:
 codex login     # copy the URL into your host browser
 codex           # start coding
 ```
 
 Subsequent `skua run` invocations reuse saved credentials — no re-login needed.
+Detach and keep the session running with `Ctrl-b`, then `d`. Re-run `skua run myapp` to reattach.
 
 ## Quick Mode
 
