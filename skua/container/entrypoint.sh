@@ -38,11 +38,48 @@ fi
 
 # ── SSH key pair (read-only mount -> local copy with correct perms) ───
 SSH_KEY=""
+# Remote-host mode: SSH key/known_hosts can be passed via base64 env vars.
+if [ -n "${SKUA_SSH_KEY_B64:-}" ] || [ -n "${SKUA_SSH_PUB_KEY_B64:-}" ] || [ -n "${SKUA_SSH_KNOWN_HOSTS_B64:-}" ]; then
+    mkdir -p /home/dev/.ssh
+    chmod 700 /home/dev/.ssh
+    REMOTE_KEY_NAME="${SSH_KEY_NAME:-id_key}"
+
+    if [ -n "${SKUA_SSH_KEY_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_KEY_B64" | base64 -d > "/home/dev/.ssh/${REMOTE_KEY_NAME}" 2>/dev/null; then
+            chmod 600 "/home/dev/.ssh/${REMOTE_KEY_NAME}"
+        else
+            rm -f "/home/dev/.ssh/${REMOTE_KEY_NAME}" || true
+            echo "[!!] Failed to decode SKUA_SSH_KEY_B64"
+        fi
+    fi
+
+    if [ -n "${SKUA_SSH_PUB_KEY_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_PUB_KEY_B64" | base64 -d > "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub" 2>/dev/null; then
+            chmod 600 "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub"
+        else
+            rm -f "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub" || true
+            echo "[!!] Failed to decode SKUA_SSH_PUB_KEY_B64"
+        fi
+    fi
+
+    if [ -n "${SKUA_SSH_KNOWN_HOSTS_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_KNOWN_HOSTS_B64" | base64 -d > /home/dev/.ssh/known_hosts 2>/dev/null; then
+            chmod 600 /home/dev/.ssh/known_hosts
+        else
+            rm -f /home/dev/.ssh/known_hosts || true
+            echo "[!!] Failed to decode SKUA_SSH_KNOWN_HOSTS_B64"
+        fi
+    fi
+fi
+
 if [ -d /home/dev/.ssh-mount ] && [ "$(ls -A /home/dev/.ssh-mount 2>/dev/null)" ]; then
     mkdir -p /home/dev/.ssh
     cp /home/dev/.ssh-mount/* /home/dev/.ssh/ 2>/dev/null || true
     chmod 700 /home/dev/.ssh
     chmod 600 /home/dev/.ssh/* 2>/dev/null || true
+fi
+
+if [ -d /home/dev/.ssh ] && [ "$(ls -A /home/dev/.ssh 2>/dev/null)" ]; then
     if [ -n "$SSH_KEY_NAME" ] && [ -f "/home/dev/.ssh/${SSH_KEY_NAME}" ]; then
         SSH_KEY="/home/dev/.ssh/${SSH_KEY_NAME}"
     else
@@ -57,10 +94,10 @@ if [ -d /home/dev/.ssh-mount ] && [ "$(ls -A /home/dev/.ssh-mount 2>/dev/null)" 
         echo "[OK] SSH key loaded: ${SSH_KEY_BASENAME}"
         echo "[OK] Git SSH command configured for SSH remotes"
     else
-        echo "[--] SSH mount found but no private key detected"
+        echo "[--] SSH material found but no private key detected"
     fi
 else
-    echo "[--] No SSH key mounted"
+    echo "[--] No SSH key provided"
 fi
 
 # ── Fix volume ownership (Docker creates named volumes as root) ───────

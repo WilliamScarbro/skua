@@ -130,7 +130,7 @@ skua build
 | `skua validate <name>` | Validate project configuration |
 | `skua describe <name>` | Show resolved configuration as YAML |
 | `skua clean [name]` | Remove saved credentials |
-| `skua remove <name>` | Remove a project |
+| `skua remove <name>` | Remove a project (including optional remote cleanup for remote projects) |
 | `skua purge` | Remove all local skua state (config + Docker artifacts) |
 
 For advanced security/environment setup, go to:

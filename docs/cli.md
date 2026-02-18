@@ -83,6 +83,12 @@ Remove a project configuration. Optionally removes persisted agent data.
 skua remove myapp
 ```
 
+For remote projects (`spec.host` set), `skua remove` can also remove remote Docker resources for that project:
+- container (`skua-<name>`)
+- auth volume (`skua-<name>-<agent>`)
+- repo volume (`skua-<name>-repo`, when repo-backed)
+- project image tag used by the project
+
 ### `skua run <name>`
 
 Start a container for a project. Validates configuration before launching. Skua starts the container in detached mode and attaches to a persistent in-container `tmux` session by default.
@@ -93,6 +99,16 @@ Use `skua adapt <name>` to have the agent generate/apply image updates in one co
 ```bash
 skua run myapp
 ```
+
+Remote project behavior (`spec.host` set):
+- Skua first tries `DOCKER_HOST=ssh://<host>` transport.
+- If that fails (for example Snap Docker CLI cannot exec `ssh`), Skua offers:
+  1. install standalone non-Snap Docker CLI now
+  2. continue with SSH fallback transport (`ssh <host> docker ...`)
+  3. cancel
+- Option 1 runs the bundled installer script (`skua/scripts/install_docker_cli.sh`) and retries.
+- Project SSH key and known_hosts are injected into remote clone/run paths.
+- Agent auth files are seeded into the remote auth volume on startup.
 
 Detach while keeping container/session alive with `Ctrl-b`, then `d`. Re-run `skua run myapp` to reattach.
 

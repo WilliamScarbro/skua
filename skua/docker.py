@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BUSL-1.1
 """Docker operations — build images, run containers, query state."""
 
+import base64
 import hashlib
 import os
 import shutil
@@ -508,16 +509,32 @@ def build_run_command(
 
     # SSH key mounts
     ssh_key = project.ssh.private_key
+    is_remote_host = bool(getattr(project, "host", ""))
     if ssh_key and Path(ssh_key).is_file():
         key_name = Path(ssh_key).name
-        docker_cmd.extend(["-v", f"{ssh_key}:/home/dev/.ssh-mount/{key_name}:ro"])
         docker_cmd.extend(["-e", f"SKUA_SSH_KEY_NAME={key_name}"])
-        pub_key = f"{ssh_key}.pub"
-        if Path(pub_key).is_file():
-            docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+
+        if is_remote_host:
+            key_b64 = base64.b64encode(Path(ssh_key).read_bytes()).decode("ascii")
+            docker_cmd.extend(["-e", f"SKUA_SSH_KEY_B64={key_b64}"])
+        else:
+            docker_cmd.extend(["-v", f"{ssh_key}:/home/dev/.ssh-mount/{key_name}:ro"])
+
+        pub_key = Path(f"{ssh_key}.pub")
+        if pub_key.is_file():
+            if is_remote_host:
+                pub_b64 = base64.b64encode(pub_key.read_bytes()).decode("ascii")
+                docker_cmd.extend(["-e", f"SKUA_SSH_PUB_KEY_B64={pub_b64}"])
+            else:
+                docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+
         known_hosts = Path(ssh_key).parent / "known_hosts"
         if known_hosts.is_file():
-            docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
+            if is_remote_host:
+                known_hosts_b64 = base64.b64encode(known_hosts.read_bytes()).decode("ascii")
+                docker_cmd.extend(["-e", f"SKUA_SSH_KNOWN_HOSTS_B64={known_hosts_b64}"])
+            else:
+                docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
 
     # Project directory mount (local bind-mount or remote named volume)
     if repo_volume:

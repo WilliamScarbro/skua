@@ -9,6 +9,7 @@ import sys
 import json
 import shlex
 import base64
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,10 +30,230 @@ from skua.docker import (
 from skua.project_adapt import ensure_adapt_workspace
 
 
+def _is_snap_binary(path: str) -> bool:
+    if not path:
+        return False
+
+    raw = str(Path(path).expanduser())
+    if raw.startswith("/snap/") or "/snap/bin/" in raw or raw.startswith("/var/lib/snapd/snap/bin/"):
+        return True
+
+    try:
+        resolved = str(Path(raw).resolve())
+    except OSError:
+        resolved = raw
+    return resolved.startswith("/snap/")
+
+
+def _find_non_snap_docker_binary() -> str:
+    """Return a preferred non-Snap docker CLI path when available."""
+    current = shutil.which("docker") or ""
+    if current and not _is_snap_binary(current):
+        return current
+
+    candidates = [
+        "/usr/local/bin/docker",
+        str(Path.home() / ".local" / "bin" / "docker"),
+        "/usr/bin/docker",
+    ]
+    for candidate in candidates:
+        p = Path(candidate).expanduser()
+        if p.is_file() and os.access(p, os.X_OK) and not _is_snap_binary(str(p)):
+            return str(p)
+    return ""
+
+
+def _prefer_non_snap_docker_on_path() -> str:
+    """Prepend non-Snap docker binary dir to PATH; returns selected binary or empty."""
+    docker_bin = _find_non_snap_docker_binary()
+    if not docker_bin:
+        return ""
+    docker_dir = str(Path(docker_bin).parent)
+    path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if docker_dir in path_parts:
+        path_parts = [docker_dir] + [p for p in path_parts if p != docker_dir]
+    else:
+        path_parts = [docker_dir] + path_parts
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+    return docker_bin
+
+
+def _ensure_local_ssh_client_for_remote_docker(host: str):
+    """Fail fast when Docker remote mode cannot execute the local SSH client."""
+    ssh_path = shutil.which("ssh")
+    if not ssh_path:
+        print("Error: Remote Docker host requires a local SSH client, but 'ssh' is not in PATH.")
+        print("  Install OpenSSH client and retry (example: apt install openssh-client).")
+        sys.exit(1)
+
+    if not os.access(ssh_path, os.X_OK):
+        print(f"Error: Local SSH client is not executable: {ssh_path}")
+        print("  Docker remote mode shells out to this binary (DOCKER_HOST=ssh://...).")
+        print("  Fix permissions or reinstall OpenSSH client, then retry.")
+        sys.exit(1)
+
+    try:
+        subprocess.run([ssh_path, "-V"], capture_output=True, text=True, check=False)
+    except PermissionError:
+        print(f"Error: Cannot execute local SSH client '{ssh_path}' (permission denied).")
+        print("  Docker remote mode shells out to this binary (DOCKER_HOST=ssh://...).")
+        print("  Fix local execute permissions or reinstall OpenSSH client, then retry.")
+        print(f"  Remote host: {host}")
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Error: Failed to execute local SSH client '{ssh_path}': {exc}")
+        print("  Docker remote mode requires a working local SSH client.")
+        print(f"  Remote host: {host}")
+        sys.exit(1)
+
+
+def _probe_current_docker_connection() -> tuple:
+    """Return (ok, error_message) for `docker version` with current env/PATH."""
+    try:
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, "docker CLI was not found in PATH."
+
+    if result.returncode == 0:
+        return True, ""
+
+    msg = (result.stderr or result.stdout or "").strip()
+    if not msg:
+        msg = f"docker exited with status {result.returncode}"
+    return False, msg
+
+
+def _print_docker_cli_install_hint():
+    """Print guidance for installing a non-Snap Docker CLI without replacing Snap."""
+    print("Tip: install a non-Snap Docker CLI binary and retry with DOCKER_HOST mode.")
+    print("  No local daemon is required for Skua remote mode.")
+    print("  Prefer CLI-only packages (for example: docker-ce-cli) or a standalone docker CLI binary.")
+    print("  Then verify:")
+    print("    which docker")
+    print("    docker --version")
+
+
+def _docker_cli_installer_script() -> Path:
+    """Return path to the standalone Docker CLI installer script."""
+    return Path(__file__).resolve().parent.parent / "scripts" / "install_docker_cli.sh"
+
+
+def _run_docker_cli_installer() -> bool:
+    """Run the installer script for a non-Snap Docker CLI."""
+    installer = _docker_cli_installer_script()
+    if not installer.is_file():
+        print(f"Error: Docker CLI installer script not found: {installer}")
+        return False
+
+    cmd = [str(installer)] if os.access(installer, os.X_OK) else ["bash", str(installer)]
+    print(f"Running installer: {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def _prompt_remote_docker_recovery_action() -> str:
+    """Prompt for next action after DOCKER_HOST failure: install, fallback, or cancel."""
+    print("Choose how to continue:")
+    print("  1. Install standalone Docker CLI now (keeps Snap Docker unchanged)")
+    print("  2. Continue with SSH fallback now (no local Docker CLI needed)")
+    print("  3. Cancel")
+    choice = input("Select option [1/2/3, default 1]: ").strip().lower()
+    if choice in ("", "1", "i", "install"):
+        return "install"
+    if choice in ("2", "f", "fallback", "ssh"):
+        return "fallback"
+    return "cancel"
+
+
+def _enable_ssh_docker_wrapper(host: str):
+    """Route `docker ...` calls through `ssh <host> docker ...` for this process."""
+    wrapper_dir = Path(tempfile.mkdtemp(prefix="skua-ssh-docker-"))
+    wrapper = wrapper_dir / "docker"
+    host_quoted = shlex.quote(host)
+
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "tty_flag=''\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$arg\" = \"-it\" ] || [ \"$arg\" = \"-ti\" ]; then\n"
+        "    tty_flag='-tt'\n"
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        f"exec ssh $tty_flag {host_quoted} docker \"$@\"\n"
+    )
+    wrapper.chmod(0o700)
+
+    current_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{wrapper_dir}:{current_path}" if current_path else str(wrapper_dir)
+    os.environ.pop("DOCKER_HOST", None)
+    os.environ["SKUA_DOCKER_TRANSPORT"] = "ssh-wrapper"
+    os.environ["SKUA_DOCKER_REMOTE_HOST"] = host
+
+
+def _configure_remote_docker_transport(host: str):
+    """Try DOCKER_HOST transport first, then offer SSH wrapper fallback."""
+    os.environ.pop("SKUA_DOCKER_TRANSPORT", None)
+    os.environ.pop("SKUA_DOCKER_REMOTE_HOST", None)
+    selected_bin = _prefer_non_snap_docker_on_path()
+    if selected_bin:
+        print(f"Using docker CLI: {selected_bin}")
+    os.environ["DOCKER_HOST"] = f"ssh://{host}"
+    print(f"Connecting to remote host '{host}' via DOCKER_HOST...")
+
+    ok, err = _probe_current_docker_connection()
+    if ok:
+        return
+
+    print("Warning: Remote Docker connection via DOCKER_HOST failed.")
+    print(f"  {err}")
+    _print_docker_cli_install_hint()
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        action = _prompt_remote_docker_recovery_action()
+        if action == "install":
+            if not _run_docker_cli_installer():
+                print("Warning: Docker CLI installer failed.")
+                fallback = input("Use SSH fallback transport now? [Y/n]: ").strip().lower()
+                if fallback == "n":
+                    sys.exit(1)
+            else:
+                selected_bin = _prefer_non_snap_docker_on_path()
+                if selected_bin:
+                    print(f"Using docker CLI: {selected_bin}")
+                os.environ["DOCKER_HOST"] = f"ssh://{host}"
+                ok, err = _probe_current_docker_connection()
+                if ok:
+                    return
+                print("Warning: DOCKER_HOST is still failing after install.")
+                print(f"  {err}")
+                fallback = input("Use SSH fallback transport now? [Y/n]: ").strip().lower()
+                if fallback == "n":
+                    sys.exit(1)
+        elif action == "cancel":
+            sys.exit(1)
+    else:
+        print("Non-interactive session detected; falling back to SSH transport.")
+
+    print("Using SSH fallback transport: ssh <host> docker ...")
+    _enable_ssh_docker_wrapper(host)
+    ok, err = _probe_current_docker_connection()
+    if not ok:
+        print("Error: SSH fallback transport failed.")
+        print(f"  {err}")
+        sys.exit(1)
+
+
 def _clone_repo_into_remote_volume(project, vol_name: str):
     """Clone the project repo into a Docker named volume using alpine/git.
 
-    Requires DOCKER_HOST to already be set to the remote host.
+    Requires the current process Docker transport to target the remote host.
     Skips silently if the repo is already cloned in the volume.
     """
     check = subprocess.run(
@@ -48,16 +269,63 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
         print(f"Using existing repo clone in volume '{vol_name}'.")
         return
 
-    print(f"Cloning {project.repo} into remote volume '{vol_name}'...")
-    result = subprocess.run([
+    clone_env = os.environ.copy()
+    clone_env["SKUA_REMOTE_GIT_REPO"] = project.repo
+
+    ssh_cmd_parts = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
+    key_var = ""
+    known_hosts_var = ""
+    key_path_value = str(getattr(project.ssh, "private_key", "") or "").strip()
+    if key_path_value:
+        key_path = Path(key_path_value).expanduser()
+        if key_path.is_file():
+            key_b64 = base64.b64encode(key_path.read_bytes()).decode("ascii")
+            key_var = "SKUA_REMOTE_GIT_SSH_KEY_B64"
+            clone_env[key_var] = key_b64
+            ssh_cmd_parts.extend(["-i", "/tmp/skua-ssh/id_key", "-o", "IdentitiesOnly=yes"])
+
+            known_hosts_path = key_path.parent / "known_hosts"
+            if known_hosts_path.is_file():
+                known_hosts_b64 = base64.b64encode(known_hosts_path.read_bytes()).decode("ascii")
+                known_hosts_var = "SKUA_REMOTE_GIT_KNOWN_HOSTS_B64"
+                clone_env[known_hosts_var] = known_hosts_b64
+                ssh_cmd_parts.extend(["-o", "UserKnownHostsFile=/tmp/skua-ssh/known_hosts"])
+        else:
+            print(f"Warning: SSH key not found for remote clone: {key_path}")
+            print("  Falling back to remote host SSH defaults.")
+
+    setup_script = (
+        "set -eu\n"
+        "if [ -n \"${SKUA_REMOTE_GIT_SSH_KEY_B64:-}\" ]; then\n"
+        "  mkdir -p /tmp/skua-ssh\n"
+        "  printf '%s' \"$SKUA_REMOTE_GIT_SSH_KEY_B64\" | base64 -d > /tmp/skua-ssh/id_key\n"
+        "  chmod 600 /tmp/skua-ssh/id_key\n"
+        "fi\n"
+        "if [ -n \"${SKUA_REMOTE_GIT_KNOWN_HOSTS_B64:-}\" ]; then\n"
+        "  mkdir -p /tmp/skua-ssh\n"
+        "  printf '%s' \"$SKUA_REMOTE_GIT_KNOWN_HOSTS_B64\" | base64 -d > /tmp/skua-ssh/known_hosts\n"
+        "  chmod 600 /tmp/skua-ssh/known_hosts\n"
+        "fi\n"
+        f"export GIT_SSH_COMMAND={shlex.quote(' '.join(ssh_cmd_parts))}\n"
+        "git clone \"$SKUA_REMOTE_GIT_REPO\" /workspace\n"
+    )
+
+    clone_cmd = [
         "docker", "run", "--rm",
         "-v", f"{vol_name}:/workspace",
-        "alpine/git",
-        "clone", project.repo, "/workspace",
-    ])
+        "-e", "SKUA_REMOTE_GIT_REPO",
+    ]
+    if key_var:
+        clone_cmd.extend(["-e", key_var])
+    if known_hosts_var:
+        clone_cmd.extend(["-e", known_hosts_var])
+    clone_cmd.extend(["--entrypoint", "sh", "alpine/git", "-lc", setup_script])
+
+    print(f"Cloning {project.repo} into remote volume '{vol_name}'...")
+    result = subprocess.run(clone_cmd, env=clone_env)
     if result.returncode != 0:
         print("Error: Failed to clone repository into remote volume.")
-        print("  Tip: For private SSH repositories, ensure git/SSH access is configured on the remote host.")
+        print("  Tip: Confirm repository access for the configured SSH key and remote host network reachability.")
         sys.exit(1)
 
 
@@ -77,6 +345,50 @@ def _seed_auth_from_host(data_dir: Path, cred, agent, overwrite: bool = False) -
         if src.is_file():
             shutil.copy2(src, dest)
             copied += 1
+    return copied
+
+
+def _seed_auth_into_remote_volume(project_name: str, agent_name: str, cred, agent, overwrite: bool = False) -> int:
+    """Seed auth files from local host into a remote Docker named volume."""
+    sources = resolve_credential_sources(cred, agent)
+    copied = 0
+    vol_name = f"skua-{project_name}-{agent_name}"
+
+    for src, dest_name in sources:
+        if not src.is_file():
+            continue
+
+        safe_dest = Path(dest_name).name.strip()
+        if not safe_dest:
+            continue
+
+        if not overwrite:
+            exists = subprocess.run(
+                ["docker", "run", "--rm", "-v", f"{vol_name}:/auth", "alpine", "test", "-f", f"/auth/{safe_dest}"],
+                capture_output=True,
+                text=True,
+            )
+            if exists.returncode == 0:
+                continue
+
+        payload = base64.b64encode(src.read_bytes()).decode("ascii")
+        copy_env = os.environ.copy()
+        copy_env["SKUA_AUTH_DEST"] = safe_dest
+        copy_env["SKUA_AUTH_FILE_B64"] = payload
+        copy_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{vol_name}:/auth",
+            "-e", "SKUA_AUTH_DEST",
+            "-e", "SKUA_AUTH_FILE_B64",
+            "alpine", "sh", "-lc",
+            'set -eu; printf "%s" "$SKUA_AUTH_FILE_B64" | base64 -d > "/auth/$SKUA_AUTH_DEST"; chmod 600 "/auth/$SKUA_AUTH_DEST"',
+        ]
+        result = subprocess.run(copy_cmd, env=copy_env)
+        if result.returncode == 0:
+            copied += 1
+        else:
+            print(f"Warning: failed to sync remote auth file '{safe_dest}' into volume '{vol_name}'.")
+
     return copied
 
 
@@ -284,8 +596,8 @@ def cmd_run(args):
 
     # Route Docker operations to remote host when specified
     if host:
-        os.environ["DOCKER_HOST"] = f"ssh://{host}"
-        print(f"Connecting to remote host '{host}'...")
+        _ensure_local_ssh_client_for_remote_docker(host)
+        _configure_remote_docker_transport(host)
 
     container_name = f"skua-{name}"
 
@@ -420,6 +732,18 @@ def cmd_run(args):
         if copied:
             action = "Synced" if refreshed else "Seeded"
             print(f"{action} {copied} auth file(s).")
+    elif host:
+        refreshed = _maybe_refresh_local_credentials(agent=agent, cred=cred)
+        copied = _seed_auth_into_remote_volume(
+            project_name=name,
+            agent_name=project.agent,
+            cred=cred,
+            agent=agent,
+            overwrite=refreshed,
+        )
+        if copied:
+            action = "Synced" if refreshed else "Seeded"
+            print(f"{action} {copied} remote auth file(s).")
 
     # Build and exec docker command
     docker_cmd = build_run_command(

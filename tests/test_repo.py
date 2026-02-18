@@ -375,6 +375,48 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn("SKUA_CREDENTIAL_NAME=cred-main", joined)
             self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
 
+    def test_build_run_command_remote_host_embeds_ssh_material(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_file = Path(tmpdir) / "id_ed25519"
+            key_data = "test-key"
+            key_file.write_text(key_data)
+            pub_file = Path(tmpdir) / "id_ed25519.pub"
+            pub_data = "ssh-ed25519 AAAA test"
+            pub_file.write_text(pub_data)
+            known_hosts = Path(tmpdir) / "known_hosts"
+            kh_data = "github.com ssh-ed25519 AAAA"
+            known_hosts.write_text(kh_data)
+
+            project = Project(
+                name="p1",
+                directory="",
+                host="docker.example.com",
+                agent="codex",
+                ssh=ProjectSshSpec(private_key=str(key_file)),
+            )
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="codex",
+                runtime=AgentRuntimeSpec(command="codex"),
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            joined = " ".join(cmd)
+
+            expected_key_b64 = base64.b64encode(key_data.encode("utf-8")).decode("ascii")
+            expected_pub_b64 = base64.b64encode(pub_data.encode("utf-8")).decode("ascii")
+            expected_kh_b64 = base64.b64encode(kh_data.encode("utf-8")).decode("ascii")
+
+            self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
+            self.assertIn(f"SKUA_SSH_KEY_B64={expected_key_b64}", joined)
+            self.assertIn(f"SKUA_SSH_PUB_KEY_B64={expected_pub_b64}", joined)
+            self.assertIn(f"SKUA_SSH_KNOWN_HOSTS_B64={expected_kh_b64}", joined)
+            self.assertNotIn("/home/dev/.ssh-mount", joined)
+
     def test_build_run_command_mounts_host_directory_name(self):
         from skua.docker import build_run_command
 
