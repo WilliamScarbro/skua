@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BUSL-1.1
-"""Project image-prep helpers.
+"""Project image-adapt helpers.
 
-This module manages per-project prep guidance and image request templates.
+This module manages per-project adapt guidance and image request templates.
 """
 
 from pathlib import Path
@@ -9,40 +9,46 @@ from pathlib import Path
 import yaml
 
 
-PREP_DIRNAME = ".skua"
-PREP_GUIDE_NAME = "PREP.md"
+ADAPT_DIRNAME = ".skua"
+ADAPT_GUIDE_NAME = "ADAPT.md"
 IMAGE_REQUEST_NAME = "image-request.yaml"
 
 
-def prep_dir(project_dir: Path) -> Path:
-    """Return the .skua prep directory path for a project."""
-    return project_dir / PREP_DIRNAME
+def adapt_dir(project_dir: Path) -> Path:
+    """Return the .skua adapt directory path for a project."""
+    return project_dir / ADAPT_DIRNAME
 
 
-def prep_guide_path(project_dir: Path) -> Path:
-    """Return the prep guide path for a project."""
-    return prep_dir(project_dir) / PREP_GUIDE_NAME
+def adapt_guide_path(project_dir: Path) -> Path:
+    """Return the adapt guide path for a project."""
+    return adapt_dir(project_dir) / ADAPT_GUIDE_NAME
 
 
 def image_request_path(project_dir: Path) -> Path:
     """Return the image request template path for a project."""
-    return prep_dir(project_dir) / IMAGE_REQUEST_NAME
+    return adapt_dir(project_dir) / IMAGE_REQUEST_NAME
 
 
-def ensure_prep_workspace(project_dir: Path, project_name: str, agent_name: str) -> tuple[Path, Path]:
-    """Create per-project prep files if missing and return (guide, request) paths."""
-    d = prep_dir(project_dir)
+def ensure_adapt_workspace(project_dir: Path, project_name: str, agent_name: str) -> tuple[Path, Path]:
+    """Create per-project adapt files if missing and return (guide, request) paths."""
+    d = adapt_dir(project_dir)
     d.mkdir(parents=True, exist_ok=True)
 
-    guide = prep_guide_path(project_dir)
+    guide = adapt_guide_path(project_dir)
     if not guide.exists():
-        guide.write_text(_prep_guide_text(project_name=project_name, agent_name=agent_name))
+        guide.write_text(_adapt_guide_text(project_name=project_name, agent_name=agent_name))
 
     request = image_request_path(project_dir)
     if not request.exists():
         request.write_text(_image_request_template_text())
 
-    _ensure_git_exclude(project_dir, [f"{PREP_DIRNAME}/{IMAGE_REQUEST_NAME}", f"{PREP_DIRNAME}/{PREP_GUIDE_NAME}"])
+    _ensure_git_exclude(
+        project_dir,
+        [
+            f"{ADAPT_DIRNAME}/{IMAGE_REQUEST_NAME}",
+            f"{ADAPT_DIRNAME}/{ADAPT_GUIDE_NAME}",
+        ],
+    )
     return guide, request
 
 
@@ -140,9 +146,9 @@ def write_applied_image_request(path: Path, request: dict, version: int):
         yaml.dump(req, f, default_flow_style=False, sort_keys=False)
 
 
-def _prep_guide_text(project_name: str, agent_name: str) -> str:
+def _adapt_guide_text(project_name: str, agent_name: str) -> str:
     return f"""# SPDX-License-Identifier: BUSL-1.1
-# Skua Image Prep ({project_name})
+# Skua Image Adapt ({project_name})
 
 Use this workflow to let `{agent_name}` suggest container image changes without writing a Dockerfile.
 
@@ -150,7 +156,7 @@ Use this workflow to let `{agent_name}` suggest container image changes without 
 2. Ask `{agent_name}` to inspect the repo and update:
    - `.skua/{IMAGE_REQUEST_NAME}`
 3. On the host, apply that request:
-   - `skua prep {project_name}`
+   - `skua adapt {project_name}`
 4. Start again with updated image config:
    - `skua run {project_name}`
 
@@ -165,7 +171,7 @@ Request rules:
 
 def _image_request_template_text() -> str:
     return f"""# SPDX-License-Identifier: BUSL-1.1
-# Skua image request template (filled by your agent and applied by `skua prep`)
+# Skua image request template (filled by your agent and applied by `skua adapt`)
 schemaVersion: 1
 status: draft
 summary: ""
@@ -185,7 +191,7 @@ commands: []
 
 
 def _ensure_git_exclude(project_dir: Path, patterns: list):
-    """Add prep artifacts to .git/info/exclude when this is a git repo."""
+    """Add adapt artifacts to .git/info/exclude when this is a git repo."""
     git_dir = project_dir / ".git"
     if not git_dir.is_dir():
         return

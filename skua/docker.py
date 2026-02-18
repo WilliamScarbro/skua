@@ -506,7 +506,7 @@ def build_run_command(
         docker_cmd.extend(["-v", f"{project.directory}:{project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_DIR={project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_IMAGE_REQUEST_FILE={project_mount_path}/.skua/image-request.yaml"])
-    docker_cmd.extend(["-e", f"SKUA_PREP_GUIDE_FILE={project_mount_path}/.skua/PREP.md"])
+    docker_cmd.extend(["-e", f"SKUA_ADAPT_GUIDE_FILE={project_mount_path}/.skua/ADAPT.md"])
 
     # Persistence mount
     auth_dir = ".claude"

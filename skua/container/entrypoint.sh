@@ -10,7 +10,7 @@ AUTH_DIR="/home/dev/${AUTH_DIR_REL#/}"
 AUTH_FILES_RAW="${SKUA_AUTH_FILES:-}"
 PROJECT_DIR="${SKUA_PROJECT_DIR:-/home/dev/project}"
 IMAGE_REQUEST_FILE="${SKUA_IMAGE_REQUEST_FILE:-$PROJECT_DIR/.skua/image-request.yaml}"
-PREP_GUIDE_FILE="${SKUA_PREP_GUIDE_FILE:-$PROJECT_DIR/.skua/PREP.md}"
+ADAPT_GUIDE_FILE="${SKUA_ADAPT_GUIDE_FILE:-$PROJECT_DIR/.skua/ADAPT.md}"
 
 echo "============================================"
 echo "  skua — Dockerized Coding Agent"
@@ -113,10 +113,10 @@ if [ -d "$PROJECT_DIR" ] && [ "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
     echo "Project: ${PROJECT_DIR}"
     cd "$PROJECT_DIR"
     if [ -f "$IMAGE_REQUEST_FILE" ]; then
-        echo "Image prep request: ${IMAGE_REQUEST_FILE}"
+        echo "Image adapt request: ${IMAGE_REQUEST_FILE}"
     fi
-    if [ -f "$PREP_GUIDE_FILE" ]; then
-        echo "Prep guide: ${PREP_GUIDE_FILE}"
+    if [ -f "$ADAPT_GUIDE_FILE" ]; then
+        echo "Adapt guide: ${ADAPT_GUIDE_FILE}"
     fi
 else
     echo "No project mounted."

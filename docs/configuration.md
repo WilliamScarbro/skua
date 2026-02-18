@@ -319,7 +319,7 @@ spec:
     extraPackages: [nodejs, npm]
     extraCommands:
       - "npm install -g typescript"
-    # Auto-incremented by `skua prep` when request changes are applied
+    # Auto-incremented by `skua adapt` when request changes are applied
     version: 1
 
   # Git identity (inherits from global if not set)
@@ -332,11 +332,10 @@ spec:
     privateKey: ~/.ssh/id_ed25519
 ```
 
-Image prep workflow:
+Image adapt workflow:
 
-1. Ask your agent to update `.skua/image-request.yaml`
-2. Run `skua prep <project>`
-3. Run `skua run <project>`
+1. Run `skua adapt <project>` (starts container + asks agent to update `.skua/image-request.yaml`)
+2. Run `skua run <project>`
 
 ---
 

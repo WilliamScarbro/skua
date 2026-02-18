@@ -18,7 +18,7 @@ from skua.docker import (
     resolve_project_image_inputs,
     run_container,
 )
-from skua.project_prep import ensure_prep_workspace
+from skua.project_adapt import ensure_adapt_workspace
 
 
 def _seed_auth_from_host(data_dir: Path, auth_dir: str, auth_files: list) -> int:
@@ -122,7 +122,7 @@ def cmd_run(args):
         project.directory = str(clone_dir)
 
     if project.directory and Path(project.directory).is_dir():
-        ensure_prep_workspace(Path(project.directory), project.name, project.agent)
+        ensure_adapt_workspace(Path(project.directory), project.name, project.agent)
 
     # Determine image name
     g = store.load_global()

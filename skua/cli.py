@@ -7,6 +7,28 @@ import sys
 from skua import __version__
 
 
+def _add_adapt_args(parser):
+    parser.add_argument("name", help="Project name to adapt")
+    parser.add_argument("--base-image", help="Override generated Dockerfile base image")
+    parser.add_argument("--from-image", help="Adapt an existing image as Dockerfile parent")
+    parser.add_argument("--package", action="append", default=[], help="Apt package to add (repeatable)")
+    parser.add_argument(
+        "--command",
+        dest="extra_command",
+        action="append",
+        default=[],
+        help="Extra setup command (repeatable)",
+    )
+    parser.add_argument(
+        "--apply-only",
+        action="store_true",
+        help="Skip automated agent run and apply existing image-request.yaml",
+    )
+    parser.add_argument("--clear", action="store_true", help="Clear project image customization")
+    parser.add_argument("--write-only", action="store_true", help="Only create adapt files; do not apply")
+    parser.add_argument("--build", action="store_true", help="Build adapted image immediately")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="skua",
@@ -46,25 +68,12 @@ def main():
     p_run = sub.add_parser("run", help="Run a container for a project")
     p_run.add_argument("name", help="Project name to run")
 
-    # prep
-    p_prep = sub.add_parser(
-        "prep",
+    # adapt
+    p_adapt = sub.add_parser(
+        "adapt",
         help="Apply project image-request template and optionally build project image",
     )
-    p_prep.add_argument("name", help="Project name to prepare")
-    p_prep.add_argument("--base-image", help="Override generated Dockerfile base image")
-    p_prep.add_argument("--from-image", help="Adapt an existing image as Dockerfile parent")
-    p_prep.add_argument("--package", action="append", default=[], help="Apt package to add (repeatable)")
-    p_prep.add_argument(
-        "--command",
-        dest="extra_command",
-        action="append",
-        default=[],
-        help="Extra setup command (repeatable)",
-    )
-    p_prep.add_argument("--clear", action="store_true", help="Clear project image customization")
-    p_prep.add_argument("--write-only", action="store_true", help="Only create prep files; do not apply")
-    p_prep.add_argument("--build", action="store_true", help="Build prepared image immediately")
+    _add_adapt_args(p_adapt)
 
     # list
     sub.add_parser("list", help="List projects and running containers")
@@ -104,7 +113,7 @@ def main():
     # Lazy import commands to keep startup fast
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run,
-        cmd_prep, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
+        cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe,
     )
 
@@ -114,7 +123,7 @@ def main():
         "add": cmd_add,
         "remove": cmd_remove,
         "run": cmd_run,
-        "prep": cmd_prep,
+        "adapt": cmd_adapt,
         "list": cmd_list,
         "clean": cmd_clean,
         "purge": cmd_purge,

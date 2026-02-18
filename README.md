@@ -29,20 +29,21 @@ Or use a GitHub repo URL:
 skua add myapp --repo git@github.com:your-org/myapp.git
 ```
 
-### 3. (Optional) Prepare a project-specific image
-Each project gets a `.skua/` prep guide and image request template:
+### 3. (Optional) Adapt a project-specific image
+Each project gets a `.skua/` adapt guide and image request template:
 
-- `.skua/PREP.md`
+- `.skua/ADAPT.md`
 - `.skua/image-request.yaml`
 
 Workflow:
 
-1. Ask your agent to inspect the project and update `.skua/image-request.yaml`
-2. Apply it:
+1. Run automated image adaptation:
 
 ```bash
-skua prep myapp
+skua adapt myapp
 ```
+
+`skua adapt` starts the project container, asks the configured agent to update `.skua/image-request.yaml`, then applies and builds the adapted project image.
 
 ### 4. Run the project container
 
@@ -122,7 +123,7 @@ skua build
 | `skua init` | First-time setup wizard |
 | `skua build` | Build images required by configured projects |
 | `skua add <name>` | Add a project (`--dir` or `--repo`) |
-| `skua prep <name>` | Apply `.skua/image-request.yaml` to project image config |
+| `skua adapt <name>` | Run agent-driven image adaptation and build updated project image |
 | `skua run <name>` | Start a container (or attach if already running) |
 | `skua list` | List projects and running status |
 | `skua config` | Show or edit global configuration |

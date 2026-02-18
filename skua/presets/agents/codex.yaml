@@ -12,6 +12,7 @@ spec:
       - npm
   runtime:
     command: codex
+    adapt_command: 'codex exec "{prompt}"'
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim

@@ -196,6 +196,7 @@ class AgentInstallSpec:
 @dataclass
 class AgentRuntimeSpec:
     command: str = ""
+    adapt_command: str = ""         # optional non-interactive command template
     env: dict = field(default_factory=dict)
     entrypoint_hooks: list = field(default_factory=list)
 

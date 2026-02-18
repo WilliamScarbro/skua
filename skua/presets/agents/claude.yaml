@@ -10,6 +10,7 @@ spec:
     required_packages: []
   runtime:
     command: claude
+    adapt_command: 'claude -p "{prompt}"'
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim

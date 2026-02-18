@@ -130,4 +130,4 @@ def cmd_build(args):
         print(f"  - {name} (existing)")
     for name in built:
         print(f"  - {name} (built)")
-    print("Use 'skua prep <name>' to apply project image-request updates before running.")
+    print("Use 'skua adapt <name>' to apply project image-request updates before running.")

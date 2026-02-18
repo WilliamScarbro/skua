@@ -6,7 +6,7 @@ from pathlib import Path
 
 from skua.config import ConfigStore, Project
 from skua.config.resources import ProjectGitSpec, ProjectSshSpec, ProjectImageSpec
-from skua.project_prep import ensure_prep_workspace
+from skua.project_adapt import ADAPT_GUIDE_NAME, ensure_adapt_workspace
 from skua.utils import find_ssh_keys
 
 
@@ -125,7 +125,7 @@ def cmd_add(args):
     if env and env.persistence.mode == "bind":
         store.project_data_dir(name, agent_name).mkdir(parents=True, exist_ok=True)
     if project_dir and Path(project_dir).is_dir():
-        ensure_prep_workspace(Path(project_dir), name, agent_name)
+        ensure_adapt_workspace(Path(project_dir), name, agent_name)
 
     # Print summary
     print(f"\nProject '{name}' added.")
@@ -136,7 +136,7 @@ def cmd_add(args):
     print(f"  {'Security:':<14} {sec_name}")
     print(f"  {'Agent:':<14} {agent_name}")
     if project_dir and Path(project_dir).is_dir():
-        print(f"  {'Prep guide:':<14} {Path(project_dir) / '.skua' / 'PREP.md'}")
+        print(f"  {'Adapt guide:':<14} {Path(project_dir) / '.skua' / ADAPT_GUIDE_NAME}")
     if ssh_key:
         print(f"  {'SSH key:':<14} {ssh_key}")
     print(f"\nRun with: skua run {name}")

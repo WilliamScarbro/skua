@@ -33,20 +33,21 @@ The image name, base image, and extra packages are configured in global config:
 skua config --tool-dir /path/to/skua
 ```
 
-### `skua prep <name>`
+### `skua adapt <name>`
 
-Apply a project image request template (`.skua/image-request.yaml`) into project config, and optionally build the resulting image.
+Start the project container, run the configured agent to update `.skua/image-request.yaml`, apply the request into project config, and build the updated project image.
 
 ```bash
-skua prep myapp                    # apply template request
-skua prep myapp --build            # apply + build now
-skua prep myapp --from-image ghcr.io/acme/app:dev
-skua prep myapp --base-image debian:bookworm-slim --package libpq-dev
-skua prep myapp --command "npm ci" --command "npm run build"
-skua prep myapp --clear            # remove project-specific image customization
+skua adapt myapp                    # run agent + apply request + build adapted image
+skua adapt myapp --build            # apply + build now
+skua adapt myapp --apply-only       # skip agent run; apply existing request file
+skua adapt myapp --from-image ghcr.io/acme/app:dev
+skua adapt myapp --base-image debian:bookworm-slim --package libpq-dev
+skua adapt myapp --command "npm ci" --command "npm run build"
+skua adapt myapp --clear            # remove project-specific image customization
 ```
 
-This workflow lets the agent suggest image changes through a template instead of writing a Dockerfile directly.
+If the agent is not logged in, `skua adapt` exits with an error and asks you to authenticate via `skua run <name>`.
 
 ### `skua add <name>`
 
@@ -86,7 +87,7 @@ skua remove myapp
 Start a container for a project. Validates configuration before launching. If the container is already running, offers to attach to it.
 
 For bind persistence, Skua auto-seeds missing agent auth files from host home into the project's persisted auth directory on first run (for example Codex `~/.codex/auth.json`).
-For image adaptation, run `skua prep <name>` after the agent updates `.skua/image-request.yaml`.
+Use `skua adapt <name>` to have the agent generate/apply image updates in one command.
 
 ```bash
 skua run myapp
