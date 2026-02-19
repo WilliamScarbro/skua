@@ -25,17 +25,32 @@ def is_container_running(name: str) -> bool:
         return False
 
 
-def get_running_skua_containers() -> list:
-    """Return list of running skua container names."""
+def get_running_skua_containers(host: str = "") -> list:
+    """Return list of running skua container names for local or remote host."""
+    cmd = ["docker", "ps", "--filter", "name=^skua-", "--format", "{{.Names}}"]
+    if host:
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            host,
+            *cmd,
+        ]
+
     try:
         result = subprocess.run(
-            ["docker", "ps", "--filter", "name=^skua-", "--format", "{{.Names}}"],
-            capture_output=True, text=True
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=8,
         )
-        if result.stdout.strip():
-            return result.stdout.strip().split("\n")
-    except FileNotFoundError:
-        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    if result.returncode != 0:
+        return []
+    if result.stdout.strip():
+        return result.stdout.strip().split("\n")
     return []
 
 
@@ -412,6 +427,7 @@ def build_image(
     base_image: str = "debian:bookworm-slim",
     extra_packages: list = None,
     extra_commands: list = None,
+    quiet: bool = False,
 ):
     """Build a Docker image, generating the Dockerfile from config.
 
@@ -467,7 +483,19 @@ def build_image(
             "-t", image_name,
             str(build_path),
         ]
-        result = subprocess.run(cmd)
+        if quiet:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                combined = "\n".join(
+                    part for part in [result.stderr, result.stdout] if part
+                )
+                lines = [line.rstrip() for line in combined.splitlines() if line.strip()]
+                if lines:
+                    print("Docker build failed. Last output:")
+                    for line in lines[-12:]:
+                        print(f"  {line}")
+        else:
+            result = subprocess.run(cmd)
         return result.returncode == 0
 
     finally:
