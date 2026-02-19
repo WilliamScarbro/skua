@@ -123,7 +123,7 @@ def main():
         help="Include git status column for repo projects",
     )
     p_list.add_argument(
-        "-i", "--image",
+        "-i", "--image", "--images",
         action="store_true",
         help="Include image column",
     )

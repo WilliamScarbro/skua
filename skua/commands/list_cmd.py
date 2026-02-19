@@ -6,7 +6,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from skua.config import ConfigStore
-from skua.docker import get_running_skua_containers, image_exists, image_name_for_project
+from skua.docker import (
+    get_running_skua_containers,
+    image_exists,
+    image_matches_build_context,
+    image_name_for_project,
+    resolve_project_image_inputs,
+)
 from skua.project_adapt import image_request_path, load_image_request, request_changes_project
 
 
@@ -139,6 +145,53 @@ def _git_status(project, store: ConfigStore) -> str:
     return "CURRENT"
 
 
+def _image_suffix(project, store: ConfigStore) -> str:
+    """Return suffix flags for image status (A=adapt, B=rebuild)."""
+    if not project:
+        return ""
+
+    flags = []
+    if _has_pending_adapt_request(project):
+        flags.append("(A)")
+
+    g = store.load_global()
+    image_name_base = g.get("imageName", "skua-base")
+    image_name = image_name_for_project(image_name_base, project)
+    if image_exists(image_name):
+        container_dir = store.get_container_dir()
+        if container_dir is None:
+            return "".join(flags)
+        defaults = g.get("defaults", {})
+        security_name = defaults.get("security", "open")
+        security = store.load_security(security_name)
+        agent = store.load_agent(project.agent)
+        if agent is None or security is None:
+            return "".join(flags)
+        image_config = g.get("image", {})
+        global_packages = image_config.get("extraPackages", [])
+        global_commands = image_config.get("extraCommands", [])
+        base_image = g.get("baseImage", "debian:bookworm-slim")
+        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+            default_base_image=base_image,
+            agent=agent,
+            project=project,
+            global_extra_packages=global_packages,
+            global_extra_commands=global_commands,
+        )
+        if not image_matches_build_context(
+            image_name=image_name,
+            container_dir=container_dir,
+            security=security,
+            agent=agent,
+            base_image=resolved_base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        ):
+            flags.append("(B)")
+
+    return "".join(flags)
+
+
 def cmd_list(args):
     store = ConfigStore()
     project_names = store.list_resources("Project")
@@ -208,7 +261,8 @@ def cmd_list(args):
             git_status = _git_status(project, store) or "-"
             row.append(f"{git_status:<9}")
         if show_image:
-            row.append(f"{img_name:<36}")
+            suffix = _image_suffix(project, store)
+            row.append(f"{(img_name + suffix):<36}")
 
         if show_agent:
             credential = project.credential or "(none)"
