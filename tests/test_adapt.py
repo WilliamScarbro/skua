@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from skua.commands.adapt import cmd_adapt
 from skua.config.loader import ConfigStore
-from skua.config.resources import AgentConfig, Environment, Project, SecurityProfile
+from skua.config.resources import AgentAuthSpec, AgentConfig, AgentRuntimeSpec, Credential, Environment, Project, SecurityProfile
 from skua.project_adapt import (
     ensure_adapt_workspace,
     load_image_request,
@@ -32,8 +32,14 @@ class TestProjectAdaptHelpers(unittest.TestCase):
             guide, request = ensure_adapt_workspace(project_dir, "proj", "codex")
             self.assertTrue(guide.is_file())
             self.assertTrue(request.is_file())
+            self.assertTrue((project_dir / "AGENTS.md").is_file())
+            self.assertTrue((project_dir / "CLAUDE.md").is_file())
             self.assertIn("Skua Image Adapt", guide.read_text())
             self.assertIn("schemaVersion: 1", request.read_text())
+            agents_text = (project_dir / "AGENTS.md").read_text()
+            self.assertIn(".skua/image-request.yaml", agents_text)
+            self.assertNotIn("skua adapt", agents_text)
+            self.assertNotIn("Dockerfile", agents_text)
 
     def test_request_has_updates_and_apply_to_project(self):
         project = Project(name="p1")
@@ -49,6 +55,91 @@ class TestProjectAdaptHelpers(unittest.TestCase):
         self.assertEqual(project.image.extra_packages, ["libpq-dev"])
         self.assertEqual(project.image.extra_commands, ["npm ci"])
         self.assertEqual(project.image.version, 1)
+
+    def test_sync_auth_from_host_overwrites_stale_project_auth(self):
+        from skua.commands.adapt import _sync_auth_from_host
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            src_dir = tmp / "src-auth"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            (src_dir / "auth.json").write_text('{"token":"fresh"}')
+
+            data_dir = tmp / "project-auth"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            (data_dir / "auth.json").write_text('{"token":"stale"}')
+
+            agent = AgentConfig(
+                name="codex",
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"]),
+            )
+            cred = Credential(name="cred", agent="codex", source_dir=str(src_dir))
+
+            copied = _sync_auth_from_host(data_dir=data_dir, cred=cred, agent=agent)
+            self.assertEqual(1, copied)
+            self.assertEqual('{"token":"fresh"}', (data_dir / "auth.json").read_text())
+
+    def test_summarize_agent_output_filters_entrypoint_noise(self):
+        from skua.commands.adapt import _summarize_agent_output
+
+        stdout = "\n".join([
+            "============================================",
+            "Agent: claude",
+            "Auth:  .claude",
+            "Usage:",
+            "  claude -> Start claude",
+            "Updated .skua/image-request.yaml",
+        ])
+        stderr = ""
+
+        summary = _summarize_agent_output(stdout, stderr)
+        self.assertEqual(["Updated .skua/image-request.yaml"], summary)
+
+    def test_request_preview_lines_formats_key_fields(self):
+        from skua.commands.adapt import _request_preview_lines
+
+        request = {
+            "summary": "Need pkg setup",
+            "fromImage": "",
+            "baseImage": "debian:bookworm-slim",
+            "packages": ["git", "jq"],
+            "commands": ["npm ci"],
+        }
+        lines = _request_preview_lines(request)
+        self.assertIn("summary: Need pkg setup", lines)
+        self.assertIn("fromImage: (unchanged)", lines)
+        self.assertIn("baseImage: debian:bookworm-slim", lines)
+        self.assertIn("packages: git, jq", lines)
+        self.assertIn("commands: 1 command(s)", lines)
+
+    def test_agent_prompt_describes_container_and_project_file_inference(self):
+        from skua.commands.adapt import _agent_prompt
+
+        prompt = _agent_prompt("proj", "claude")
+        self.assertIn("running inside the project's Docker container environment", prompt)
+        self.assertIn("Infer dependencies by reading project files", prompt)
+        self.assertIn("missing tool/system dependency blocks progress", prompt)
+
+    def test_project_has_pending_request_detects_unapplied_changes(self):
+        from skua.commands.adapt import _project_has_pending_request
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "proj"
+            project_dir.mkdir()
+            project = Project(name="proj", directory=str(project_dir))
+            ensure_adapt_workspace(project_dir, "proj", "codex")
+            (project_dir / ".skua" / "image-request.yaml").write_text(
+                yaml.dump(
+                    {
+                        "schemaVersion": 1,
+                        "status": "ready",
+                        "packages": ["git"],
+                    },
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+            )
+            self.assertTrue(_project_has_pending_request(project))
 
 
 class TestAdaptCommand(unittest.TestCase):
@@ -69,9 +160,18 @@ class TestAdaptCommand(unittest.TestCase):
             p.write_text(content)
         return base_dir
 
-    def _adapt_args(self, name: str, apply_only: bool = False, build: bool = False):
+    def _adapt_args(
+        self,
+        name: str,
+        apply_only: bool = False,
+        build: bool = False,
+        show_prompt: bool = False,
+        discover: bool = False,
+    ):
         return argparse.Namespace(
             name=name,
+            show_prompt=show_prompt,
+            discover=discover,
             base_image="",
             from_image="",
             package=[],
@@ -81,6 +181,27 @@ class TestAdaptCommand(unittest.TestCase):
             write_only=False,
             build=build,
         )
+
+    def test_cmd_adapt_show_prompt_prints_and_exits_early(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            stdout = io.StringIO()
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._run_agent_adapt_session") as mock_session,
+                mock.patch("sys.stdout", stdout),
+            ):
+                cmd_adapt(self._adapt_args("proj", show_prompt=True))
+
+            out = stdout.getvalue()
+            self.assertIn("Adapt prompt for project 'proj' (agent: codex):", out)
+            self.assertIn("Resolved non-interactive agent command:", out)
+            self.assertIn("codex exec", out)
+            mock_session.assert_not_called()
 
     def test_cmd_adapt_applies_request_to_project_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -244,7 +365,7 @@ class TestAdaptCommand(unittest.TestCase):
                         for pkg in fixture["expected"]["extra_packages"]:
                             self.assertIn(pkg, output)
 
-    def test_cmd_adapt_runs_agent_session_by_default(self):
+    def test_cmd_adapt_does_not_run_agent_session_by_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "repo"
             project_dir.mkdir()
@@ -271,8 +392,182 @@ class TestAdaptCommand(unittest.TestCase):
             ):
                 cmd_adapt(self._adapt_args("proj"))
 
+            mock_session.assert_not_called()
+            mock_build.assert_not_called()
+
+    def test_cmd_adapt_runs_agent_session_in_discover_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            _, request_path = ensure_adapt_workspace(project_dir, "proj", "codex")
+            with open(request_path, "w") as f:
+                yaml.dump(
+                    {
+                        "schemaVersion": 1,
+                        "status": "ready",
+                        "packages": ["git"],
+                    },
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._run_agent_adapt_session") as mock_session,
+                mock.patch("skua.commands.adapt._build_project_image") as mock_build,
+            ):
+                cmd_adapt(self._adapt_args("proj", discover=True))
+
             mock_session.assert_called_once()
             mock_build.assert_called_once()
+
+    def test_cmd_adapt_respects_user_rejection_before_apply(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            _, request_path = ensure_adapt_workspace(project_dir, "proj", "codex")
+            with open(request_path, "w") as f:
+                yaml.dump(
+                    {
+                        "schemaVersion": 1,
+                        "status": "ready",
+                        "packages": ["git"],
+                    },
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._is_interactive_tty", return_value=True),
+                mock.patch("skua.commands.adapt._confirm_apply_wishlist", return_value=False) as mock_confirm,
+                mock.patch("skua.commands.adapt._run_agent_adapt_session"),
+            ):
+                cmd_adapt(self._adapt_args("proj", apply_only=True))
+
+            mock_confirm.assert_called_once()
+            updated = store.load_project("proj")
+            self.assertEqual(updated.image.version, 0)
+
+    def test_cmd_adapt_rejects_discover_with_apply_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                self.assertRaises(SystemExit) as ctx,
+            ):
+                cmd_adapt(self._adapt_args("proj", apply_only=True, discover=True))
+            self.assertEqual(1, ctx.exception.code)
+
+    def test_cmd_adapt_all_dispatches_pending_projects(self):
+        from skua.commands.adapt import _cmd_adapt_all
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            store = self._new_store(tmp / "cfg")
+
+            p1_dir = tmp / "proj-a"
+            p1_dir.mkdir()
+            p2_dir = tmp / "proj-b"
+            p2_dir.mkdir()
+
+            store.save_resource(Project(name="proj-a", directory=str(p1_dir), agent="codex"))
+            store.save_resource(Project(name="proj-b", directory=str(p2_dir), agent="codex"))
+
+            ensure_adapt_workspace(p1_dir, "proj-a", "codex")
+            ensure_adapt_workspace(p2_dir, "proj-b", "codex")
+            (p1_dir / ".skua" / "image-request.yaml").write_text(
+                yaml.dump(
+                    {"schemaVersion": 1, "status": "ready", "packages": ["git"]},
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+            )
+
+            args = argparse.Namespace(
+                all=True,
+                show_prompt=False,
+                discover=False,
+                clear=False,
+                write_only=False,
+                base_image="",
+                from_image="",
+                package=[],
+                extra_command=[],
+                build=False,
+                apply_only=False,
+            )
+
+            with mock.patch("skua.commands.adapt.cmd_adapt") as mock_cmd:
+                _cmd_adapt_all(store, args)
+
+            self.assertEqual(1, mock_cmd.call_count)
+            called_args = mock_cmd.call_args.args[0]
+            self.assertEqual("proj-a", called_args.name)
+            self.assertFalse(called_args.all)
+
+    def test_agent_adapt_command_simple_template_avoids_shell(self):
+        from skua.commands.adapt import _agent_adapt_command
+
+        agent = AgentConfig(
+            name="claude",
+            runtime=AgentRuntimeSpec(
+                command="claude",
+                adapt_command='claude -p "{prompt}"',
+            ),
+        )
+
+        cmd = _agent_adapt_command(agent, "proj")
+        self.assertNotEqual(cmd[:2], ["bash", "-lc"])
+        self.assertEqual(cmd[0], "claude")
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertIn("status: ready", cmd[-1])
+        self.assertIn(".skua/image-request.yaml", cmd[-1])
+
+    def test_agent_adapt_command_default_claude_includes_permission_flag(self):
+        from skua.commands.adapt import _agent_adapt_command
+
+        agent = AgentConfig(
+            name="claude",
+            runtime=AgentRuntimeSpec(command="claude"),
+        )
+
+        cmd = _agent_adapt_command(agent, "proj")
+        self.assertEqual(cmd[0], "claude")
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertIn("-p", cmd)
+
+    def test_agent_adapt_command_shell_template_uses_bash(self):
+        from skua.commands.adapt import _agent_adapt_command
+
+        agent = AgentConfig(
+            name="mock-agent",
+            runtime=AgentRuntimeSpec(
+                command="bash",
+                adapt_command=(
+                    "cat > .skua/image-request.yaml <<'EOF'\n"
+                    "schemaVersion: 1\n"
+                    "status: ready\n"
+                    "EOF"
+                ),
+            ),
+        )
+
+        cmd = _agent_adapt_command(agent, "proj")
+        self.assertEqual(cmd[:2], ["bash", "-lc"])
+        self.assertIn("cat > .skua/image-request.yaml", cmd[2])
 
 
 if __name__ == "__main__":

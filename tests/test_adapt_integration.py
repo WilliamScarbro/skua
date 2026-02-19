@@ -83,6 +83,8 @@ class TestAdaptIntegration(unittest.TestCase):
 
             args = argparse.Namespace(
                 name="proj",
+                show_prompt=False,
+                discover=True,
                 base_image="",
                 from_image="",
                 package=[],
