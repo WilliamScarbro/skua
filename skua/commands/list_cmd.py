@@ -145,14 +145,42 @@ def _git_status(project, store: ConfigStore) -> str:
     return "CURRENT"
 
 
-def _image_suffix(project, store: ConfigStore) -> str:
-    """Return suffix flags for image status (A=adapt, B=rebuild)."""
-    if not project:
+def _container_image_id(container_name: str, host: str = "") -> str:
+    """Return image ID used by a container, or empty string."""
+    cmd = ["docker", "inspect", "--format", "{{.Image}}", container_name]
+    if host:
+        cmd = ["ssh", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
-    flags = []
+
+def _image_id(image_name: str, host: str = "") -> str:
+    """Return image ID for an image name, or empty string."""
+    cmd = ["docker", "image", "inspect", "--format", "{{.Id}}", image_name]
+    if host:
+        cmd = ["ssh", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _image_suffix(project, store: ConfigStore, host: str, is_running: bool) -> tuple:
+    """Return (suffix, flags) for image status."""
+    if not project:
+        return "", set()
+
+    flags = set()
     if _has_pending_adapt_request(project):
-        flags.append("(A)")
+        flags.add("(A)")
 
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
@@ -187,9 +215,16 @@ def _image_suffix(project, store: ConfigStore) -> str:
             extra_packages=extra_packages,
             extra_commands=extra_commands,
         ):
-            flags.append("(B)")
+            flags.add("(B)")
 
-    return "".join(flags)
+    if is_running and not host:
+        current_id = _container_image_id(f"skua-{project.name}")
+        latest_id = _image_id(image_name)
+        if current_id and latest_id and current_id != latest_id:
+            flags.add("(R)")
+
+    ordered = [flag for flag in ("(A)", "(B)", "(R)") if flag in flags]
+    return "".join(ordered), flags
 
 
 def cmd_list(args):
@@ -241,6 +276,7 @@ def cmd_list(args):
     pending_count = 0
     needs_adapt = False
     needs_build = False
+    needs_restart = False
     for name, project in projects:
         container_name = f"skua-{name}"
         host = getattr(project, "host", "") or ""
@@ -263,11 +299,13 @@ def cmd_list(args):
             git_status = _git_status(project, store) or "-"
             row.append(f"{git_status:<9}")
         if show_image:
-            suffix = _image_suffix(project, store)
-            if "(A)" in suffix:
+            suffix, flags = _image_suffix(project, store, host, container_name in running)
+            if "(A)" in flags:
                 needs_adapt = True
-            if "(B)" in suffix:
+            if "(B)" in flags:
                 needs_build = True
+            if "(R)" in flags:
+                needs_restart = True
             sep = " " if suffix else ""
             row.append(f"{(img_name + sep + suffix):<36}")
 
@@ -291,8 +329,10 @@ def cmd_list(args):
     print(f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt")
     if pending_count:
         print("  * pending image-request changes")
-    if show_image and (needs_adapt or needs_build):
+    if show_image and (needs_adapt or needs_build or needs_restart):
         if needs_adapt:
             print("  (A) image-request changes pending; run 'skua adapt'")
         if needs_build:
             print("  (B) image out of date; run 'skua build' or 'skua adapt --build'")
+        if needs_restart:
+            print("  (R) container running older image; run 'skua restart'")

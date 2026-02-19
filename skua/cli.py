@@ -98,6 +98,14 @@ def main():
     p_run = sub.add_parser("run", help="Run a container for a project")
     p_run.add_argument("name", help="Project name to run")
 
+    # stop
+    p_stop = sub.add_parser("stop", help="Stop a running project container")
+    p_stop.add_argument("name", help="Project name to stop")
+
+    # restart
+    p_restart = sub.add_parser("restart", help="Restart a project container")
+    p_restart.add_argument("name", help="Project name to restart")
+
     # adapt
     p_adapt = sub.add_parser(
         "adapt",
@@ -199,7 +207,7 @@ def main():
 
     # Lazy import commands to keep startup fast
     from skua.commands import (
-        cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run,
+        cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe, cmd_credential,
     )
@@ -210,6 +218,8 @@ def main():
         "add": cmd_add,
         "remove": cmd_remove,
         "run": cmd_run,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
         "adapt": cmd_adapt,
         "list": cmd_list,
         "clean": cmd_clean,
