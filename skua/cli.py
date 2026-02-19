@@ -66,6 +66,7 @@ def main():
     # build
     p_build = sub.add_parser("build", help="Build images required by configured projects")
     p_build.add_argument(
+        "-v",
         "--verbose",
         action="store_true",
         help="Show full Docker build output",
