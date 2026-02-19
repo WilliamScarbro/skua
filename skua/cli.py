@@ -101,10 +101,20 @@ def main():
     # stop
     p_stop = sub.add_parser("stop", help="Stop a running project container")
     p_stop.add_argument("name", help="Project name to stop")
+    p_stop.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Skip git status confirmation prompts",
+    )
 
     # restart
     p_restart = sub.add_parser("restart", help="Restart a project container")
     p_restart.add_argument("name", help="Project name to restart")
+    p_restart.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Skip git status confirmation prompts",
+    )
 
     # adapt
     p_adapt = sub.add_parser(

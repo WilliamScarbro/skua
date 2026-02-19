@@ -68,8 +68,10 @@ def _git_status(repo_dir: Path) -> str:
     return "CURRENT"
 
 
-def _should_continue_for_git(project, store: ConfigStore) -> bool:
+def _should_continue_for_git(project, store: ConfigStore, force: bool) -> bool:
     if not project.repo:
+        return True
+    if force:
         return True
     if project.host:
         print("Warning: Cannot check git status for remote projects.")
@@ -85,6 +87,7 @@ def _should_continue_for_git(project, store: ConfigStore) -> bool:
 def cmd_stop(args) -> bool:
     store = ConfigStore()
     name = str(getattr(args, "name", "") or "").strip()
+    force = bool(getattr(args, "force", False))
     if not name:
         print("Error: Provide a project name.")
         sys.exit(1)
@@ -101,7 +104,7 @@ def cmd_stop(args) -> bool:
         print(f"Container '{container_name}' is not running.")
         return True
 
-    if not _should_continue_for_git(project, store):
+    if not _should_continue_for_git(project, store, force):
         print("Stop cancelled.")
         return False
 
