@@ -190,8 +190,8 @@ def cmd_list(args):
             row.append(f"{_format_host(project):<14}")
         row.append(f"{_format_source(project):<38}")
         if show_git:
-            status = _git_status(project, store) or "-"
-            row.append(f"{status:<9}")
+            git_status = _git_status(project, store) or "-"
+            row.append(f"{git_status:<9}")
         row.append(f"{img_name:<36}")
 
         if show_agent:
