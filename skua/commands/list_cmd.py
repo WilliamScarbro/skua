@@ -108,6 +108,14 @@ def _git_status(project, store: ConfigStore) -> str:
         return ""
 
     try:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "fetch", "--quiet", "--prune"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+    try:
         ahead_behind = subprocess.run(
             ["git", "-C", str(repo_dir), "rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
             capture_output=True, text=True, timeout=5,
@@ -122,6 +130,8 @@ def _git_status(project, store: ConfigStore) -> str:
     if len(parts) >= 2:
         behind = int(parts[0])
         ahead = int(parts[1])
+        if behind > 0 and ahead > 0:
+            return "DIVERGED"
         if behind > 0:
             return "BEHIND"
         if ahead > 0:
