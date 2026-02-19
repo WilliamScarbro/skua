@@ -4,9 +4,11 @@
 import base64
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -428,6 +430,7 @@ def build_image(
     extra_packages: list = None,
     extra_commands: list = None,
     quiet: bool = False,
+    verbose: bool = False,
 ):
     """Build a Docker image, generating the Dockerfile from config.
 
@@ -496,9 +499,57 @@ def build_image(
                         print(f"  {line}")
                 return False, combined
             return True, ""
-        else:
+        if verbose:
             result = subprocess.run(cmd)
-        return result.returncode == 0, ""
+            return result.returncode == 0, ""
+
+        # Non-verbose: show a single-line progress bar based on build steps.
+        progress_cmd = list(cmd)
+        progress_cmd.extend(["--progress=plain"])
+        step_re = re.compile(r"^(step|STEP)\s+(\d+)\s*/\s*(\d+)")
+        tail = deque(maxlen=20)
+        printed_progress = False
+        current_step = 0
+        total_steps = 0
+
+        def render_progress(cur: int, total: int) -> None:
+            if total <= 0:
+                return
+            width = 28
+            filled = int(width * cur / total)
+            bar = "#" * filled + "-" * (width - filled)
+            msg = f"\r  Build progress: [{bar}] {cur}/{total}"
+            print(msg, end="", flush=True)
+
+        proc = subprocess.Popen(
+            progress_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            stripped = line.strip()
+            if stripped:
+                tail.append(stripped)
+            match = step_re.match(stripped)
+            if match:
+                current_step = int(match.group(2))
+                total_steps = int(match.group(3))
+                render_progress(current_step, total_steps)
+                printed_progress = True
+
+        proc.wait()
+        if printed_progress:
+            print()
+
+        if proc.returncode != 0:
+            if tail:
+                print("Docker build failed. Last output:")
+                for line in tail:
+                    print(f"  {line}")
+            return False, "\n".join(tail)
+        return True, ""
 
     finally:
         if build_path.exists():

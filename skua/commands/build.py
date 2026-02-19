@@ -128,6 +128,7 @@ def cmd_build(args):
             base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
+            verbose=getattr(args, "verbose", False),
         )
         if success:
             if needs_rebuild:

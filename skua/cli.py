@@ -64,7 +64,12 @@ def main():
                         help="Re-initialize even if already configured")
 
     # build
-    sub.add_parser("build", help="Build images required by configured projects")
+    p_build = sub.add_parser("build", help="Build images required by configured projects")
+    p_build.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show full Docker build output",
+    )
 
     # add
     p_add = sub.add_parser("add", help="Add a project configuration")

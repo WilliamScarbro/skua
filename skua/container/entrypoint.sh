@@ -131,6 +131,9 @@ fi
 if [ "$AGENT_COMMAND" = "claude" ]; then
     echo "alias claude-dsp='claude --dangerously-skip-permissions'" >> /home/dev/.bashrc
 fi
+if [ "$AGENT_COMMAND" = "codex" ]; then
+    echo "alias codex-dsp='codex --dangerously-bypass-approvals-and-sandbox'" >> /home/dev/.bashrc
+fi
 
 # ── Check tool availability ──────────────────────────────────────────
 if command -v "$AGENT_COMMAND" &>/dev/null; then
@@ -219,6 +222,9 @@ echo "Usage:"
 echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
 if [ "$AGENT_COMMAND" = "claude" ]; then
     echo "  claude-dsp     -> Start with --dangerously-skip-permissions"
+fi
+if [ "$AGENT_COMMAND" = "codex" ]; then
+    echo "  codex-dsp      -> Start with --dangerously-bypass-approvals-and-sandbox"
 fi
 if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
     echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
