@@ -117,6 +117,11 @@ def main():
         action="store_true",
         help="Include security columns (security profile, network mode)",
     )
+    p_list.add_argument(
+        "-g", "--git",
+        action="store_true",
+        help="Include git status column for repo projects",
+    )
 
     # clean
     p_clean = sub.add_parser("clean", help="Clean persisted agent credentials")

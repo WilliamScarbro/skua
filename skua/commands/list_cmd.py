@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua list — list projects and running containers."""
 
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -75,12 +76,66 @@ def _has_pending_adapt_request(project) -> bool:
     return request_changes_project(project, request)
 
 
+def _git_status(project, store: ConfigStore) -> str:
+    """Return git status for repo projects: BEHIND/AHEAD/UNCLEAN/CURRENT."""
+    if not project or not getattr(project, "repo", ""):
+        return ""
+    if getattr(project, "host", ""):
+        return ""
+
+    repo_dir = None
+    if project.directory:
+        candidate = Path(project.directory).expanduser()
+        if candidate.is_dir():
+            repo_dir = candidate
+    if repo_dir is None:
+        candidate = store.repo_dir(project.name)
+        if candidate.is_dir():
+            repo_dir = candidate
+    if repo_dir is None:
+        return ""
+    if not (repo_dir / ".git").exists():
+        return ""
+
+    try:
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if dirty.stdout.strip():
+            return "UNCLEAN"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+    try:
+        ahead_behind = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+    if ahead_behind.returncode != 0:
+        return "CURRENT"
+
+    parts = ahead_behind.stdout.strip().split()
+    if len(parts) >= 2:
+        behind = int(parts[0])
+        ahead = int(parts[1])
+        if behind > 0:
+            return "BEHIND"
+        if ahead > 0:
+            return "AHEAD"
+    return "CURRENT"
+
+
 def cmd_list(args):
     store = ConfigStore()
     project_names = store.list_resources("Project")
     running_by_host = {"": set(get_running_skua_containers())}
     show_agent = bool(getattr(args, "agent", False))
     show_security = bool(getattr(args, "security", False))
+    show_git = bool(getattr(args, "git", False))
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
 
@@ -97,6 +152,8 @@ def cmd_list(args):
     if show_host:
         columns.append(("HOST", 14))
     columns.append(("SOURCE", 38))
+    if show_git:
+        columns.append(("GIT", 9))
     columns.append(("IMAGE", 36))
     if show_agent:
         columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
@@ -132,6 +189,9 @@ def cmd_list(args):
         if show_host:
             row.append(f"{_format_host(project):<14}")
         row.append(f"{_format_source(project):<38}")
+        if show_git:
+            status = _git_status(project, store) or "-"
+            row.append(f"{status:<9}")
         row.append(f"{img_name:<36}")
 
         if show_agent:
