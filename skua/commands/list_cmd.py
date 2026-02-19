@@ -159,6 +159,32 @@ def _container_image_id(container_name: str, host: str = "") -> str:
     return result.stdout.strip()
 
 
+def _container_image_name(container_name: str, host: str = "") -> str:
+    """Return image name recorded on the container, or empty string."""
+    cmd = ["docker", "inspect", "--format", "{{.Config.Image}}", container_name]
+    if host:
+        cmd = ["ssh", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+def _container_image_name(container_name: str, host: str = "") -> str:
+    """Return image name recorded on the container, or empty string."""
+    cmd = ["docker", "inspect", "--format", "{{.Config.Image}}", container_name]
+    if host:
+        cmd = ["ssh", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
 def _image_id(image_name: str, host: str = "") -> str:
     """Return image ID for an image name, or empty string."""
     cmd = ["docker", "image", "inspect", "--format", "{{.Id}}", image_name]
@@ -173,7 +199,7 @@ def _image_id(image_name: str, host: str = "") -> str:
     return result.stdout.strip()
 
 
-def _image_suffix(project, store: ConfigStore, host: str, is_running: bool) -> tuple:
+def _image_suffix(project, store: ConfigStore) -> tuple:
     """Return (suffix, flags) for image status."""
     if not project:
         return "", set()
@@ -217,13 +243,7 @@ def _image_suffix(project, store: ConfigStore, host: str, is_running: bool) -> t
         ):
             flags.add("(B)")
 
-    if is_running and not host:
-        current_id = _container_image_id(f"skua-{project.name}")
-        latest_id = _image_id(image_name)
-        if current_id and latest_id and current_id != latest_id:
-            flags.add("(R)")
-
-    ordered = [flag for flag in ("(A)", "(B)", "(R)") if flag in flags]
+    ordered = [flag for flag in ("(A)", "(B)") if flag in flags]
     return "".join(ordered), flags
 
 
@@ -248,7 +268,32 @@ def cmd_list(args):
     if local_only:
         projects = [(name, p) for name, p in projects if not getattr(p, "host", "")]
 
+    def _running_for_host(host: str) -> set:
+        normalized = host or ""
+        if normalized not in running_by_host:
+            running_by_host[normalized] = set(get_running_skua_containers(host=normalized))
+        return running_by_host[normalized]
+
     show_host = any(getattr(p, "host", "") for _, p in projects)
+    needs_running_image = False
+    running_image_values = {}
+    if show_image:
+        for name, project in projects:
+            container_name = f"skua-{name}"
+            host = getattr(project, "host", "") or ""
+            if container_name not in _running_for_host(host):
+                running_image_values[name] = "-"
+                continue
+            img_name = image_name_for_project(image_name_base, project)
+            project_id = _image_id(img_name, host=host)
+            container_id = _container_image_id(container_name, host=host)
+            if project_id and container_id and project_id == container_id:
+                running_image_values[name] = "-"
+                continue
+            running_name = _container_image_name(container_name, host=host) or container_id or "-"
+            running_image_values[name] = running_name
+            if running_name != "-":
+                needs_running_image = True
 
     columns = [("NAME", 16)]
     if show_host:
@@ -258,6 +303,8 @@ def cmd_list(args):
         columns.append(("GIT", 9))
     if show_image:
         columns.append(("IMAGE", 36))
+        if needs_running_image:
+            columns.append(("RUNNING-IMAGE", 36))
     if show_agent:
         columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
     if show_security:
@@ -267,16 +314,9 @@ def cmd_list(args):
     print(" ".join(f"{title:<{width}}" for title, width in columns))
     print("-" * (sum(width for _, width in columns) + (len(columns) - 1)))
 
-    def _running_for_host(host: str) -> set:
-        normalized = host or ""
-        if normalized not in running_by_host:
-            running_by_host[normalized] = set(get_running_skua_containers(host=normalized))
-        return running_by_host[normalized]
-
     pending_count = 0
     needs_adapt = False
     needs_build = False
-    needs_restart = False
     for name, project in projects:
         container_name = f"skua-{name}"
         host = getattr(project, "host", "") or ""
@@ -299,15 +339,15 @@ def cmd_list(args):
             git_status = _git_status(project, store) or "-"
             row.append(f"{git_status:<9}")
         if show_image:
-            suffix, flags = _image_suffix(project, store, host, container_name in running)
+            suffix, flags = _image_suffix(project, store)
             if "(A)" in flags:
                 needs_adapt = True
             if "(B)" in flags:
                 needs_build = True
-            if "(R)" in flags:
-                needs_restart = True
             sep = " " if suffix else ""
             row.append(f"{(img_name + sep + suffix):<36}")
+            if needs_running_image:
+                row.append(f"{running_image_values.get(name, '-'):<36}")
 
         if show_agent:
             credential = project.credential or "(none)"
@@ -329,10 +369,8 @@ def cmd_list(args):
     print(f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt")
     if pending_count:
         print("  * pending image-request changes")
-    if show_image and (needs_adapt or needs_build or needs_restart):
+    if show_image and (needs_adapt or needs_build):
         if needs_adapt:
             print("  (A) image-request changes pending; run 'skua adapt'")
         if needs_build:
             print("  (B) image out of date; run 'skua build' or 'skua adapt --build'")
-        if needs_restart:
-            print("  (R) container running older image; run 'skua restart'")
