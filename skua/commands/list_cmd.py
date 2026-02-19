@@ -97,6 +97,7 @@ def cmd_list(args):
     if show_host:
         columns.append(("HOST", 14))
     columns.append(("SOURCE", 38))
+    columns.append(("IMAGE", 36))
     if show_agent:
         columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
     if show_security:
@@ -118,10 +119,10 @@ def cmd_list(args):
         host = getattr(project, "host", "") or ""
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
+        img_name = image_name_for_project(image_name_base, project)
         if container_name in running:
             status = "running"
         else:
-            img_name = image_name_for_project(image_name_base, project)
             status = "built" if image_exists(img_name) else "missing"
         if pending_adapt:
             status += "*"
@@ -131,6 +132,7 @@ def cmd_list(args):
         if show_host:
             row.append(f"{_format_host(project):<14}")
         row.append(f"{_format_source(project):<38}")
+        row.append(f"{img_name:<36}")
 
         if show_agent:
             credential = project.credential or "(none)"
