@@ -504,8 +504,15 @@ def build_image(
             return result.returncode == 0, ""
 
         # Non-verbose: show a single-line progress bar based on build steps.
+        # --progress=plain is a BuildKit-only flag; check availability first.
         progress_cmd = list(cmd)
-        progress_cmd.extend(["--progress=plain"])
+        has_buildx = subprocess.run(
+            ["docker", "buildx", "version"],
+            capture_output=True,
+        ).returncode == 0
+        if has_buildx:
+            # Insert before the build path (last element)
+            progress_cmd.insert(-1, "--progress=plain")
         step_re = re.compile(r"^(step|STEP)\s+(\d+)\s*/\s*(\d+)")
         tail = deque(maxlen=20)
         printed_progress = False
