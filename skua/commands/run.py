@@ -604,10 +604,8 @@ def cmd_run(args):
     # Check if already running
     if is_container_running(container_name):
         print(f"Container '{container_name}' is already running.")
-        answer = input("Attach to it? [Y/n]: ").strip().lower()
-        if answer != "n":
-            print("Attaching to container tmux session (detach: Ctrl-b then d)...")
-            exec_into_container(container_name)
+        print("Attaching to container tmux session (detach: Ctrl-b then d)...")
+        exec_into_container(container_name)
         return
 
     # Load referenced resources
