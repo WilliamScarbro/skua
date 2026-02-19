@@ -78,7 +78,7 @@ def _should_continue_for_git(project, store: ConfigStore, force: bool) -> bool:
         return confirm("Stop container anyway?", default=False)
     repo_dir = _repo_dir(project, store)
     status = _git_status(repo_dir)
-    if status in ("", "CURRENT"):
+    if status in ("", "CURRENT", "BEHIND"):
         return True
     print(f"Warning: git status is {status} for {repo_dir}")
     return confirm("Stop container anyway?", default=False)
