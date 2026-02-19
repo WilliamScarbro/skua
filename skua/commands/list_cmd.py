@@ -239,6 +239,8 @@ def cmd_list(args):
         return running_by_host[normalized]
 
     pending_count = 0
+    needs_adapt = False
+    needs_build = False
     for name, project in projects:
         container_name = f"skua-{name}"
         host = getattr(project, "host", "") or ""
@@ -262,7 +264,12 @@ def cmd_list(args):
             row.append(f"{git_status:<9}")
         if show_image:
             suffix = _image_suffix(project, store)
-            row.append(f"{(img_name + suffix):<36}")
+            if "(A)" in suffix:
+                needs_adapt = True
+            if "(B)" in suffix:
+                needs_build = True
+            sep = " " if suffix else ""
+            row.append(f"{(img_name + sep + suffix):<36}")
 
         if show_agent:
             credential = project.credential or "(none)"
@@ -284,3 +291,8 @@ def cmd_list(args):
     print(f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt")
     if pending_count:
         print("  * pending image-request changes")
+    if show_image and (needs_adapt or needs_build):
+        if needs_adapt:
+            print("  (A) image-request changes pending; run 'skua adapt'")
+        if needs_build:
+            print("  (B) image out of date; run 'skua build' or 'skua adapt --build'")
