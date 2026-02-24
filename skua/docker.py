@@ -58,8 +58,8 @@ def get_running_skua_containers(host: str = "") -> list:
 
 def image_name_for_agent(base_image_name: str, agent_name: str) -> str:
     """Return an agent-specific image name, preserving an optional tag."""
-    base = (base_image_name or "skua-base").strip()
-    agent = (agent_name or "claude").strip()
+    base = (base_image_name or "skua-base").strip().lower()
+    agent = (agent_name or "claude").strip().lower()
 
     if not base:
         base = "skua-base"
@@ -127,7 +127,7 @@ def image_name_for_project(base_image_name: str, project: Project) -> str:
         return agent_image
 
     repo, tag = _split_image_ref_tag(agent_image)
-    project_part = _sanitize_mount_name(project.name or "project")
+    project_part = _sanitize_mount_name(project.name or "project").lower()
     version = int(getattr(project.image, "version", 0) or 0)
     if version < 1:
         version = 1
