@@ -21,6 +21,7 @@ from skua.project_adapt import (
     load_image_request,
     request_has_updates,
     apply_image_request_to_project,
+    smoke_test_path,
 )
 
 
@@ -436,7 +437,10 @@ class TestAdaptCommand(unittest.TestCase):
             ):
                 cmd_adapt(self._adapt_args("proj", discover=True))
 
-            mock_session.assert_called_once()
+            # First call: discover wishlist; second call: create smoke test (no smoke test file exists)
+            self.assertGreaterEqual(mock_session.call_count, 1)
+            first_call_kwargs = mock_session.call_args_list[0].kwargs
+            self.assertFalse(first_call_kwargs.get("prompt_override"))  # discover call has no prompt_override
             mock_build.assert_called_once()
 
     def test_cmd_adapt_discover_retries_build_after_agent_revises_request(self):
@@ -462,13 +466,14 @@ class TestAdaptCommand(unittest.TestCase):
                 return ""
 
             session_calls = []
-            def fake_session(store, project, env, sec, agent, build_error=""):
-                session_calls.append(build_error)
+            def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
+                             prompt_override="", warn_on_failure=False):
+                session_calls.append({"build_error": build_error, "prompt_override": prompt_override})
+                if prompt_override:
+                    return  # smoke test creation attempt, don't update request
                 if build_error:
-                    # Agent revises request to fix the build error
                     packages = ["git", "make", "cmake"]
                 else:
-                    # Initial discover
                     packages = ["git", "make"]
                 with open(request_path, "w") as f:
                     yaml.dump(
@@ -483,10 +488,11 @@ class TestAdaptCommand(unittest.TestCase):
             ):
                 cmd_adapt(self._adapt_args("proj", discover=True))
 
-            # Agent session called twice: initial discover + error retry
-            self.assertEqual(2, len(session_calls))
-            self.assertEqual("", session_calls[0])
-            self.assertIn("not found", session_calls[1])
+            # Discover sessions (non-prompt_override): initial discover + build-error retry
+            adapt_sessions = [c for c in session_calls if not c["prompt_override"]]
+            self.assertEqual(2, len(adapt_sessions))
+            self.assertEqual("", adapt_sessions[0]["build_error"])
+            self.assertIn("not found", adapt_sessions[1]["build_error"])
             # Build attempted twice
             self.assertEqual(2, len(build_calls))
             # Revised request was applied (packages include 'make')
@@ -515,8 +521,11 @@ class TestAdaptCommand(unittest.TestCase):
                 return ""
 
             session_calls = []
-            def fake_session(store, project, env, sec, agent, build_error=""):
-                session_calls.append(build_error)
+            def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
+                             prompt_override="", warn_on_failure=False):
+                session_calls.append({"build_error": build_error, "prompt_override": prompt_override})
+                if prompt_override:
+                    return  # smoke test creation attempt, don't update request
                 packages = ["git", "make", "cmake"]
                 with open(request_path, "w") as f:
                     yaml.dump(
@@ -531,8 +540,10 @@ class TestAdaptCommand(unittest.TestCase):
             ):
                 cmd_adapt(self._adapt_args("proj", build=True))
 
-            self.assertEqual(1, len(session_calls))
-            self.assertIn("not found", session_calls[0])
+            # Only the build-error retry session should have updated the request
+            retry_sessions = [c for c in session_calls if not c["prompt_override"]]
+            self.assertEqual(1, len(retry_sessions))
+            self.assertIn("not found", retry_sessions[0]["build_error"])
             self.assertEqual(2, len(build_calls))
             updated = store.load_project("proj")
             self.assertIn("cmake", updated.image.extra_packages)
@@ -698,6 +709,126 @@ class TestAdaptCommand(unittest.TestCase):
         cmd = _agent_adapt_command(agent, "proj")
         self.assertEqual(cmd[:2], ["bash", "-lc"])
         self.assertIn("cat > .skua/image-request.yaml", cmd[2])
+
+    def test_cmd_adapt_asks_agent_to_create_smoke_test_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            _, request_path = ensure_adapt_workspace(project_dir, "proj", "codex")
+            with open(request_path, "w") as f:
+                yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git"]},
+                          f, default_flow_style=False, sort_keys=False)
+
+            session_calls = []
+            def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
+                             prompt_override="", warn_on_failure=False):
+                session_calls.append({"prompt_override": prompt_override, "warn_on_failure": warn_on_failure})
+
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._run_agent_adapt_session", side_effect=fake_session),
+                mock.patch("skua.commands.adapt._build_project_image", return_value=""),
+                mock.patch("skua.commands.adapt._run_smoke_test", return_value=""),
+            ):
+                cmd_adapt(self._adapt_args("proj", build=True))
+
+            # Should have called the session once for smoke test creation (build succeeded, no smoke test existed)
+            self.assertEqual(1, len(session_calls))
+            self.assertTrue(session_calls[0]["warn_on_failure"])
+            self.assertIn("smoke-test.sh", session_calls[0]["prompt_override"])
+
+    def test_cmd_adapt_smoke_test_passes_exits_loop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            _, request_path = ensure_adapt_workspace(project_dir, "proj", "codex")
+            with open(request_path, "w") as f:
+                yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git"]},
+                          f, default_flow_style=False, sort_keys=False)
+            # Pre-create smoke test so creation session is skipped
+            smoke_script = smoke_test_path(project_dir)
+            smoke_script.write_text("#!/bin/bash\nexit 0\n")
+
+            session_calls = []
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._run_agent_adapt_session", side_effect=session_calls.append),
+                mock.patch("skua.commands.adapt._build_project_image", return_value=""),
+                mock.patch("skua.commands.adapt._run_smoke_test", return_value=""),
+            ):
+                cmd_adapt(self._adapt_args("proj", build=True))
+
+            # No retries needed — build and smoke test both passed
+            self.assertEqual(0, len(session_calls))
+
+    def test_cmd_adapt_smoke_test_failure_triggers_agent_revision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            store = self._new_store(Path(tmpdir) / "cfg")
+            store.save_resource(Project(name="proj", directory=str(project_dir), agent="codex"))
+
+            _, request_path = ensure_adapt_workspace(project_dir, "proj", "codex")
+            with open(request_path, "w") as f:
+                yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git"]},
+                          f, default_flow_style=False, sort_keys=False)
+            smoke_script = smoke_test_path(project_dir)
+            smoke_script.write_text("#!/bin/bash\nexit 1\n")
+
+            # Smoke test fails first, then passes after agent revision
+            smoke_calls = [0]
+            def fake_smoke(store, project, project_dir, smoke_script):
+                smoke_calls[0] += 1
+                if smoke_calls[0] == 1:
+                    return "python3: command not found"
+                return ""
+
+            session_calls = []
+            def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
+                             prompt_override="", warn_on_failure=False):
+                session_calls.append({"smoke_error": smoke_error})
+                with open(request_path, "w") as f:
+                    yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git", "python3"]},
+                              f, default_flow_style=False, sort_keys=False)
+
+            with (
+                mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
+                mock.patch("skua.commands.adapt._run_agent_adapt_session", side_effect=fake_session),
+                mock.patch("skua.commands.adapt._build_project_image", return_value=""),
+                mock.patch("skua.commands.adapt._run_smoke_test", side_effect=fake_smoke),
+            ):
+                cmd_adapt(self._adapt_args("proj", build=True))
+
+            self.assertEqual(1, len(session_calls))
+            self.assertIn("python3: command not found", session_calls[0]["smoke_error"])
+            self.assertEqual(2, smoke_calls[0])
+            updated = store.load_project("proj")
+            self.assertIn("python3", updated.image.extra_packages)
+
+    def test_agent_prompt_includes_smoke_error_context(self):
+        from skua.commands.adapt import _agent_prompt
+
+        prompt = _agent_prompt("proj", "claude", smoke_error="python3: command not found")
+        self.assertIn("SMOKE TEST FAILED", prompt)
+        self.assertIn("python3: command not found", prompt)
+
+    def test_agent_smoke_test_creation_prompt_describes_script(self):
+        from skua.commands.adapt import _agent_smoke_test_creation_prompt
+
+        prompt = _agent_smoke_test_creation_prompt("myproject")
+        self.assertIn("smoke-test.sh", prompt)
+        self.assertIn("exit 0", prompt)
+        self.assertIn("myproject", prompt)
+
+    def test_smoke_test_path_returns_skua_subpath(self):
+        p = smoke_test_path(Path("/some/project"))
+        self.assertEqual(p, Path("/some/project/.skua/smoke-test.sh"))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import yaml
 ADAPT_DIRNAME = ".skua"
 ADAPT_GUIDE_NAME = "ADAPT.md"
 IMAGE_REQUEST_NAME = "image-request.yaml"
+SMOKE_TEST_NAME = "smoke-test.sh"
 AGENTS_HINT_NAME = "AGENTS.md"
 CLAUDE_HINT_NAME = "CLAUDE.md"
 
@@ -29,6 +30,11 @@ def adapt_guide_path(project_dir: Path) -> Path:
 def image_request_path(project_dir: Path) -> Path:
     """Return the image request template path for a project."""
     return adapt_dir(project_dir) / IMAGE_REQUEST_NAME
+
+
+def smoke_test_path(project_dir: Path) -> Path:
+    """Return the smoke test script path for a project."""
+    return adapt_dir(project_dir) / SMOKE_TEST_NAME
 
 
 def agents_hint_path(project_dir: Path) -> Path:

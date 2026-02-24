@@ -20,6 +20,16 @@ def _add_adapt_args(parser):
         help="Show the resolved agent prompt/command for this project and exit",
     )
     parser.add_argument(
+        "--dockerfile",
+        action="store_true",
+        help="Print the generated Dockerfile for this project and exit",
+    )
+    parser.add_argument(
+        "--show-smoke-test",
+        action="store_true",
+        help="Print the smoke test script (.skua/smoke-test.sh) for this project and exit",
+    )
+    parser.add_argument(
         "--discover",
         action="store_true",
         help="Run automated agent discovery to generate/update image-request.yaml before applying",

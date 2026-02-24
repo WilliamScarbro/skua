@@ -15,6 +15,7 @@ from skua.config import ConfigStore, validate_project
 from skua.docker import (
     build_run_command,
     build_image,
+    generate_dockerfile,
     image_exists,
     image_name_for_project,
     resolve_project_image_inputs,
@@ -27,6 +28,7 @@ from skua.project_adapt import (
     request_has_updates,
     apply_image_request_to_project,
     write_applied_image_request,
+    smoke_test_path,
 )
 
 
@@ -87,6 +89,14 @@ def cmd_adapt(args):
     if project_dir is None:
         print("Error: project directory is not set.")
         sys.exit(1)
+
+    if bool(getattr(args, "dockerfile", False)):
+        _print_project_dockerfile(store, project, agent, sec)
+        return
+
+    if bool(getattr(args, "show_smoke_test", False)):
+        _print_project_smoke_test(project_dir)
+        return
 
     guide_path, request_path = ensure_adapt_workspace(project_dir, project.name, project.agent)
     print(f"Adapt guide:   {guide_path}")
@@ -174,14 +184,40 @@ def cmd_adapt(args):
     if should_build:
         print("[adapt] Step 3: Build adapted image")
         build_error = _build_project_image(store, project, agent)
+        smoke_error = ""
+        if not build_error:
+            smoke_script = smoke_test_path(project_dir)
+            if not smoke_script.exists():
+                print("[adapt] No smoke test found; asking agent to create one...")
+                _run_agent_adapt_session(
+                    store, project, env, sec, agent,
+                    prompt_override=_agent_smoke_test_creation_prompt(project.name),
+                    warn_on_failure=True,
+                )
+            if smoke_script.exists():
+                print("[adapt] Step 4: Run smoke test")
+                smoke_error = _run_smoke_test(store, project, project_dir, smoke_script)
+                if smoke_error:
+                    print("[adapt] Smoke test failed.")
+                else:
+                    print("[adapt] Smoke test passed.")
+            else:
+                print("[adapt] Warning: No smoke test available; skipping smoke test step.")
         retry_count = 0
         max_retries = 3
-        while build_error:
+        while build_error or smoke_error:
             if retry_count >= max_retries:
-                print("[adapt] Reached maximum build retries; aborting.")
+                print("[adapt] Reached maximum retries; aborting.")
                 break
-            print("[adapt] Build failed; asking agent to revise image request...")
-            _run_agent_adapt_session(store, project, env, sec, agent, build_error=build_error)
+            if build_error:
+                print("[adapt] Build failed; asking agent to revise image request...")
+            else:
+                print("[adapt] Smoke test failed; asking agent to revise image request...")
+            _run_agent_adapt_session(
+                store, project, env, sec, agent,
+                build_error=build_error,
+                smoke_error=smoke_error,
+            )
             retry_request = load_image_request(request_path)
             if _is_interactive_tty() and not force:
                 if not _confirm_apply_wishlist(project.agent, retry_request):
@@ -195,13 +231,26 @@ def cmd_adapt(args):
                 _print_project_image_summary(project)
                 write_applied_image_request(request_path, retry_request, project.image.version)
                 retry_count += 1
-                print(f"[adapt] Step 3 (retry {retry_count}): Build adapted image")
+                print(f"[adapt] Retry {retry_count}: Build adapted image")
                 build_error = _build_project_image(store, project, agent)
+                smoke_error = ""
+                if not build_error:
+                    smoke_script = smoke_test_path(project_dir)
+                    if smoke_script.exists():
+                        print(f"[adapt] Retry {retry_count}: Run smoke test")
+                        smoke_error = _run_smoke_test(store, project, project_dir, smoke_script)
+                        if smoke_error:
+                            print("[adapt] Smoke test failed.")
+                        else:
+                            print("[adapt] Smoke test passed.")
             else:
-                print("[adapt] Agent did not update the image request; cannot retry build.")
+                print("[adapt] Agent did not update the image request; cannot retry.")
                 break
         if build_error:
             print("Error: Image build failed. Fix the image request and re-run 'skua adapt'.")
+            sys.exit(1)
+        if smoke_error:
+            print("Error: Smoke test failed. Fix the image request and re-run 'skua adapt'.")
             sys.exit(1)
     else:
         image_name = _current_image_name(store, project)
@@ -416,7 +465,7 @@ def _shell_join(argv: list) -> str:
     return " ".join(shlex.quote(str(token)) for token in (argv or []))
 
 
-def _agent_prompt(project_name: str, agent_name: str, build_error: str = "") -> str:
+def _agent_prompt(project_name: str, agent_name: str, build_error: str = "", smoke_error: str = "") -> str:
     base = (
         f"You are adapting the project '{project_name}'. "
         "You are running inside the project's Docker container environment. "
@@ -437,7 +486,32 @@ def _agent_prompt(project_name: str, agent_name: str, build_error: str = "") -> 
             "Build context:\n\n"
             f"{build_error}"
         )
+    if smoke_error:
+        base += (
+            "\n\nThe Docker image built successfully but the SMOKE TEST FAILED. "
+            "Update .skua/image-request.yaml to add missing packages or commands needed to pass the smoke test. "
+            "Smoke test output:\n\n"
+            f"{smoke_error}"
+        )
     return base
+
+
+def _agent_smoke_test_creation_prompt(project_name: str) -> str:
+    return (
+        f"You are adapting the project '{project_name}'. "
+        "You are running inside the project's Docker container environment. "
+        f"Create a smoke test script at `.skua/smoke-test.sh`. "
+        "The script must exit 0 on success and non-zero on failure. "
+        "It should verify that the project's required tools and dependencies are available in the current environment. "
+        "Inspect the project files (README, lockfiles, manifests, build scripts, CI config) "
+        "to determine what tools and commands should work. "
+        "Common checks: verify required executables exist (e.g., python3, node, go, cargo), "
+        "check that key dependencies are importable or buildable "
+        "(e.g., 'python -c \"import fastapi\"', 'node -e \"require(\\\"express\\\")\"'), "
+        "or run a fast build/install dry-run. "
+        "Keep the script minimal and fast (under 30 seconds to run). "
+        "Do not modify any other file."
+    )
 
 
 def _template_uses_shell(template: str) -> bool:
@@ -544,9 +618,9 @@ def _confirm_apply_wishlist(agent_name: str, request: dict) -> bool:
     return answer != "n"
 
 
-def _agent_adapt_command(agent, project_name: str, build_error: str = "") -> list:
+def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_error: str = "", prompt_override: str = "") -> list:
     agent_name = (agent.name or "").strip().lower()
-    prompt = _agent_prompt(project_name, agent_name, build_error)
+    prompt = prompt_override or _agent_prompt(project_name, agent_name, build_error, smoke_error)
 
     template = str(getattr(agent.runtime, "adapt_command", "") or "").strip()
     if template:
@@ -622,7 +696,17 @@ def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, d
         sys.exit(1)
 
 
-def _run_agent_adapt_session(store: ConfigStore, project, env, sec, agent, build_error: str = ""):
+def _run_agent_adapt_session(
+    store: ConfigStore,
+    project,
+    env,
+    sec,
+    agent,
+    build_error: str = "",
+    smoke_error: str = "",
+    prompt_override: str = "",
+    warn_on_failure: bool = False,
+):
     """Start an adapt container session and ask the agent to update image-request.yaml."""
     print("[adapt] Preparing runtime image...")
     image_name = _ensure_runtime_image(store, project, sec, agent)
@@ -644,12 +728,16 @@ def _run_agent_adapt_session(store: ConfigStore, project, env, sec, agent, build
     print("[adapt] Syncing credentials and checking auth...")
     _ensure_agent_authenticated(store, project, env, agent, cred, docker_cmd_base)
 
-    if build_error:
+    if prompt_override:
+        print(f"[adapt] {agent.name} is creating smoke test...")
+    elif build_error:
         print(f"[adapt] {agent.name} is revising image request after build failure...")
+    elif smoke_error:
+        print(f"[adapt] {agent.name} is revising image request after smoke test failure...")
     else:
         print(f"[adapt] {agent.name} is generating wishlist...")
     run_cmd = _noninteractive_run_command(docker_cmd_base, project.name, "agent")
-    adapt_cmd = _agent_adapt_command(agent, project.name, build_error)
+    adapt_cmd = _agent_adapt_command(agent, project.name, build_error, smoke_error, prompt_override)
     print(f"[adapt] Agent command: {_shell_join(adapt_cmd)}")
     run_cmd.extend(adapt_cmd)
     result = subprocess.run(run_cmd, capture_output=True, text=True)
@@ -659,6 +747,14 @@ def _run_agent_adapt_session(store: ConfigStore, project, env, sec, agent, build
         for line in summary_lines:
             print(f"  {line}")
     if result.returncode != 0:
+        if warn_on_failure:
+            print("Warning: Agent session failed; continuing without result.")
+            if not summary_lines:
+                combined = "\n".join(part for part in [result.stderr, result.stdout] if part)
+                lines = [line.rstrip() for line in _strip_ansi(combined).splitlines() if line.strip()]
+                for line in lines[-6:]:
+                    print(f"  {line}")
+            return
         print("Error: Automated adapt agent session failed.")
         if not summary_lines:
             print("Last command output:")
@@ -691,6 +787,40 @@ def _request_from_flags(args):
         "packages": list(args.package or []),
         "commands": list(args.extra_command or []),
     }
+
+
+def _print_project_dockerfile(store: ConfigStore, project, agent, sec):
+    """Print the generated Dockerfile for a project."""
+    g = store.load_global()
+    base_image = g.get("baseImage", "debian:bookworm-slim")
+    image_config = g.get("image", {})
+    global_packages = image_config.get("extraPackages", [])
+    global_commands = image_config.get("extraCommands", [])
+    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+        default_base_image=base_image,
+        agent=agent,
+        project=project,
+        global_extra_packages=global_packages,
+        global_extra_commands=global_commands,
+    )
+    dockerfile = generate_dockerfile(
+        agent=agent,
+        security=sec,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    print(dockerfile, end="")
+
+
+def _print_project_smoke_test(project_dir: Path):
+    """Print the smoke test script for a project, or a note if it doesn't exist."""
+    smoke_script = smoke_test_path(project_dir)
+    if not smoke_script.exists():
+        print(f"No smoke test found at {smoke_script}")
+        print("Run 'skua adapt <name> --discover' or '--build' to generate one.")
+        return
+    print(smoke_script.read_text(), end="")
 
 
 def _print_project_image_summary(project):
@@ -744,6 +874,28 @@ def _format_build_error_context(error_output: str, dockerfile_text: str) -> str:
     if error_output:
         parts.append("Build error output:\n\n" + error_output.rstrip())
     return "\n\n".join(parts).strip()
+
+
+def _run_smoke_test(store: ConfigStore, project, project_dir: Path, smoke_script: Path) -> str:
+    """Run the smoke test inside the adapted image. Returns error output on failure, empty string on success."""
+    image_name = _current_image_name(store, project)
+    rel_smoke = smoke_script.relative_to(project_dir)
+    cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{project_dir}:/workspace:ro",
+        "-w", "/workspace",
+        image_name,
+        "bash", str(rel_smoke),
+    ]
+    print(f"[adapt] Running smoke test in image: {image_name}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "Smoke test timed out after 120 seconds."
+    if result.returncode == 0:
+        return ""
+    combined = "\n".join(p for p in [result.stdout, result.stderr] if p).strip()
+    return combined or "Smoke test failed with no output."
 
 
 def _build_project_image(store: ConfigStore, project, agent) -> str:
