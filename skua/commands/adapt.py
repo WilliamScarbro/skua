@@ -17,6 +17,7 @@ from skua.docker import (
     build_image,
     generate_dockerfile,
     image_exists,
+    image_name_for_agent,
     image_name_for_project,
     resolve_project_image_inputs,
 )
@@ -124,7 +125,10 @@ def cmd_adapt(args):
 
     if discover_mode:
         print("[adapt] Step 1: Discover wishlist with agent")
-        _run_agent_adapt_session(store, project, env, sec, agent)
+        _run_agent_adapt_session(
+            store, project, env, sec, agent,
+            needs_smoke_test=(not smoke_test_path(project_dir).exists()),
+        )
 
     if request_from_flags is not None:
         request = request_from_flags
@@ -187,7 +191,7 @@ def cmd_adapt(args):
         smoke_error = ""
         if not build_error:
             smoke_script = smoke_test_path(project_dir)
-            if not smoke_script.exists():
+            if not smoke_script.exists() and not discover_mode:
                 print("[adapt] No smoke test found; asking agent to create one...")
                 _run_agent_adapt_session(
                     store, project, env, sec, agent,
@@ -403,16 +407,17 @@ def _sync_auth_from_host(data_dir: Path, cred, agent) -> int:
     return copied
 
 
-def _ensure_runtime_image(store: ConfigStore, project, sec, agent) -> str:
-    """Return an existing runtime image name, building lazily when needed."""
+def _ensure_base_agent_image(store: ConfigStore, project, sec, agent) -> str:
+    """Return the base agent image name, building lazily when needed."""
     g = store.load_global()
-    image_name = _runtime_image_name(store, project)
+    image_name_base = g.get("imageName", "skua-base")
+    image_name = image_name_for_agent(image_name_base, agent.name)
     if image_exists(image_name):
-        print(f"[adapt] Runtime image ready: {image_name}")
+        print(f"[adapt] Base agent image ready: {image_name}")
         return image_name
 
-    print(f"[adapt] Runtime image missing: {image_name}")
-    print("[adapt] Building runtime image...")
+    print(f"[adapt] Base agent image missing: {image_name}")
+    print("[adapt] Building base agent image...")
     container_dir = store.get_container_dir()
     if container_dir is None:
         print("Error: Cannot find container build assets (entrypoint.sh).")
@@ -446,7 +451,7 @@ def _ensure_runtime_image(store: ConfigStore, project, sec, agent) -> str:
     if not success:
         print(f"Error: failed to build image '{image_name}'.")
         sys.exit(1)
-    print(f"[adapt] Runtime image built: {image_name}")
+    print(f"[adapt] Base agent image built: {image_name}")
     return image_name
 
 
@@ -465,7 +470,12 @@ def _shell_join(argv: list) -> str:
     return " ".join(shlex.quote(str(token)) for token in (argv or []))
 
 
-def _agent_prompt(project_name: str, agent_name: str, build_error: str = "", smoke_error: str = "") -> str:
+def _agent_prompt(project_name: str, agent_name: str, build_error: str = "", smoke_error: str = "", needs_smoke_test: bool = False) -> str:
+    file_restriction = (
+        "Only modify .skua/image-request.yaml and .skua/smoke-test.sh."
+        if needs_smoke_test
+        else "Do not modify any other file."
+    )
     base = (
         f"You are adapting the project '{project_name}'. "
         "You are running inside the project's Docker container environment. "
@@ -477,8 +487,21 @@ def _agent_prompt(project_name: str, agent_name: str, build_error: str = "", smo
         "Keep requests minimal and incremental. "
         "Use packages for apt dependencies, commands for setup steps, and optionally "
         "baseImage or fromImage when needed. "
-        "Do not modify any other file."
+        f"{file_restriction}"
     )
+    if needs_smoke_test:
+        base += (
+            "\n\nAlso create a smoke test script at `.skua/smoke-test.sh`. "
+            "The script must exit 0 on success and non-zero on failure. "
+            "It should verify that the project's required tools and dependencies are available in the current environment. "
+            "Inspect the project files (README, lockfiles, manifests, build scripts, CI config) "
+            "to determine what tools and commands should work. "
+            "Common checks: verify required executables exist (e.g., python3, node, go, cargo), "
+            "check that key dependencies are importable or buildable "
+            "(e.g., 'python -c \"import fastapi\"', 'node -e \"require(\\\"express\\\")\"'), "
+            "or run a fast build/install dry-run. "
+            "Keep the script minimal and fast (under 30 seconds to run)."
+        )
     if build_error:
         base += (
             "\n\nThe previous Docker build FAILED. Update .skua/image-request.yaml to fix it. "
@@ -618,9 +641,9 @@ def _confirm_apply_wishlist(agent_name: str, request: dict) -> bool:
     return answer != "n"
 
 
-def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_error: str = "", prompt_override: str = "") -> list:
+def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_error: str = "", prompt_override: str = "", needs_smoke_test: bool = False) -> list:
     agent_name = (agent.name or "").strip().lower()
-    prompt = prompt_override or _agent_prompt(project_name, agent_name, build_error, smoke_error)
+    prompt = prompt_override or _agent_prompt(project_name, agent_name, build_error, smoke_error, needs_smoke_test)
 
     template = str(getattr(agent.runtime, "adapt_command", "") or "").strip()
     if template:
@@ -706,10 +729,11 @@ def _run_agent_adapt_session(
     smoke_error: str = "",
     prompt_override: str = "",
     warn_on_failure: bool = False,
+    needs_smoke_test: bool = False,
 ):
     """Start an adapt container session and ask the agent to update image-request.yaml."""
-    print("[adapt] Preparing runtime image...")
-    image_name = _ensure_runtime_image(store, project, sec, agent)
+    print("[adapt] Preparing base agent image...")
+    image_name = _ensure_base_agent_image(store, project, sec, agent)
     data_dir = store.project_data_dir(project.name, project.agent)
 
     docker_cmd_base = build_run_command(
@@ -734,10 +758,12 @@ def _run_agent_adapt_session(
         print(f"[adapt] {agent.name} is revising image request after build failure...")
     elif smoke_error:
         print(f"[adapt] {agent.name} is revising image request after smoke test failure...")
+    elif needs_smoke_test:
+        print(f"[adapt] {agent.name} is generating wishlist and smoke test...")
     else:
         print(f"[adapt] {agent.name} is generating wishlist...")
     run_cmd = _noninteractive_run_command(docker_cmd_base, project.name, "agent")
-    adapt_cmd = _agent_adapt_command(agent, project.name, build_error, smoke_error, prompt_override)
+    adapt_cmd = _agent_adapt_command(agent, project.name, build_error, smoke_error, prompt_override, needs_smoke_test)
     print(f"[adapt] Agent command: {_shell_join(adapt_cmd)}")
     run_cmd.extend(adapt_cmd)
     result = subprocess.run(run_cmd, capture_output=True, text=True)
@@ -844,12 +870,6 @@ def _current_image_name(store: ConfigStore, project) -> str:
     image_name_base = g.get("imageName", "skua-base")
     return image_name_for_project(image_name_base, project)
 
-
-def _runtime_image_name(store: ConfigStore, project) -> str:
-    """Return the runtime image name used for agent adapt sessions."""
-    g = store.load_global()
-    image_name_base = g.get("imageName", "skua-base")
-    return f"{image_name_for_project(image_name_base, project)}-runtime"
 
 
 def _read_last_dockerfile(container_dir: Path, max_chars: int = 8000) -> str:
