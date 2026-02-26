@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua list — list projects and running containers."""
 
+import json
 import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -264,6 +265,41 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
     return "".join(ordered), flags
 
 
+def _agent_activity(container_name: str, host: str = "") -> str:
+    """Return agent activity state by reading /tmp/skua-agent-status inside the container.
+
+    States written by the hook scripts:
+        thinking  — agent is actively executing a tool
+        idle      — agent is between tool calls
+        done      — agent finished its task (Stop hook fired)
+
+    Returns "-" when the container is unreachable or the status file is absent
+    (e.g. the image pre-dates monitoring support or no agent has been started).
+    Returns "?" when the file exists but cannot be parsed.
+    """
+    cmd = ["docker", "exec", container_name, "cat", "/tmp/skua-agent-status"]
+    if host:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "-"
+    if result.returncode != 0 or not result.stdout.strip():
+        return "-"
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        return "?"
+    state = data.get("state", "?")
+    if state == "thinking":
+        tool = data.get("tool", "")
+        if tool:
+            tool = tool[:10] if len(tool) > 10 else tool
+            return f"think:{tool}"
+        return "thinking"
+    return state
+
+
 def cmd_list(args):
     store = ConfigStore()
     project_names = store.list_resources("Project")
@@ -320,6 +356,16 @@ def cmd_list(args):
             if running_name != "-":
                 needs_running_image = True
 
+    activity_values = {}
+    if show_agent:
+        for name, project in projects:
+            container_name = f"skua-{name}"
+            host = getattr(project, "host", "") or ""
+            if container_name in _running_for_host(host):
+                activity_values[name] = _agent_activity(container_name, host=host)
+            else:
+                activity_values[name] = "-"
+
     columns = [("NAME", 16)]
     if show_host:
         columns.append(("HOST", 14))
@@ -331,7 +377,7 @@ def cmd_list(args):
         if needs_running_image:
             columns.append(("RUNNING-IMAGE", 36))
     if show_agent:
-        columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
+        columns.extend([("AGENT", 10), ("CREDENTIAL", 20), ("ACTIVITY", 14)])
     if show_security:
         columns.extend([("SECURITY", 12), ("NETWORK", 10)])
     columns.append(("STATUS", 12))
@@ -378,7 +424,8 @@ def cmd_list(args):
 
         if show_agent:
             credential = project.credential or "(none)"
-            row.extend([_col(project.agent, 10), _col(credential, 20)])
+            activity = activity_values.get(name, "-")
+            row.extend([_col(project.agent, 10), _col(credential, 20), _col(activity, 14)])
         if show_security:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"

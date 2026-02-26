@@ -418,6 +418,12 @@ COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh
 RUN chmod +x /home/dev/entrypoint.sh
 
 ENTRYPOINT ["/home/dev/entrypoint.sh"]
+
+# ── Agent monitoring hooks ────────────────────────────────────────────
+COPY --chown=dev:dev hooks/ /home/dev/.skua/hooks/
+RUN chmod +x /home/dev/.skua/hooks/*.sh
+COPY --chown=dev:dev entrypoint.d/ /home/dev/entrypoint.d/
+RUN chmod +x /home/dev/entrypoint.d/*.sh 2>/dev/null || true
 """
     return dockerfile
 
@@ -469,6 +475,24 @@ def build_image(
 
         # Copy entrypoint
         shutil.copy2(container_dir / "entrypoint.sh", build_path / "entrypoint.sh")
+
+        # Copy agent monitoring hook scripts (baked into image; always present)
+        hooks_dst = build_path / "hooks"
+        hooks_dst.mkdir()
+        hooks_src = container_dir / "hooks"
+        if hooks_src.is_dir():
+            for f in sorted(hooks_src.iterdir()):
+                if f.is_file():
+                    shutil.copy2(f, hooks_dst / f.name)
+
+        # Copy entrypoint.d agent-specific setup scripts
+        epd_dst = build_path / "entrypoint.d"
+        epd_dst.mkdir()
+        epd_src = container_dir / "entrypoint.d"
+        if epd_src.is_dir():
+            for f in sorted(epd_src.iterdir()):
+                if f.is_file():
+                    shutil.copy2(f, epd_dst / f.name)
 
         # Copy Claude settings (no credentials)
         settings_dir = build_path / "claude-settings"
@@ -761,6 +785,14 @@ def compute_build_context_hash(
     for fname in ("settings.json", "settings.local.json"):
         src = claude_home / fname
         _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
+
+    # Hash agent monitoring scripts so changes to hooks trigger a rebuild
+    for subdir in ("hooks", "entrypoint.d"):
+        script_dir = container_dir / subdir
+        if script_dir.is_dir():
+            for script_file in sorted(script_dir.iterdir()):
+                if script_file.is_file():
+                    _hash_with_marker(hasher, f"{subdir}:{script_file.name}", script_file.read_bytes())
 
     return hasher.hexdigest()
 

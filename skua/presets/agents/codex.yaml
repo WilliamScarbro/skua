@@ -16,7 +16,8 @@ spec:
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim
-    entrypoint_hooks: []
+    entrypoint_hooks:
+      - entrypoint.d/codex.sh
   auth:
     dir: .codex
     files:

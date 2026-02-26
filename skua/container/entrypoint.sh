@@ -161,6 +161,15 @@ else
     NEEDS_LOGIN+=("$AGENT_LOGIN_COMMAND")
 fi
 
+# ── Agent monitoring setup ────────────────────────────────────────────
+# Run the agent-specific entrypoint hook (if present) to configure activity
+# monitoring.  The hook writes to /tmp/skua-agent-status so that
+# `skua list --agent` can display real-time agent state.
+AGENT_HOOK="/home/dev/entrypoint.d/${AGENT_NAME}.sh"
+if [ -f "$AGENT_HOOK" ]; then
+    bash "$AGENT_HOOK" || true
+fi
+
 echo ""
 
 # ── Project ──────────────────────────────────────────────────────────
