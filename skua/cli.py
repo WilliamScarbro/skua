@@ -95,10 +95,16 @@ def main():
     p_add.add_argument("--credential", help="Named credential set to use for this project")
     p_add.add_argument("--no-credential", action="store_true",
                         help="Skip credential setup (use when the agent will authenticate inside the container)")
+    p_add.add_argument("--image", help="Docker base image for the project container")
     p_add.add_argument("--quick", action="store_true",
                         help="Use all defaults, skip interactive prompts")
     p_add.add_argument("--no-prompt", action="store_true",
                         help="Skip interactive prompts for missing values")
+
+    # update
+    p_update = sub.add_parser("update", help="Update a project configuration")
+    p_update.add_argument("name", help="Project name to update")
+    p_update.add_argument("--image", help="Set the Docker base image for the project container")
 
     # remove
     p_rm = sub.add_parser("remove", help="Remove a project configuration")
@@ -227,7 +233,7 @@ def main():
 
     # Lazy import commands to keep startup fast
     from skua.commands import (
-        cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
+        cmd_build, cmd_init, cmd_add, cmd_update, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe, cmd_credential,
     )
@@ -236,6 +242,7 @@ def main():
         "init": cmd_init,
         "build": cmd_build,
         "add": cmd_add,
+        "update": cmd_update,
         "remove": cmd_remove,
         "run": cmd_run,
         "stop": cmd_stop,

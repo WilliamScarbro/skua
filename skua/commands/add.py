@@ -173,6 +173,7 @@ def cmd_add(args):
     else:
         cred_name = _auto_add_local_credential(store, agent_name, agent, quick, args.no_prompt)
 
+    base_image = getattr(args, "image", None) or ""
     project = Project(
         name=name,
         directory=project_dir or "",
@@ -184,7 +185,7 @@ def cmd_add(args):
         credential=cred_name,
         git=ProjectGitSpec(),
         ssh=ProjectSshSpec(private_key=ssh_key),
-        image=ProjectImageSpec(),
+        image=ProjectImageSpec(base_image=base_image),
     )
 
     store.save_resource(project)
@@ -221,6 +222,7 @@ def cmd_add(args):
     _print_summary_attr("Security", sec_name)
     _print_summary_attr("Agent", agent_name)
     _print_summary_attr("Credential", cred_name)
+    _print_summary_attr("Image", base_image)
     if project_dir and Path(project_dir).is_dir():
         print(f"  {'Adapt guide:':<14} {Path(project_dir) / '.skua' / ADAPT_GUIDE_NAME}")
     if ssh_key:
