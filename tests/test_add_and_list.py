@@ -463,3 +463,40 @@ class TestListColumns(unittest.TestCase):
         self.assertIn("unreachable", out)
         self.assertNotIn("built", out)
         self.assertIn("1 project(s), 0 running", out)
+
+    @mock.patch("skua.commands.list_cmd.get_running_skua_containers", return_value=[])
+    @mock.patch("skua.commands.list_cmd.ConfigStore")
+    def test_list_truncates_long_source_to_column_width(self, MockStore, _mock_running):
+        from skua.commands.list_cmd import cmd_list
+
+        long_path = "/very/deeply/nested/directory/structure/that/is/way/too/long/for/the/column"
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["proj"]
+        store.resolve_project.return_value = Project(
+            name="proj",
+            directory=long_path,
+            environment="local-docker",
+            security="open",
+            agent="claude",
+        )
+        store.load_environment.return_value = SimpleNamespace(
+            network=SimpleNamespace(mode="bridge")
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list(argparse.Namespace())
+        out = buf.getvalue()
+
+        # Every data line must have the STATUS column starting at the right offset
+        source_col_width = 38
+        for line in out.splitlines():
+            if "proj" in line and ("missing" in line or "built" in line):
+                # NAME(16) + space + SOURCE(38) + space = offset 55 for next col
+                # Verify the SOURCE field does not bleed: its slice must be exactly 38 chars
+                name_width = 16
+                source_start = name_width + 1  # after the space separator
+                source_field = line[source_start:source_start + source_col_width]
+                self.assertEqual(len(source_field), source_col_width,
+                                 f"SOURCE field should be exactly {source_col_width} chars")

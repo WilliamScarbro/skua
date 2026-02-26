@@ -49,6 +49,13 @@ def _github_source(repo_url: str) -> str:
     return ""
 
 
+def _col(value: str, width: int) -> str:
+    """Left-justify value in exactly width chars, truncating with … if needed."""
+    if len(value) > width:
+        value = value[:width - 1] + "\u2026"
+    return f"{value:<{width}}"
+
+
 def _format_host(project) -> str:
     """Return the host label: SSH:<host> for remote, LOCAL for local."""
     host = getattr(project, "host", "") or ""
@@ -327,7 +334,7 @@ def cmd_list(args):
         columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
     if show_security:
         columns.extend([("SECURITY", 12), ("NETWORK", 10)])
-    columns.append(("STATUS", 10))
+    columns.append(("STATUS", 12))
 
     print(" ".join(f"{title:<{width}}" for title, width in columns))
     print("-" * (sum(width for _, width in columns) + (len(columns) - 1)))
@@ -350,14 +357,14 @@ def cmd_list(args):
         if pending_adapt:
             status += "*"
             pending_count += 1
-        row = [f"{name:<16}"]
+        row = [_col(name, 16)]
 
         if show_host:
-            row.append(f"{_format_host(project):<14}")
-        row.append(f"{_format_source(project):<38}")
+            row.append(_col(_format_host(project), 14))
+        row.append(_col(_format_source(project), 38))
         if show_git:
             git_status = _git_status(project, store) or "-"
-            row.append(f"{git_status:<9}")
+            row.append(_col(git_status, 9))
         if show_image:
             suffix, flags = _image_suffix(project, store)
             if "(A)" in flags:
@@ -365,19 +372,19 @@ def cmd_list(args):
             if "(B)" in flags:
                 needs_build = True
             sep = " " if suffix else ""
-            row.append(f"{(img_name + sep + suffix):<36}")
+            row.append(_col(img_name + sep + suffix, 36))
             if needs_running_image:
-                row.append(f"{running_image_values.get(name, '-'):<36}")
+                row.append(_col(running_image_values.get(name, "-"), 36))
 
         if show_agent:
             credential = project.credential or "(none)"
-            row.extend([f"{project.agent:<10}", f"{credential:<20}"])
+            row.extend([_col(project.agent, 10), _col(credential, 20)])
         if show_security:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"
-            row.extend([f"{project.security:<12}", f"{network:<10}"])
+            row.extend([_col(project.security, 12), _col(network, 10)])
 
-        row.append(f"{status:<10}")
+        row.append(_col(status, 12))
         print(" ".join(row))
 
     print()
