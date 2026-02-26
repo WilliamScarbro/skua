@@ -278,10 +278,17 @@ def cmd_list(args):
     if local_only:
         projects = [(name, p) for name, p in projects if not getattr(p, "host", "")]
 
+    unreachable_hosts: set = set()
+
     def _running_for_host(host: str) -> set:
         normalized = host or ""
         if normalized not in running_by_host:
-            running_by_host[normalized] = set(get_running_skua_containers(host=normalized))
+            result = get_running_skua_containers(host=normalized)
+            if result is None:
+                unreachable_hosts.add(normalized)
+                running_by_host[normalized] = set()
+            else:
+                running_by_host[normalized] = set(result)
         return running_by_host[normalized]
 
     show_host = any(getattr(p, "host", "") for _, p in projects)
@@ -336,6 +343,8 @@ def cmd_list(args):
         img_name = image_name_for_project(image_name_base, project)
         if container_name in running:
             status = "running"
+        elif host and host in unreachable_hosts:
+            status = "unreachable"
         else:
             status = "built" if image_exists(img_name) else "missing"
         if pending_adapt:

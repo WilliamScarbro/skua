@@ -27,8 +27,12 @@ def is_container_running(name: str) -> bool:
         return False
 
 
-def get_running_skua_containers(host: str = "") -> list:
-    """Return list of running skua container names for local or remote host."""
+def get_running_skua_containers(host: str = "") -> list | None:
+    """Return list of running skua container names for local or remote host.
+
+    Returns None when the host is unreachable (SSH failure or timeout).
+    Returns an empty list when connected but no skua containers are running.
+    """
     cmd = ["docker", "ps", "--filter", "name=^skua-", "--format", "{{.Names}}"]
     if host:
         cmd = [
@@ -47,10 +51,10 @@ def get_running_skua_containers(host: str = "") -> list:
             timeout=8,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
+        return None if host else []
 
     if result.returncode != 0:
-        return []
+        return None if host else []
     if result.stdout.strip():
         return result.stdout.strip().split("\n")
     return []

@@ -430,3 +430,36 @@ class TestListColumns(unittest.TestCase):
         self.assertEqual(2, mock_running.call_count)
         mock_running.assert_any_call()
         mock_running.assert_any_call(host="qar")
+
+    @mock.patch("skua.commands.list_cmd.image_exists", return_value=True)
+    @mock.patch("skua.commands.list_cmd.get_running_skua_containers")
+    @mock.patch("skua.commands.list_cmd.ConfigStore")
+    def test_list_shows_unreachable_when_ssh_host_fails(self, MockStore, mock_running, _mock_image_exists):
+        from skua.commands.list_cmd import cmd_list
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["remote"]
+        store.resolve_project.return_value = Project(
+            name="remote",
+            repo="git@github.com:org/repo.git",
+            host="badhost",
+            environment="local-docker",
+            security="open",
+            agent="claude",
+        )
+        store.load_environment.return_value = SimpleNamespace(
+            network=SimpleNamespace(mode="bridge")
+        )
+
+        # Local query succeeds; SSH to "badhost" fails (returns None)
+        mock_running.side_effect = [[], None]
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list(argparse.Namespace())
+        out = buf.getvalue()
+
+        self.assertIn("unreachable", out)
+        self.assertNotIn("built", out)
+        self.assertIn("1 project(s), 0 running", out)
