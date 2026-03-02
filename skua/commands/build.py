@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BUSL-1.1
-"""skua build — ensure required project Docker images exist."""
+"""skua build — build/refresh a single project's Docker image."""
 import sys
 
 from skua.config import ConfigStore
@@ -10,16 +10,6 @@ from skua.docker import (
     image_name_for_project,
     resolve_project_image_inputs,
 )
-
-
-def _required_projects(store: ConfigStore) -> list:
-    """Return all resolvable projects in stable name order."""
-    required = []
-    for name in store.list_resources("Project"):
-        project = store.resolve_project(name)
-        if project:
-            required.append(project)
-    return required
 
 
 def cmd_build(args):
@@ -44,26 +34,17 @@ def cmd_build(args):
     defaults = g.get("defaults", {})
     security_name = defaults.get("security", "open")
     security = store.load_security(security_name)
-    required_projects = _required_projects(store)
-    if not required_projects:
-        print("No projects configured, so no agent images are required.")
-        print("Add a project with 'skua add <name> --dir <path>' or --repo first.")
-        return
+    project_name = getattr(args, "name", "")
+    project = store.resolve_project(project_name)
+    if project is None:
+        print(f"Error: Project '{project_name}' not found.")
+        print(f"Add it with: skua add {project_name} --dir /path/to/project")
+        sys.exit(1)
 
-    missing_agents = set()
-    project_specs = []
-    for project in required_projects:
-        agent = store.load_agent(project.agent)
-        if agent is None:
-            missing_agents.add(project.agent)
-            continue
-        project_specs.append((project, agent))
-
-    if missing_agents:
-        print("Error: missing agent configs referenced by projects:")
-        for name in sorted(missing_agents):
-            print(f"  - {name}")
-        print("Run 'skua init' to install default presets, or fix project configs.")
+    agent = store.load_agent(project.agent)
+    if agent is None:
+        print(f"Error: missing agent config '{project.agent}' for project '{project.name}'.")
+        print("Run 'skua init' to install default presets, or fix the project config.")
         sys.exit(1)
 
     # Collect extra packages/commands from global config
@@ -71,11 +52,11 @@ def cmd_build(args):
     global_packages = image_config.get("extraPackages", [])
     global_commands = image_config.get("extraCommands", [])
 
-    print("Building Docker images...")
+    print("Building Docker image...")
     print(f"  Base image:  {base_image}")
     print(f"  Image base:  {image_name_base}")
     print(f"  Security:    {security_name}")
-    print(f"  Projects:    {len(project_specs)}")
+    print(f"  Project:     {project.name}")
     if global_packages:
         print(f"  Global pkgs: {', '.join(global_packages)}")
     print(f"  Source:      {container_dir}")
@@ -85,36 +66,32 @@ def cmd_build(args):
     rebuilt = []
     existing = []
     failed = []
-    seen_images = set()
-    for project, agent in project_specs:
-        image_name = image_name_for_project(image_name_base, project)
-        if image_name in seen_images:
-            continue
-        seen_images.add(image_name)
-        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
-            default_base_image=base_image,
+    image_name = image_name_for_project(image_name_base, project)
+    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+        default_base_image=base_image,
+        agent=agent,
+        project=project,
+        global_extra_packages=global_packages,
+        global_extra_commands=global_commands,
+    )
+    needs_rebuild = False
+    if image_exists(image_name):
+        if image_matches_build_context(
+            image_name=image_name,
+            container_dir=container_dir,
+            security=security,
             agent=agent,
-            project=project,
-            global_extra_packages=global_packages,
-            global_extra_commands=global_commands,
-        )
-        needs_rebuild = False
-        if image_exists(image_name):
-            if image_matches_build_context(
-                image_name=image_name,
-                container_dir=container_dir,
-                security=security,
-                agent=agent,
-                base_image=resolved_base_image,
-                extra_packages=extra_packages,
-                extra_commands=extra_commands,
-            ):
-                print(f"-> Using existing image '{image_name}' (project: {project.name})")
-                existing.append(image_name)
-                continue
+            base_image=resolved_base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        ):
+            print(f"-> Using existing image '{image_name}' (project: {project.name})")
+            existing.append(image_name)
+        else:
             print(f"-> Image '{image_name}' is out-of-date; rebuilding (project: {project.name})")
             needs_rebuild = True
 
+    if not existing:
         if not needs_rebuild:
             print(
                 f"-> Image '{image_name}' missing; building for project "

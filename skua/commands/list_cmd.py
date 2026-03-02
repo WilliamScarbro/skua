@@ -271,6 +271,7 @@ def _agent_activity(container_name: str, host: str = "") -> str:
     States written by the hook scripts:
         thinking  — agent is actively executing a tool
         idle      — agent is between tool calls
+        api_activity — agent is actively using the API without a subprocess
         done      — agent finished its task (Stop hook fired)
 
     Returns "-" when the container is unreachable or the status file is absent
@@ -297,6 +298,25 @@ def _agent_activity(container_name: str, host: str = "") -> str:
             tool = tool[:10] if len(tool) > 10 else tool
             return f"think:{tool}"
         return "thinking"
+    if state == "processing":
+        return "processing"
+    if state == "api_activity":
+        hits = data.get("hits")
+        if isinstance(hits, int) and hits >= 0:
+            if hits < 50:
+                return "idle"
+            if hits < 100:
+                return "X"
+            if hits < 250:
+                return "XX"
+            if hits < 400:
+                return "XXX"
+            if hits < 550:
+                return "XXXX"
+            if hits < 700:
+                return "XXXXX"
+            return "XXXXXX"
+        return "?"
     return state
 
 
@@ -357,16 +377,17 @@ def cmd_list(args):
                 needs_running_image = True
 
     activity_values = {}
-    if show_agent:
-        for name, project in projects:
-            container_name = f"skua-{name}"
-            host = getattr(project, "host", "") or ""
-            if container_name in _running_for_host(host):
-                activity_values[name] = _agent_activity(container_name, host=host)
-            else:
-                activity_values[name] = "-"
+    for name, project in projects:
+        container_name = f"skua-{name}"
+        host = getattr(project, "host", "") or ""
+        if container_name in _running_for_host(host):
+            activity_values[name] = _agent_activity(container_name, host=host)
+        else:
+            activity_values[name] = "-"
 
     columns = [("NAME", 16)]
+    columns.append(("ACTIVITY", 14))
+    columns.append(("STATUS", 12))
     if show_host:
         columns.append(("HOST", 14))
     columns.append(("SOURCE", 38))
@@ -377,10 +398,9 @@ def cmd_list(args):
         if needs_running_image:
             columns.append(("RUNNING-IMAGE", 36))
     if show_agent:
-        columns.extend([("AGENT", 10), ("CREDENTIAL", 20), ("ACTIVITY", 14)])
+        columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
     if show_security:
         columns.extend([("SECURITY", 12), ("NETWORK", 10)])
-    columns.append(("STATUS", 12))
 
     print(" ".join(f"{title:<{width}}" for title, width in columns))
     print("-" * (sum(width for _, width in columns) + (len(columns) - 1)))
@@ -404,6 +424,9 @@ def cmd_list(args):
             status += "*"
             pending_count += 1
         row = [_col(name, 16)]
+        activity = activity_values.get(name, "-")
+        row.append(_col(activity, 14))
+        row.append(_col(status, 12))
 
         if show_host:
             row.append(_col(_format_host(project), 14))
@@ -424,14 +447,11 @@ def cmd_list(args):
 
         if show_agent:
             credential = project.credential or "(none)"
-            activity = activity_values.get(name, "-")
-            row.extend([_col(project.agent, 10), _col(credential, 20), _col(activity, 14)])
+            row.extend([_col(project.agent, 10), _col(credential, 20)])
         if show_security:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"
             row.extend([_col(project.security, 12), _col(network, 10)])
-
-        row.append(_col(status, 12))
         print(" ".join(row))
 
     print()
@@ -447,6 +467,6 @@ def cmd_list(args):
         if needs_adapt:
             print("  (A) image-request changes pending; run 'skua adapt'")
         if needs_build:
-            print("  (B) image out of date; run 'skua build' or 'skua adapt --build'")
+            print("  (B) image out of date; run 'skua build <name>' or 'skua adapt --build'")
     if show_image and needs_running_image:
         print("  RUNNING-IMAGE indicates a restart is needed to use the latest image")

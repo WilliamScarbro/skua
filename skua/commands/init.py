@@ -85,7 +85,7 @@ def cmd_init(args):
 
     print()
     print("Next steps:")
-    print("  skua build                          Build required project images")
+    print("  skua build <name>                   Build required image for a project")
     print("  skua add <name> --dir /path          Add a project")
     print("  skua adapt <name>                    Apply image-request template changes")
     print("  skua run <name>                      Start a container")

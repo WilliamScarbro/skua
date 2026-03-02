@@ -244,7 +244,7 @@ class TestListColumns(unittest.TestCase):
     @mock.patch("skua.commands.list_cmd.get_running_skua_containers")
     @mock.patch("skua.commands.list_cmd._has_pending_adapt_request", return_value=True)
     @mock.patch("skua.commands.list_cmd.ConfigStore")
-    def test_list_default_shows_minimal_columns(self, MockStore, _mock_pending, mock_running):
+    def test_list_default_shows_default_columns(self, MockStore, _mock_pending, mock_running):
         from skua.commands.list_cmd import cmd_list
 
         store = MockStore.return_value
@@ -269,8 +269,9 @@ class TestListColumns(unittest.TestCase):
         out = buf.getvalue()
 
         self.assertIn("NAME", out)
-        self.assertIn("SOURCE", out)
+        self.assertIn("ACTIVITY", out)
         self.assertIn("STATUS", out)
+        self.assertIn("SOURCE", out)
         self.assertNotIn("AGENT", out)
         self.assertNotIn("CREDENTIAL", out)
         self.assertNotIn("SECURITY", out)
@@ -305,6 +306,7 @@ class TestListColumns(unittest.TestCase):
             cmd_list(argparse.Namespace(agent=True, security=True))
         out = buf.getvalue()
 
+        self.assertIn("ACTIVITY", out)
         self.assertIn("AGENT", out)
         self.assertIn("CREDENTIAL", out)
         self.assertIn("SECURITY", out)
@@ -362,7 +364,6 @@ class TestListColumns(unittest.TestCase):
         self.assertEqual(2, mock_running.call_count)
         mock_running.assert_any_call()
         mock_running.assert_any_call(host="qar")
-
     @mock.patch("skua.commands.list_cmd.image_exists")
     @mock.patch("skua.commands.list_cmd.get_running_skua_containers", return_value=[])
     @mock.patch("skua.commands.list_cmd.ConfigStore")
@@ -489,14 +490,59 @@ class TestListColumns(unittest.TestCase):
             cmd_list(argparse.Namespace())
         out = buf.getvalue()
 
-        # Every data line must have the STATUS column starting at the right offset
+        # Every data line must have the SOURCE column starting at the right offset.
         source_col_width = 38
         for line in out.splitlines():
             if "proj" in line and ("missing" in line or "built" in line):
-                # NAME(16) + space + SOURCE(38) + space = offset 55 for next col
+                # NAME(16) + space + ACTIVITY(14) + space + STATUS(12) + space = offset 45.
                 # Verify the SOURCE field does not bleed: its slice must be exactly 38 chars
-                name_width = 16
-                source_start = name_width + 1  # after the space separator
+                source_start = 45
                 source_field = line[source_start:source_start + source_col_width]
                 self.assertEqual(len(source_field), source_col_width,
                                  f"SOURCE field should be exactly {source_col_width} chars")
+
+
+class TestAgentActivityFormatting(unittest.TestCase):
+    @mock.patch("skua.commands.list_cmd.subprocess.run")
+    def test_api_activity_below_threshold_returns_idle(self, mock_run):
+        from skua.commands.list_cmd import _agent_activity
+
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='{"state":"api_activity","hits":49,"window":30,"ts":123}\n',
+        )
+
+        self.assertEqual("idle", _agent_activity("skua-demo"))
+
+    @mock.patch("skua.commands.list_cmd.subprocess.run")
+    def test_api_activity_renders_bar(self, mock_run):
+        from skua.commands.list_cmd import _agent_activity
+
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='{"state":"api_activity","hits":250,"window":30,"ts":123}\n',
+        )
+
+        self.assertEqual("XXX", _agent_activity("skua-demo"))
+
+    @mock.patch("skua.commands.list_cmd.subprocess.run")
+    def test_api_activity_caps_bar_width(self, mock_run):
+        from skua.commands.list_cmd import _agent_activity
+
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='{"state":"api_activity","hits":1000,"window":30,"ts":123}\n',
+        )
+
+        self.assertEqual("XXXXXX", _agent_activity("skua-demo"))
+
+    @mock.patch("skua.commands.list_cmd.subprocess.run")
+    def test_processing_state_has_priority(self, mock_run):
+        from skua.commands.list_cmd import _agent_activity
+
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='{"state":"processing","ts":123}\n',
+        )
+
+        self.assertEqual("processing", _agent_activity("skua-demo"))

@@ -99,7 +99,7 @@ docker stop skua-myapp
 ```bash
 sudo dpkg -i skua_<version>_all.deb
 skua init
-skua build
+skua build <name>
 ```
 
 ### Manual Setup
@@ -108,7 +108,7 @@ skua build
 pip install pyyaml
 ln -s /path/to/skua/bin/skua ~/.local/bin/skua
 skua init
-skua build
+skua build <name>
 ```
 
 ## Useful Docs
@@ -123,7 +123,7 @@ skua build
 | Command | Purpose |
 |---------|---------|
 | `skua init` | First-time setup wizard |
-| `skua build` | Build images required by configured projects |
+| `skua build <name>` | Build image required by a project |
 | `skua add <name>` | Add a project (`--dir` or `--repo`) |
 | `skua adapt <name>` | Run agent-driven image adaptation and build updated project image |
 | `skua run <name>` | Start a container (or attach if already running) |

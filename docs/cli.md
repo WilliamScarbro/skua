@@ -21,11 +21,11 @@ skua init --force   # re-initialize (overwrites global config)
 
 ### `skua build`
 
-Build Docker images required by currently configured projects. For default projects, Skua tags images as `<imageName>-<agent>` (for example `skua-base-codex`). Projects with image customizations use project-scoped tags (`...-<project>-vN`).
+Build the Docker image required by a specific project. For default projects, Skua tags images as `<imageName>-<agent>` (for example `skua-base-codex`). Projects with image customizations use project-scoped tags (`...-<project>-vN`).
 If an image already exists, Skua compares its saved build-context hash (generated Dockerfile + entrypoint/default config inputs) and rebuilds automatically when drift is detected.
 
 ```bash
-skua build
+skua build myapp
 ```
 
 The image name, base image, and extra packages are configured in global config:
@@ -128,7 +128,7 @@ skua list -s        # include security/network columns
 skua list -a -s     # full view
 ```
 
-Default columns: NAME, SOURCE, STATUS.
+Default columns: NAME, ACTIVITY, STATUS, SOURCE.
 
 ### `skua clean [<name>]`
 

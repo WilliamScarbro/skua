@@ -19,14 +19,14 @@ The installer will:
 1. Check prerequisites
 2. Symlink `skua` to your PATH
 3. Run the init wizard (git identity, SSH key, preset installation)
-4. Build images required by configured projects
+4. Build an image for your project
 
 ## Install from .deb
 
 ```bash
 sudo dpkg -i skua_<version>_all.deb
 skua init
-skua build
+skua build <name>
 ```
 
 ## First Project
@@ -34,6 +34,9 @@ skua build
 ```bash
 # Add a project
 skua add myapp --dir ~/projects/myapp --agent codex
+
+# Build its image
+skua build myapp
 
 # Optional: run automated project image adaptation
 skua adapt myapp

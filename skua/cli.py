@@ -74,7 +74,8 @@ def main():
                         help="Re-initialize even if already configured")
 
     # build
-    p_build = sub.add_parser("build", help="Build images required by configured projects")
+    p_build = sub.add_parser("build", help="Build image required by a project")
+    p_build.add_argument("name", help="Project name to build image for")
     p_build.add_argument(
         "-v",
         "--verbose",
@@ -100,11 +101,6 @@ def main():
                         help="Use all defaults, skip interactive prompts")
     p_add.add_argument("--no-prompt", action="store_true",
                         help="Skip interactive prompts for missing values")
-
-    # update
-    p_update = sub.add_parser("update", help="Update a project configuration")
-    p_update.add_argument("name", help="Project name to update")
-    p_update.add_argument("--image", help="Set the Docker base image for the project container")
 
     # remove
     p_rm = sub.add_parser("remove", help="Remove a project configuration")
@@ -144,7 +140,7 @@ def main():
     p_list.add_argument(
         "-a", "--agent",
         action="store_true",
-        help="Include agent configuration columns (agent, credential)",
+        help="Include agent configuration columns (agent, credential); activity is always shown",
     )
     p_list.add_argument(
         "-s", "--security",
@@ -233,7 +229,7 @@ def main():
 
     # Lazy import commands to keep startup fast
     from skua.commands import (
-        cmd_build, cmd_init, cmd_add, cmd_update, cmd_remove, cmd_run, cmd_stop, cmd_restart,
+        cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe, cmd_credential,
     )
@@ -242,7 +238,6 @@ def main():
         "init": cmd_init,
         "build": cmd_build,
         "add": cmd_add,
-        "update": cmd_update,
         "remove": cmd_remove,
         "run": cmd_run,
         "stop": cmd_stop,
