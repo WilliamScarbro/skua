@@ -12,6 +12,16 @@ from skua.docker import (
 )
 
 
+def _required_projects(store: ConfigStore) -> list:
+    """Return all resolvable projects in stable name order."""
+    required = []
+    for name in store.list_resources("Project"):
+        project = store.resolve_project(name)
+        if project:
+            required.append(project)
+    return required
+
+
 def cmd_build(args):
     store = ConfigStore()
 

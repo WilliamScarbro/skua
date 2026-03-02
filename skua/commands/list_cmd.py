@@ -75,6 +75,16 @@ def _format_source(project) -> str:
     return "(none)"
 
 
+def _format_project_source(project) -> str:
+    """Backward-compatible source formatter used by older tests/callers."""
+    if project.directory:
+        return f"LOCAL:{_shorten_home_path(project.directory)}"
+    if project.repo:
+        github = _github_source(project.repo)
+        return github or f"REPO:{project.repo}"
+    return "(none)"
+
+
 def _has_pending_adapt_request(project) -> bool:
     """Return True when project has unapplied image-request changes."""
     directory = str(getattr(project, "directory", "") or "").strip()
