@@ -9,6 +9,7 @@ AUTH_DIR_REL="${SKUA_AUTH_DIR:-.claude}"
 AUTH_DIR="/home/dev/${AUTH_DIR_REL#/}"
 AUTH_FILES_RAW="${SKUA_AUTH_FILES:-}"
 PROJECT_DIR="${SKUA_PROJECT_DIR:-/home/dev/project}"
+PROJECT_NAME="${SKUA_PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
 IMAGE_REQUEST_FILE="${SKUA_IMAGE_REQUEST_FILE:-$PROJECT_DIR/.skua/image-request.yaml}"
 ADAPT_GUIDE_FILE="${SKUA_ADAPT_GUIDE_FILE:-$PROJECT_DIR/.skua/ADAPT.md}"
 TMUX_ENABLE="${SKUA_TMUX_ENABLE:-1}"
@@ -178,7 +179,8 @@ echo ""
 
 # ── Project ──────────────────────────────────────────────────────────
 if [ -d "$PROJECT_DIR" ] && [ "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
-    echo "Project: ${PROJECT_DIR}"
+    echo "Project: ${PROJECT_NAME}"
+    echo "Path: ${PROJECT_DIR}"
     cd "$PROJECT_DIR"
     if [ -f "$IMAGE_REQUEST_FILE" ]; then
         echo "Image adapt request: ${IMAGE_REQUEST_FILE}"
@@ -207,7 +209,8 @@ Agent: ${AGENT_NAME}
 Auth:  ${AUTH_DIR_REL}
 Credential: ${CREDENTIAL_NAME:-"(none)"}
 SSH key: ${SSH_KEY_BASENAME}
-Project: ${PROJECT_DIR}
+Project: ${PROJECT_NAME}
+Path: ${PROJECT_DIR}
 
 tmux quickstart:
   Ctrl-b d      Detach

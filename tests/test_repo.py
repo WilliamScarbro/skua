@@ -347,6 +347,7 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn("SKUA_AUTH_FILES=auth.json", joined)
             self.assertIn("SKUA_CREDENTIAL_NAME=(none)", joined)
             self.assertIn(f"{data_dir}:/home/dev/.codex", joined)
+            self.assertIn("SKUA_PROJECT_NAME=p1", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/p1", joined)
 
     def test_build_run_command_sets_credential_and_ssh_key_env(self):
