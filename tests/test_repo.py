@@ -462,6 +462,61 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn(f"{clone_dir}:/home/dev/platform-api", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/platform-api", joined)
 
+    def test_build_run_command_adds_tcpdump_caps_for_codex(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Project(name="p1", directory="", agent="codex")
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="codex",
+                runtime=AgentRuntimeSpec(command="codex"),
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            self.assertIn("--cap-add=NET_RAW", cmd)
+            self.assertIn("--cap-add=NET_ADMIN", cmd)
+
+    def test_build_run_command_adds_tcpdump_caps_for_claude(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Project(name="p1", directory="", agent="claude")
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="claude",
+                runtime=AgentRuntimeSpec(command="claude"),
+                auth=AgentAuthSpec(
+                    dir=".claude",
+                    files=[".credentials.json"],
+                    login_command="claude login",
+                ),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-claude", data_dir)
+            self.assertIn("--cap-add=NET_RAW", cmd)
+            self.assertIn("--cap-add=NET_ADMIN", cmd)
+
+    def test_build_run_command_does_not_add_tcpdump_caps_for_other_agents(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Project(name="p1", directory="", agent="custom")
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="custom",
+                runtime=AgentRuntimeSpec(command="custom-agent"),
+                auth=AgentAuthSpec(dir=".custom", files=["auth.json"], login_command="custom-agent login"),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-custom", data_dir)
+            self.assertNotIn("--cap-add=NET_RAW", cmd)
+            self.assertNotIn("--cap-add=NET_ADMIN", cmd)
+
     def test_detached_run_command_replaces_interactive_flags(self):
         from skua.commands.run import _detached_run_command
         cmd = ["docker", "run", "-it", "--rm", "--name", "skua-p1", "skua-base"]
@@ -473,8 +528,8 @@ class TestRunCommandEnv(unittest.TestCase):
         self.assertIn("tmux", detached[-1])
         self.assertIn("tmux new-session -d -s", detached[-1])
         self.assertIn("/bin/bash", detached[-1])
-        self.assertIn("/tmp/skua-entrypoint-info.txt", detached[-1])
-        self.assertIn("tmux send-keys", detached[-1])
+        self.assertNotIn("/tmp/skua-entrypoint-info.txt", detached[-1])
+        self.assertNotIn("tmux send-keys", detached[-1])
 
 
 class TestBuildCommandImageDrift(unittest.TestCase):
@@ -504,42 +559,40 @@ class TestBuildCommandImageDrift(unittest.TestCase):
     @mock.patch("skua.commands.build.build_image")
     @mock.patch("skua.commands.build.image_matches_build_context")
     @mock.patch("skua.commands.build.image_exists")
-    @mock.patch("skua.commands.build._required_projects")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_rebuilds_existing_image_when_context_drifted(
-        self, MockStore, mock_required, mock_exists, mock_match, mock_build
+        self, MockStore, mock_exists, mock_match, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
             store, project = self._setup_store(tmpdir)
             MockStore.return_value = store
-            mock_required.return_value = [project]
+            store.resolve_project.return_value = project
             mock_exists.return_value = True
             mock_match.return_value = False
             mock_build.return_value = (True, "")
 
-            cmd_build(argparse.Namespace())
+            cmd_build(argparse.Namespace(name="proj", verbose=False))
             mock_build.assert_called_once()
             mock_match.assert_called_once()
 
     @mock.patch("skua.commands.build.build_image")
     @mock.patch("skua.commands.build.image_matches_build_context")
     @mock.patch("skua.commands.build.image_exists")
-    @mock.patch("skua.commands.build._required_projects")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_skips_rebuild_when_existing_image_matches_context(
-        self, MockStore, mock_required, mock_exists, mock_match, mock_build
+        self, MockStore, mock_exists, mock_match, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
             store, project = self._setup_store(tmpdir)
             MockStore.return_value = store
-            mock_required.return_value = [project]
+            store.resolve_project.return_value = project
             mock_exists.return_value = True
             mock_match.return_value = True
             mock_build.return_value = (True, "")
 
-            cmd_build(argparse.Namespace())
+            cmd_build(argparse.Namespace(name="proj", verbose=False))
             mock_build.assert_not_called()
             mock_match.assert_called_once()
 
@@ -554,8 +607,8 @@ class TestContainerAttachCommand(unittest.TestCase):
         exec_into_container("skua-demo")
         args = mock_execvp.call_args[0][1]
         joined = " ".join(args)
-        self.assertIn('tmux new-session -A -s "$session"', joined)
-        self.assertNotIn("/tmp/skua-entrypoint-info.txt", joined)
+        self.assertIn('tmux attach-session -t "$session"', joined)
+        self.assertIn('/home/dev/tmux-attach-banner.sh', joined)
         self.assertNotIn("tmux send-keys", joined)
 
 

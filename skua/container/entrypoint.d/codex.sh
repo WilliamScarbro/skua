@@ -5,9 +5,9 @@
 # Starts a lightweight background daemon that tracks the Codex process and
 # writes its inferred activity state to /tmp/skua-agent-status.
 #
-# Because Codex does not expose a formal hook API, we use process-level
-# monitoring: when the Codex node process has child processes (running shell
-# commands or other tools) the state is "thinking"; otherwise "idle".
+# Because Codex does not expose a formal hook API, we use a background
+# monitor: subprocesses report as "processing", and recent API traffic is
+# collapsed into an ACTIVITY bar or "idle" by `skua list`.
 
 HOOKS_DIR="/home/dev/.skua/hooks"
 STATUS_FILE="/tmp/skua-agent-status"

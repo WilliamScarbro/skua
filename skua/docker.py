@@ -236,7 +236,7 @@ DEFAULT_PACKAGES = [
     "less", "tree", "file", "htop", "jq", "tmux",
     "zip", "unzip", "tar", "gzip", "bzip2", "xz-utils",
     "diffutils", "patch", "man-db", "manpages",
-    "net-tools", "iputils-ping", "dnsutils",
+    "net-tools", "iputils-ping", "dnsutils", "tcpdump", "libcap2-bin",
 ]
 
 # Agent install commands keyed by agent name (fallback when no AgentConfig found)
@@ -396,6 +396,13 @@ RUN set -eux; \\
     fi; \\
     echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+# ── Allow tcpdump for non-root (monitoring) ──────────────────────────
+RUN set -eux; \
+    tcpdump_bin="$(command -v tcpdump || true)"; \
+    if [ -n "$tcpdump_bin" ]; then \
+        setcap cap_net_raw,cap_net_admin=eip "$tcpdump_bin" || true; \
+    fi
+
 # ── Install agent ────────────────────────────────────────────────────
 ENV NPM_CONFIG_PREFIX="/home/dev/.local"
 USER dev
@@ -411,11 +418,15 @@ RUN mkdir -p /home/dev/.ssh /home/dev/project /home/dev/.claude
 
 # ── Environment ──────────────────────────────────────────────────────
 ENV EDITOR=vim
-ENV PATH="/home/dev/.local/bin:${{PATH}}"
+ENV PATH="/home/dev/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 {sudo_removal}
 # ── Entrypoint ───────────────────────────────────────────────────────
 COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh
 RUN chmod +x /home/dev/entrypoint.sh
+COPY --chown=dev:dev check_monitoring.sh /home/dev/check_monitoring.sh
+RUN chmod +x /home/dev/check_monitoring.sh
+COPY --chown=dev:dev tmux-attach-banner.sh /home/dev/tmux-attach-banner.sh
+RUN chmod +x /home/dev/tmux-attach-banner.sh
 
 ENTRYPOINT ["/home/dev/entrypoint.sh"]
 
@@ -475,6 +486,12 @@ def build_image(
 
         # Copy entrypoint
         shutil.copy2(container_dir / "entrypoint.sh", build_path / "entrypoint.sh")
+        check_monitoring_src = container_dir / "check_monitoring.sh"
+        if check_monitoring_src.is_file():
+            shutil.copy2(check_monitoring_src, build_path / "check_monitoring.sh")
+        tmux_attach_banner_src = container_dir / "tmux-attach-banner.sh"
+        if tmux_attach_banner_src.is_file():
+            shutil.copy2(tmux_attach_banner_src, build_path / "tmux-attach-banner.sh")
 
         # Copy agent monitoring hook scripts (baked into image; always present)
         hooks_dst = build_path / "hooks"
@@ -712,6 +729,12 @@ def build_run_command(
         if environment.driver == "docker":
             docker_cmd.append("--network=none")
 
+    # Codex monitoring uses tcpdump from a non-root background process.
+    # The binary has file capabilities baked into the image, but the container
+    # still needs the matching kernel capabilities at runtime.
+    if agent_name in ("codex", "claude"):
+        docker_cmd.extend(["--cap-add=NET_RAW", "--cap-add=NET_ADMIN"])
+
     docker_cmd.append(image_name)
     return docker_cmd
 
@@ -725,10 +748,14 @@ def exec_into_container(container_name: str):
     """
     attach_cmd = (
         'if [ "${SKUA_TMUX_ENABLE:-1}" = "0" ] || ! command -v tmux >/dev/null 2>&1; then '
-        "  exec /bin/bash; "
-        "fi; "
+        '  exec /bin/bash; '
+        'fi; '
         'session="${SKUA_TMUX_SESSION:-skua}"; '
-        'tmux new-session -A -s "$session"'
+        'if ! tmux has-session -t "$session" 2>/dev/null; then '
+        '  tmux new-session -d -s "$session"; '
+        'fi; '
+        'exec tmux attach-session -t "$session" \\; '
+        'run-shell "/home/dev/tmux-attach-banner.sh \\"$session\\""'
     )
     os.execvp(
         "docker",
@@ -785,6 +812,19 @@ def compute_build_context_hash(
     for fname in ("settings.json", "settings.local.json"):
         src = claude_home / fname
         _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
+
+    check_monitoring_path = container_dir / "check_monitoring.sh"
+    _hash_with_marker(
+        hasher,
+        "check_monitoring",
+        check_monitoring_path.read_bytes() if check_monitoring_path.exists() else None,
+    )
+    tmux_attach_banner_path = container_dir / "tmux-attach-banner.sh"
+    _hash_with_marker(
+        hasher,
+        "tmux_attach_banner",
+        tmux_attach_banner_path.read_bytes() if tmux_attach_banner_path.exists() else None,
+    )
 
     # Hash agent monitoring scripts so changes to hooks trigger a rebuild
     for subdir in ("hooks", "entrypoint.d"):

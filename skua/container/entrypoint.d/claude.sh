@@ -75,3 +75,8 @@ if added:
 else:
     print("[OK] Claude Code monitoring hooks already configured")
 PYEOF
+
+# Start background API activity monitor so that the inter-tool-call LLM
+# inference phase is visible in `skua list` rather than appearing as "idle".
+nohup bash "$HOOKS_DIR/claude-monitor.sh" "$STATUS_FILE" > /dev/null 2>&1 &
+echo "[OK] Claude activity monitor started (pid $!)"

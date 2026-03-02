@@ -573,9 +573,6 @@ def _detached_run_command(docker_cmd: list) -> list:
         '[ -d "$start_dir" ] || start_dir="/home/dev"; '
         'if ! tmux has-session -t "$session" 2>/dev/null; then '
         '  tmux new-session -d -s "$session" -c "$start_dir" /bin/bash; '
-        '  if [ -f /tmp/skua-entrypoint-info.txt ]; then '
-        '    tmux send-keys -t "$session" "cat /tmp/skua-entrypoint-info.txt; echo" C-m; '
-        "  fi; "
         "fi; "
         'while tmux has-session -t "$session" 2>/dev/null; do sleep 1; done'
     )

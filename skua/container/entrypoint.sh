@@ -170,6 +170,10 @@ if [ -f "$AGENT_HOOK" ]; then
     bash "$AGENT_HOOK" || true
 fi
 
+if [ -x /home/dev/check_monitoring.sh ]; then
+    /home/dev/check_monitoring.sh || true
+fi
+
 echo ""
 
 # ── Project ──────────────────────────────────────────────────────────
@@ -237,6 +241,7 @@ elif [ "$AGENT_NAME" = "codex" ]; then
 else
     echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
 fi
+echo "  check_monitoring.sh -> Verify tcpdump monitoring permissions"
 if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
     echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
     echo "  tmux detach: Ctrl-b then d"

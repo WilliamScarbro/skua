@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 # Agent Activity Monitoring
 
-`skua list --agent` includes an **ACTIVITY** column that shows whether a
-running agent is actively thinking, idle between turns, or has finished its
-task.
+`skua list` includes an **ACTIVITY** column that shows whether a
+running agent is actively processing, has recent API activity, is idle
+between turns, or has finished its task.
 
 ```
 NAME             SOURCE                                 AGENT      CREDENTIAL           ACTIVITY       STATUS
@@ -11,6 +11,7 @@ NAME             SOURCE                                 AGENT      CREDENTIAL   
 myapp            DIR:~/projects/myapp                   claude     (none)               think:Bash     running
 other            DIR:~/projects/other                   claude     (none)               idle           running
 codex-proj       DIR:~/projects/codex-proj              codex      (none)               done           running
+codex-busy       DIR:~/projects/codex-busy              codex      (none)               XXXX           running
 stale            DIR:~/projects/stale                   claude     (none)               -              running
 ```
 
@@ -20,6 +21,8 @@ Possible ACTIVITY values:
 |------------------|-----------------------------------------------------|
 | `thinking`       | Agent is executing a tool (no tool name available)  |
 | `think:<Tool>`   | Agent is executing the named tool                   |
+| `processing`     | Codex has an active subprocess                      |
+| `X` to `XXXXXX`  | Codex API activity over the last 30 seconds         |
 | `idle`           | Agent is between tool calls, waiting for the model  |
 | `done`           | Agent finished its task (Stop event fired)          |
 | `-`              | Status unavailable — container pre-dates monitoring |
@@ -62,11 +65,24 @@ survive container restarts without re-merging.
 
 Codex does not expose a formal hooks API.  Instead `entrypoint.d/codex.sh`
 starts a background bash daemon (`hooks/codex-monitor.sh`) that polls the
-Codex node process once per second:
+Codex runtime once per second and watches API traffic:
 
-- **Children present** → agent is running a tool → writes `thinking`
-- **No children** → agent is between tool calls → writes `idle`
+- **Descendant subprocesses present** → agent is running a tool → writes `processing`
+- **At least 50 API hits in the last 30 seconds** → shows API activity in the ACTIVITY column
+- **Fewer than 50 API hits in the last 30 seconds** → shows `idle`
 - **Process exits** → writes `done`
+
+The display is calibrated for Codex's current traffic profile:
+
+| Hits in last 30s | Display |
+|------------------|---------|
+| `< 50`           | `idle`  |
+| `50-99`          | `X`     |
+| `100-249`        | `XX`    |
+| `250-399`        | `XXX`   |
+| `400-549`        | `XXXX`  |
+| `550-699`        | `XXXXX` |
+| `>= 700`         | `XXXXXX` |
 
 The daemon is lightweight (a `while sleep 1` loop) and exits with the
 container.
