@@ -209,16 +209,14 @@ def _repo_name_from_url(repo_url: str) -> str:
 def _project_mount_path(project: Project) -> str:
     """Return the in-container project mount path."""
     mount_name = ""
-
     if project.repo:
         mount_name = _repo_name_from_url(project.repo)
-    if not mount_name and project.directory:
+    elif project.directory:
         mount_name = _sanitize_mount_name(Path(project.directory).name)
-    if not mount_name and project.name:
+    elif project.name:
         mount_name = _sanitize_mount_name(project.name)
     if not mount_name:
         mount_name = "project"
-
     return f"/home/dev/{mount_name}"
 
 
@@ -266,6 +264,34 @@ def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
         if c:
             normalized.append(c)
     return normalized
+
+
+def agent_install_uses_floating_version(agent: AgentConfig = None) -> bool:
+    """Return True when the agent install commands resolve latest at build time.
+
+    Floating installs are not captured by the generated Dockerfile hash alone, so
+    callers may want to force a rebuild without using Docker's layer cache.
+    """
+    if not agent:
+        return False
+
+    commands = []
+    if agent.install and agent.install.commands:
+        commands = _normalize_agent_install_commands(agent.name, agent.install.commands)
+    else:
+        commands = DEFAULT_AGENT_INSTALLS.get(agent.name, [])
+
+    for raw_cmd in commands:
+        cmd = str(raw_cmd or "").strip()
+        if not cmd:
+            continue
+        if "curl -fsSL" in cmd and "| bash" in cmd:
+            return True
+        if "@openai/codex@" in cmd:
+            continue
+        if "@openai/codex" in cmd and "npm install" in cmd:
+            return True
+    return False
 
 
 def base_image_for_agent(default_base_image: str, agent: AgentConfig = None) -> str:
@@ -414,27 +440,27 @@ WORKDIR /home/dev
 COPY --chown=dev:dev claude-settings/ /home/dev/.claude-defaults/
 
 # ── Placeholder directories ─────────────────────────────────────────
-RUN mkdir -p /home/dev/.ssh /home/dev/project /home/dev/.claude
+RUN mkdir -p /home/dev/.ssh /home/dev/project /home/dev/.claude /home/dev/.entrypoint.d/hooks
 
 # ── Environment ──────────────────────────────────────────────────────
 ENV EDITOR=vim
 ENV PATH="/home/dev/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 {sudo_removal}
 # ── Entrypoint ───────────────────────────────────────────────────────
-COPY --chown=dev:dev entrypoint.sh /home/dev/entrypoint.sh
-RUN chmod +x /home/dev/entrypoint.sh
-COPY --chown=dev:dev check_monitoring.sh /home/dev/check_monitoring.sh
-RUN chmod +x /home/dev/check_monitoring.sh
-COPY --chown=dev:dev tmux-attach-banner.sh /home/dev/tmux-attach-banner.sh
-RUN chmod +x /home/dev/tmux-attach-banner.sh
+COPY --chown=dev:dev entrypoint.sh /home/dev/.entrypoint.d/entrypoint.sh
+RUN chmod +x /home/dev/.entrypoint.d/entrypoint.sh
+COPY --chown=dev:dev check_monitoring.sh /home/dev/.entrypoint.d/check_monitoring.sh
+RUN chmod +x /home/dev/.entrypoint.d/check_monitoring.sh
+COPY --chown=dev:dev tmux-attach-banner.sh /home/dev/.entrypoint.d/tmux-attach-banner.sh
+RUN chmod +x /home/dev/.entrypoint.d/tmux-attach-banner.sh
 
-ENTRYPOINT ["/home/dev/entrypoint.sh"]
+ENTRYPOINT ["/home/dev/.entrypoint.d/entrypoint.sh"]
 
 # ── Agent monitoring hooks ────────────────────────────────────────────
-COPY --chown=dev:dev hooks/ /home/dev/.skua/hooks/
-RUN chmod +x /home/dev/.skua/hooks/*.sh
-COPY --chown=dev:dev entrypoint.d/ /home/dev/entrypoint.d/
-RUN chmod +x /home/dev/entrypoint.d/*.sh 2>/dev/null || true
+COPY --chown=dev:dev hooks/ /home/dev/.entrypoint.d/hooks/
+RUN chmod +x /home/dev/.entrypoint.d/hooks/*.sh
+COPY --chown=dev:dev .entrypoint.d/ /home/dev/.entrypoint.d/
+RUN chmod +x /home/dev/.entrypoint.d/*.sh 2>/dev/null || true
 """
     return dockerfile
 
@@ -452,6 +478,8 @@ def build_image(
     extra_commands: list = None,
     quiet: bool = False,
     verbose: bool = False,
+    pull: bool = False,
+    no_cache: bool = False,
 ):
     """Build a Docker image, generating the Dockerfile from config.
 
@@ -502,10 +530,10 @@ def build_image(
                 if f.is_file():
                     shutil.copy2(f, hooks_dst / f.name)
 
-        # Copy entrypoint.d agent-specific setup scripts
-        epd_dst = build_path / "entrypoint.d"
+        # Copy hidden entrypoint helper scripts
+        epd_dst = build_path / ".entrypoint.d"
         epd_dst.mkdir()
-        epd_src = container_dir / "entrypoint.d"
+        epd_src = container_dir / ".entrypoint.d"
         if epd_src.is_dir():
             for f in sorted(epd_src.iterdir()):
                 if f.is_file():
@@ -531,6 +559,10 @@ def build_image(
             "-t", image_name,
             str(build_path),
         ]
+        if pull:
+            cmd.insert(-1, "--pull")
+        if no_cache:
+            cmd.insert(-1, "--no-cache")
         if quiet:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -691,10 +723,11 @@ def build_run_command(
         if agent and agent.runtime and agent.runtime.command
         else agent_name
     )
+    _login_subcmd = "\\login" #if agent_name == "codex" else "login"
     login_command = (
         agent.auth.login_command
         if agent and agent.auth and agent.auth.login_command
-        else f"{agent_command} login"
+        else f"{agent_command} {_login_subcmd}"
     )
     auth_files = []
     if agent and agent.auth and agent.auth.files:
@@ -756,7 +789,7 @@ def exec_into_container(container_name: str):
         '  tmux new-session -d -s "$session"; '
         'fi; '
         'exec tmux attach-session -t "$session" \\; '
-        'run-shell "/home/dev/tmux-attach-banner.sh \\"$session\\""'
+        'run-shell "/home/dev/.entrypoint.d/tmux-attach-banner.sh \\"$session\\""'
     )
     os.execvp(
         "docker",
@@ -828,7 +861,7 @@ def compute_build_context_hash(
     )
 
     # Hash agent monitoring scripts so changes to hooks trigger a rebuild
-    for subdir in ("hooks", "entrypoint.d"):
+    for subdir in ("hooks", ".entrypoint.d"):
         script_dir = container_dir / subdir
         if script_dir.is_dir():
             for script_file in sorted(script_dir.iterdir()):

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua build — build/refresh a single project's Docker image."""
 import sys
+from pathlib import Path
 
 from skua.config import ConfigStore
 from skua.docker import (
+    agent_install_uses_floating_version,
     build_image,
     image_exists,
     image_matches_build_context,
@@ -37,6 +39,12 @@ def cmd_build(args):
 
     # Determine image naming and base image
     g = store.load_global()
+    preset_dir = Path(__file__).resolve().parent.parent / "presets"
+    if preset_dir and preset_dir.exists():
+        project_name = getattr(args, "name", "")
+        project = store.resolve_project(project_name)
+        if project is not None:
+            store.refresh_agent_preset(preset_dir, project.agent, overwrite=True)
     image_name_base = g.get("imageName", "skua-base")
     base_image = g.get("baseImage", "debian:bookworm-slim")
 
@@ -84,9 +92,16 @@ def cmd_build(args):
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
     )
+    force_refresh = agent_install_uses_floating_version(agent)
     needs_rebuild = False
     if image_exists(image_name):
-        if image_matches_build_context(
+        if force_refresh:
+            print(
+                f"-> Agent '{agent.name}' uses a floating install; rebuilding '{image_name}' "
+                "without Docker cache to refresh the client"
+            )
+            needs_rebuild = True
+        elif image_matches_build_context(
             image_name=image_name,
             container_dir=container_dir,
             security=security,
@@ -116,6 +131,8 @@ def cmd_build(args):
             extra_packages=extra_packages,
             extra_commands=extra_commands,
             verbose=getattr(args, "verbose", False),
+            pull=force_refresh,
+            no_cache=force_refresh,
         )
         if success:
             if needs_rebuild:

@@ -9,7 +9,7 @@
 # monitor: subprocesses report as "processing", and recent API traffic is
 # collapsed into an ACTIVITY bar or "idle" by `skua list`.
 
-HOOKS_DIR="/home/dev/.skua/hooks"
+HOOKS_DIR="/home/dev/.entrypoint.d/hooks"
 STATUS_FILE="/tmp/skua-agent-status"
 
 # Initialise status file so skua list shows "idle" from first boot

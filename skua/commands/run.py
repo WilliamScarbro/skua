@@ -16,11 +16,13 @@ from pathlib import Path
 from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
 from skua.docker import (
+    agent_install_uses_floating_version,
     is_container_running,
     exec_into_container,
     build_run_command,
     build_image,
     image_exists,
+    image_matches_build_context,
     image_name_for_project,
     resolve_project_image_inputs,
     start_container,
@@ -540,7 +542,8 @@ def _maybe_refresh_local_credentials(agent, cred) -> bool:
     if not reason:
         return False
 
-    login_cmd = (agent.auth.login_command or f"{agent.runtime.command or agent.name} login").strip()
+    _login_subcmd = "\\login" if agent.name == "codex" else "login"
+    login_cmd = (agent.auth.login_command or f"{agent.runtime.command or agent.name} {_login_subcmd}").strip()
     if not login_cmd:
         print(f"Warning: {reason}. No login command is configured for agent '{agent.name}'.")
         return False
@@ -605,6 +608,10 @@ def cmd_run(args):
         exec_into_container(container_name)
         return
 
+    preset_dir = Path(__file__).resolve().parent.parent / "presets"
+    if preset_dir.exists():
+        store.refresh_agent_preset(preset_dir, project.agent, overwrite=True)
+
     # Load referenced resources
     env = store.load_environment(project.environment)
     sec = store.load_security(project.security)
@@ -667,29 +674,56 @@ def cmd_run(args):
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
     image_name = image_name_for_project(image_name_base, project)
-    if not image_exists(image_name):
+    base_image = g.get("baseImage", "debian:bookworm-slim")
+    defaults = g.get("defaults", {})
+    build_security_name = defaults.get("security", "open")
+    build_security = store.load_security(build_security_name) or sec
+    image_config = g.get("image", {})
+    global_extra_packages = image_config.get("extraPackages", [])
+    global_extra_commands = image_config.get("extraCommands", [])
+    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+        default_base_image=base_image,
+        agent=agent,
+        project=project,
+        global_extra_packages=global_extra_packages,
+        global_extra_commands=global_extra_commands,
+    )
+
+    force_refresh = agent_install_uses_floating_version(agent)
+    image_available = image_exists(image_name)
+    needs_rebuild = not image_available
+    if not image_available:
         print(f"Image '{image_name}' not found for agent '{project.agent}'.")
         print("Building image lazily...")
+    elif force_refresh:
+        print(
+            f"Image '{image_name}' uses floating install commands for agent "
+            f"'{project.agent}'; rebuilding to refresh."
+        )
+        needs_rebuild = True
+    else:
+        container_dir = store.get_container_dir()
+        if container_dir is None:
+            print("Warning: Cannot verify image build context (missing container assets).")
+            print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
+        elif not image_matches_build_context(
+            image_name=image_name,
+            container_dir=container_dir,
+            security=build_security,
+            agent=agent,
+            base_image=resolved_base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        ):
+            print(f"Image '{image_name}' is out-of-date; rebuilding lazily...")
+            needs_rebuild = True
+
+    if needs_rebuild:
         container_dir = store.get_container_dir()
         if container_dir is None:
             print("Error: Cannot find container build assets (entrypoint.sh).")
             print("Set toolDir in global.yaml or reinstall skua.")
             sys.exit(1)
-
-        base_image = g.get("baseImage", "debian:bookworm-slim")
-        defaults = g.get("defaults", {})
-        build_security_name = defaults.get("security", "open")
-        build_security = store.load_security(build_security_name) or sec
-        image_config = g.get("image", {})
-        global_extra_packages = image_config.get("extraPackages", [])
-        global_extra_commands = image_config.get("extraCommands", [])
-        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
-            default_base_image=base_image,
-            agent=agent,
-            project=project,
-            global_extra_packages=global_extra_packages,
-            global_extra_commands=global_extra_commands,
-        )
 
         success, _ = build_image(
             container_dir=container_dir,
@@ -699,6 +733,8 @@ def cmd_run(args):
             base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
+            pull=force_refresh,
+            no_cache=force_refresh,
         )
         if not success:
             print(f"Error: failed to build image '{image_name}'.")

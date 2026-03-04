@@ -66,6 +66,10 @@ def cmd_adapt(args):
         print(f"Error: Security profile '{project.security}' not found.")
         sys.exit(1)
 
+    preset_dir = Path(__file__).resolve().parent.parent / "presets"
+    if preset_dir.exists():
+        store.refresh_agent_preset(preset_dir, project.agent, overwrite=True)
+
     agent = store.load_agent(project.agent)
     if agent is None:
         print(f"Error: Agent '{project.agent}' not found.")
@@ -669,7 +673,15 @@ def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_
                     token = token.replace(sentinel_prompt_shell, prompt)
                     token = token.replace(sentinel_prompt, prompt)
                 replaced.append(token)
-            return _normalize_adapt_argv(agent_name, replaced)
+            argv = _normalize_adapt_argv(agent_name, replaced)
+            if agent_name == "codex" and "--skip-git-repo-check" not in argv:
+                # Insert after "exec" subcommand regardless of template wording.
+                try:
+                    idx = argv.index("exec")
+                    argv.insert(idx + 1, "--skip-git-repo-check")
+                except ValueError:
+                    pass
+            return argv
         except ValueError as exc:
             print(f"Error: Invalid adapt command for agent '{agent.name}': {exc}")
             sys.exit(1)
@@ -680,7 +692,7 @@ def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_
     else:
         base = [agent_name or "agent"]
     if agent_name == "codex":
-        return base + ["exec", prompt]
+        return base + ["exec", "--skip-git-repo-check", prompt]
     if agent_name == "claude":
         return _normalize_adapt_argv(agent_name, base + ["-p", prompt])
     print(f"Error: Automated adapt is unsupported for agent '{agent.name}'.")
@@ -703,7 +715,8 @@ def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, d
         if copied:
             print(f"Synced {copied} auth file(s) from host.")
         if not (data_dir / primary_auth).is_file():
-            login_cmd = agent.auth.login_command or f"{agent.runtime.command or agent.name} login"
+            _login_subcmd = "\\login" if agent.name == "codex" else "login"
+            login_cmd = agent.auth.login_command or f"{agent.runtime.command or agent.name} {_login_subcmd}"
             print(f"Error: Agent '{agent.name}' is not logged in for project '{project.name}'.")
             print(f"Missing auth file: {data_dir / primary_auth}")
             print(f"Run 'skua run {project.name}' and execute '{login_cmd}', then retry.")
@@ -713,7 +726,8 @@ def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, d
     check_cmd.extend(["bash", "-lc", f"test -f /home/dev/{auth_dir}/{primary_auth}"])
     result = subprocess.run(check_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        login_cmd = agent.auth.login_command or f"{agent.runtime.command or agent.name} login"
+        _login_subcmd = "\\login" if agent.name == "codex" else "login"
+        login_cmd = agent.auth.login_command or f"{agent.runtime.command or agent.name} {_login_subcmd}"
         print(f"Error: Agent '{agent.name}' is not logged in for project '{project.name}'.")
         print(f"Run 'skua run {project.name}' and execute '{login_cmd}', then retry.")
         sys.exit(1)
@@ -766,6 +780,7 @@ def _run_agent_adapt_session(
     adapt_cmd = _agent_adapt_command(agent, project.name, build_error, smoke_error, prompt_override, needs_smoke_test)
     print(f"[adapt] Agent command: {_shell_join(adapt_cmd)}")
     run_cmd.extend(adapt_cmd)
+    print(f"[adapt] Full command: {_shell_join(run_cmd)}")
     result = subprocess.run(run_cmd, capture_output=True, text=True)
     summary_lines = _summarize_agent_output(result.stdout, result.stderr)
     if summary_lines:

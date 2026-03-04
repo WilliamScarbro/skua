@@ -203,6 +203,27 @@ class ConfigStore:
                 if not dest_file.exists() or overwrite:
                     shutil.copy2(src_file, dest_file)
 
+    def refresh_agent_preset(self, preset_dir: Path, name: str, overwrite: bool = True) -> bool:
+        """Refresh a shipped agent preset into the installed config.
+
+        Returns True when a bundled preset exists for the named agent and was copied.
+        """
+        agent_name = str(name or "").strip()
+        if not agent_name:
+            return False
+
+        src_file = preset_dir / "agents" / f"{agent_name}.yaml"
+        if not src_file.exists():
+            return False
+
+        self.ensure_dirs()
+        dest_file = self._resource_path("AgentConfig", agent_name)
+        if dest_file.exists() and not overwrite:
+            return False
+
+        shutil.copy2(src_file, dest_file)
+        return True
+
     # ── Persistence paths ────────────────────────────────────────────
 
     def project_data_dir(self, project_name: str, agent_name: str = "claude") -> Path:

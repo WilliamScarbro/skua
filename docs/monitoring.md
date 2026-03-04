@@ -34,12 +34,12 @@ Possible ACTIVITY values:
 
 Skua injects lightweight hook scripts into the container image at build time.
 On each container start, `entrypoint.sh` runs the agent-specific setup script
-from `/home/dev/entrypoint.d/` which configures the hooks and initialises
+from `/home/dev/.entrypoint.d/` which configures the hooks and initialises
 `/tmp/skua-agent-status`.
 
 ### Claude Code
 
-Claude Code has a formal hooks API.  The setup script (`entrypoint.d/claude.sh`)
+Claude Code has a formal hooks API.  The setup script (`.entrypoint.d/claude.sh`)
 merges four hook entries into `~/.claude/settings.local.json` at startup — the
 merge is idempotent, so restarting the container does not duplicate entries:
 
@@ -50,7 +50,7 @@ merge is idempotent, so restarting the container does not duplicate entries:
 | `Stop`        | `{"state":"done","ts":...}`        |
 | `SubagentStop`| `{"state":"done","ts":...}`        |
 
-The hook scripts live at `/home/dev/.skua/hooks/` inside the container.
+The hook scripts live at `/home/dev/.entrypoint.d/hooks/` inside the container.
 
 Because `settings.local.json` is in the persistent auth volume, the hooks
 survive container restarts without re-merging.
@@ -63,26 +63,26 @@ survive container restarts without re-merging.
 
 ### Codex
 
-Codex does not expose a formal hooks API.  Instead `entrypoint.d/codex.sh`
+Codex does not expose a formal hooks API.  Instead `.entrypoint.d/codex.sh`
 starts a background bash daemon (`hooks/codex-monitor.sh`) that polls the
 Codex runtime once per second and watches API traffic:
 
 - **Descendant subprocesses present** → agent is running a tool → writes `processing`
-- **At least 50 API hits in the last 30 seconds** → shows API activity in the ACTIVITY column
-- **Fewer than 50 API hits in the last 30 seconds** → shows `idle`
+- **At least 100 API hits in the last 30 seconds** → shows API activity in the ACTIVITY column
+- **Fewer than 100 API hits in the last 30 seconds** → shows `idle`
 - **Process exits** → writes `done`
 
 The display is calibrated for Codex's current traffic profile:
 
 | Hits in last 30s | Display |
 |------------------|---------|
-| `< 50`           | `idle`  |
-| `50-99`          | `X`     |
-| `100-249`        | `XX`    |
-| `250-399`        | `XXX`   |
-| `400-549`        | `XXXX`  |
-| `550-699`        | `XXXXX` |
-| `>= 700`         | `XXXXXX` |
+| `< 100`          | `idle`  |
+| `100-249`        | `X`     |
+| `250-399`        | `XX`    |
+| `400-549`        | `XXX`   |
+| `550-699`        | `XXXX`  |
+| `700-849`        | `XXXXX` |
+| `>= 850`         | `XXXXXX` |
 
 The daemon is lightweight (a `while sleep 1` loop) and exits with the
 container.

@@ -467,7 +467,7 @@ class TestAdaptCommand(unittest.TestCase):
 
             session_calls = []
             def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
-                             prompt_override="", warn_on_failure=False):
+                             prompt_override="", warn_on_failure=False, needs_smoke_test=False):
                 session_calls.append({"build_error": build_error, "prompt_override": prompt_override})
                 if prompt_override:
                     return  # smoke test creation attempt, don't update request

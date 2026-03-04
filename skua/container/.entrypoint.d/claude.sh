@@ -9,7 +9,7 @@
 #
 # Requires $AUTH_DIR to be set (done by entrypoint.sh before this is called).
 
-HOOKS_DIR="/home/dev/.skua/hooks"
+HOOKS_DIR="/home/dev/.entrypoint.d/hooks"
 STATUS_FILE="/tmp/skua-agent-status"
 
 # Initialise status file so skua list shows "idle" from first boot
@@ -53,11 +53,30 @@ skua_hooks = {
     }],
 }
 
+# Stale hooks directories from older skua versions — remove their entries on upgrade.
+stale_dirs = ["/home/dev/.skua/hooks"]
+
 existing_hooks = settings.setdefault("hooks", {})
+removed = []
 added = []
 for event, new_entries in skua_hooks.items():
     existing_event = existing_hooks.setdefault(event, [])
-    # Idempotency check: skip if any entry already references our hooks dir
+
+    # Evict any entries that reference a stale hooks directory.
+    cleaned = [
+        entry for entry in existing_event
+        if not any(
+            stale in h.get("command", "")
+            for stale in stale_dirs
+            for h in entry.get("hooks", [])
+        )
+    ]
+    if len(cleaned) != len(existing_event):
+        existing_hooks[event] = cleaned
+        existing_event = cleaned
+        removed.append(event)
+
+    # Idempotency check: skip if any entry already references our hooks dir.
     already_added = any(
         hooks_dir in h.get("command", "")
         for entry in existing_event
@@ -70,9 +89,11 @@ for event, new_entries in skua_hooks.items():
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
+if removed:
+    print(f"[OK] Claude Code stale monitoring hooks removed: {', '.join(removed)}")
 if added:
     print(f"[OK] Claude Code monitoring hooks added: {', '.join(added)}")
-else:
+if not removed and not added:
     print("[OK] Claude Code monitoring hooks already configured")
 PYEOF
 

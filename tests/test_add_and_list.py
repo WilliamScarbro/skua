@@ -509,7 +509,7 @@ class TestAgentActivityFormatting(unittest.TestCase):
 
         mock_run.return_value = SimpleNamespace(
             returncode=0,
-            stdout='{"state":"api_activity","hits":49,"window":30,"ts":123}\n',
+            stdout='{"state":"api_activity","hits":99,"window":30,"ts":123}\n',
         )
 
         self.assertEqual("idle", _agent_activity("skua-demo"))
@@ -523,7 +523,7 @@ class TestAgentActivityFormatting(unittest.TestCase):
             stdout='{"state":"api_activity","hits":250,"window":30,"ts":123}\n',
         )
 
-        self.assertEqual("XXX", _agent_activity("skua-demo"))
+        self.assertEqual("XX", _agent_activity("skua-demo"))
 
     @mock.patch("skua.commands.list_cmd.subprocess.run")
     def test_api_activity_caps_bar_width(self, mock_run):

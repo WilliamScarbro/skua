@@ -15,7 +15,7 @@ spec:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim
     entrypoint_hooks:
-      - entrypoint.d/claude.sh
+      - .entrypoint.d/claude.sh
   auth:
     dir: .claude
     files:

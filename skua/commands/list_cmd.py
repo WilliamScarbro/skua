@@ -313,17 +313,17 @@ def _agent_activity(container_name: str, host: str = "") -> str:
     if state == "api_activity":
         hits = data.get("hits")
         if isinstance(hits, int) and hits >= 0:
-            if hits < 50:
-                return "idle"
             if hits < 100:
-                return "X"
+                return "idle"
             if hits < 250:
-                return "XX"
+                return "X"
             if hits < 400:
-                return "XXX"
+                return "XX"
             if hits < 550:
-                return "XXXX"
+                return "XXX"
             if hits < 700:
+                return "XXXX"
+            if hits < 850:
                 return "XXXXX"
             return "XXXXXX"
         return "?"

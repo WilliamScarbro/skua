@@ -99,6 +99,7 @@ For remote projects (`spec.host` set), `skua remove` can also remove remote Dock
 Start a container for a project. Validates configuration before launching. Skua starts the container in detached mode and attaches to a persistent in-container `tmux` session by default.
 
 For bind persistence, Skua auto-seeds missing agent auth files from host home into the project's persisted auth directory on first run (for example Codex `~/.codex/auth.json`).
+Interactive Bash history is persisted per project at `<project>/.skua/.bash_history`.
 Use `skua adapt <name>` to have the agent generate/apply image updates in one command.
 
 ```bash

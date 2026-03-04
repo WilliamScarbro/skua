@@ -247,7 +247,7 @@ spec:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim
     entrypointHooks:
-      - entrypoint.d/claude.sh
+      - .entrypoint.d/claude.sh
 
   auth:
     dir: .claude              # mounted as volume/bind for persistence

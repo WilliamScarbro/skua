@@ -553,9 +553,41 @@ class TestBuildCommandImageDrift(unittest.TestCase):
         }
         store.load_security.return_value = SecurityProfile(name="open")
         project = Project(name="proj", agent="codex")
-        agent = AgentConfig(name="codex")
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex@0.20.0"]),
+        )
         store.load_agent.return_value = agent
         return store, project
+
+    @mock.patch("skua.commands.build.build_image")
+    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_exists")
+    @mock.patch("skua.commands.build.ConfigStore")
+    def test_floating_agent_install_forces_cache_busting_rebuild(
+        self, MockStore, mock_exists, mock_match, mock_build
+    ):
+        from skua.commands.build import cmd_build
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, project = self._setup_store(tmpdir)
+            project.agent = "codex"
+            store.resolve_project.return_value = project
+            store.load_agent.return_value = AgentConfig(
+                name="codex",
+                install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+            )
+            store.refresh_agent_preset = mock.Mock(return_value=True)
+            MockStore.return_value = store
+            mock_exists.return_value = True
+            mock_build.return_value = (True, "")
+
+            cmd_build(argparse.Namespace(name="proj", verbose=False))
+
+            mock_match.assert_not_called()
+            mock_build.assert_called_once()
+            self.assertTrue(mock_build.call_args.kwargs["pull"])
+            self.assertTrue(mock_build.call_args.kwargs["no_cache"])
+            store.refresh_agent_preset.assert_called_once()
 
     @mock.patch("skua.commands.build.build_image")
     @mock.patch("skua.commands.build.image_matches_build_context")
@@ -598,6 +630,50 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             mock_match.assert_called_once()
 
 
+class TestAgentInstallRefresh(unittest.TestCase):
+    def test_agent_install_uses_floating_version_detects_unpinned_codex(self):
+        from skua.docker import agent_install_uses_floating_version
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        self.assertTrue(agent_install_uses_floating_version(agent))
+
+    def test_agent_install_uses_floating_version_ignores_pinned_codex(self):
+        from skua.docker import agent_install_uses_floating_version
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex@0.20.0"]),
+        )
+        self.assertFalse(agent_install_uses_floating_version(agent))
+
+    @mock.patch("skua.docker.subprocess.run")
+    @mock.patch("skua.docker.compute_build_context_hash", return_value="ctx-hash")
+    def test_build_image_adds_pull_and_no_cache_when_requested(self, _mock_hash, mock_run):
+        from skua.docker import build_image
+
+        mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            container_dir = Path(tmpdir) / "container"
+            container_dir.mkdir()
+            (container_dir / "entrypoint.sh").write_text("#!/bin/bash\n")
+            success, _ = build_image(
+                container_dir=container_dir,
+                image_name="skua-test",
+                quiet=True,
+                pull=True,
+                no_cache=True,
+            )
+
+        self.assertTrue(success)
+        docker_cmd = mock_run.call_args_list[0].args[0]
+        self.assertIn("--pull", docker_cmd)
+        self.assertIn("--no-cache", docker_cmd)
+
+
 class TestContainerAttachCommand(unittest.TestCase):
     """Test docker exec attach command wiring."""
 
@@ -609,7 +685,7 @@ class TestContainerAttachCommand(unittest.TestCase):
         args = mock_execvp.call_args[0][1]
         joined = " ".join(args)
         self.assertIn('tmux attach-session -t "$session"', joined)
-        self.assertIn('/home/dev/tmux-attach-banner.sh', joined)
+        self.assertIn('/home/dev/.entrypoint.d/tmux-attach-banner.sh', joined)
         self.assertNotIn("tmux send-keys", joined)
 
 

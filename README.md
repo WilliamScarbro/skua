@@ -67,6 +67,7 @@ claude /login
 ```
 
 Credentials are persisted, so later runs usually do not require login again.
+Bash history is also persisted per project in `.skua/.bash_history`.
 
 ### 6. Detach and keep the session alive
 Detach from `tmux` and return to your host shell:
