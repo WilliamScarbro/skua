@@ -129,6 +129,7 @@ skua build <name>
 | `skua adapt <name>` | Run agent-driven image adaptation and build updated project image |
 | `skua run <name>` | Start a container (or attach if already running) |
 | `skua list` | List projects and running status |
+| `skua dashboard` | Live interactive project dashboard (auto-refresh + actions) |
 | `skua config` | Show or edit global configuration |
 | `skua validate <name>` | Validate project configuration |
 | `skua describe <name>` | Show resolved configuration as YAML |

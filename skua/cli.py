@@ -163,6 +163,34 @@ def main():
         help="Only show projects running on the local host",
     )
 
+    # dashboard
+    p_dashboard = sub.add_parser("dashboard", help="Live interactive project dashboard")
+    p_dashboard.add_argument(
+        "-a", "--agent",
+        action="store_true",
+        help="Include agent configuration columns (agent, credential)",
+    )
+    p_dashboard.add_argument(
+        "-s", "--security",
+        action="store_true",
+        help="Include security columns (security profile, network mode)",
+    )
+    p_dashboard.add_argument(
+        "-g", "--git",
+        action="store_true",
+        help="Include git status column for repo projects",
+    )
+    p_dashboard.add_argument(
+        "-i", "--image", "--images",
+        action="store_true",
+        help="Include image column",
+    )
+    p_dashboard.add_argument(
+        "--local",
+        action="store_true",
+        help="Only show projects running on the local host",
+    )
+
     # clean
     p_clean = sub.add_parser("clean", help="Clean persisted agent credentials")
     p_clean.add_argument("name", nargs="?", help="Project name (omit for all)")
@@ -231,7 +259,7 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe, cmd_credential,
+        cmd_describe, cmd_credential, cmd_dashboard,
     )
 
     commands = {
@@ -244,6 +272,7 @@ def main():
         "restart": cmd_restart,
         "adapt": cmd_adapt,
         "list": cmd_list,
+        "dashboard": cmd_dashboard,
         "clean": cmd_clean,
         "purge": cmd_purge,
         "config": cmd_config,

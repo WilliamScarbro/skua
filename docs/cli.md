@@ -131,6 +131,30 @@ skua list -a -s     # full view
 
 Default columns: NAME, ACTIVITY, STATUS, SOURCE.
 
+### `skua dashboard`
+
+Start a live, interactive dashboard with a continuously refreshing project table.
+It uses the same filtering/column flags as `skua list`.
+
+```bash
+skua dashboard
+skua dashboard -a -s -g -i
+skua dashboard --local
+```
+
+Keybindings:
+- `h`: toggle help
+- `Up` / `Down`: move selection
+- `Enter`: run selected project
+- `b`: build selected project image
+- `s`: stop selected project
+- `a`: adapt selected project
+- `d`: remove selected project
+- `r`: restart selected project
+- `q`: quit
+
+The dashboard auto-refreshes every 2 seconds.
+
 ### `skua clean [<name>]`
 
 Remove saved agent credentials for a project (or all projects).

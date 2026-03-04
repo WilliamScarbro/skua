@@ -16,8 +16,9 @@ from skua.commands.config_cmd import cmd_config
 from skua.commands.validate_cmd import cmd_validate
 from skua.commands.describe import cmd_describe
 from skua.commands.credential import cmd_credential
+from skua.commands.dashboard import cmd_dashboard
 __all__ = [
     "cmd_build", "cmd_init", "cmd_add", "cmd_remove", "cmd_run", "cmd_stop",
     "cmd_restart", "cmd_adapt", "cmd_list", "cmd_clean", "cmd_purge",
-    "cmd_config", "cmd_validate", "cmd_describe", "cmd_credential",
+    "cmd_config", "cmd_validate", "cmd_describe", "cmd_credential", "cmd_dashboard",
 ]
