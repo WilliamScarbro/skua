@@ -29,6 +29,12 @@ if ! python3 -c "import yaml" 2>/dev/null; then
     pip3 install --break-system-packages pyyaml 2>/dev/null || pip3 install pyyaml
 fi
 
+# Check for Textual (dashboard UI)
+if ! python3 -c "import textual" 2>/dev/null; then
+    echo "Installing Textual..."
+    pip3 install --break-system-packages textual 2>/dev/null || pip3 install textual
+fi
+
 # Verify Docker daemon is running
 if ! docker info &>/dev/null; then
     echo "Error: Docker daemon is not running."
@@ -36,7 +42,7 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
-echo "[OK] Prerequisites: docker, python3, git, pyyaml"
+echo "[OK] Prerequisites: docker, python3, git, pyyaml, textual"
 echo ""
 
 # ── Install skua to PATH ─────────────────────────────────────────────

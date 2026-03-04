@@ -251,6 +251,12 @@ DEFAULT_AGENT_REQUIRED_PACKAGES = {
 LEGACY_CODEX_UNIVERSAL_IMAGE = "ghcr.io/openai/codex-universal:latest"
 BUILD_CONTEXT_HASH_LABEL = "skua.build-context-hash"
 MANAGED_IMAGE_LABEL = "skua.managed"
+AGENT_VERSION_LABEL_PREFIX = "skua.agent.version."
+AGENT_VERSION_NPM_PACKAGES = {
+    "codex": "@openai/codex",
+    "claude": "@anthropic-ai/claude-code",
+}
+_AGENT_VERSION_CACHE = {}
 
 
 def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
@@ -292,6 +298,92 @@ def agent_install_uses_floating_version(agent: AgentConfig = None) -> bool:
         if "@openai/codex" in cmd and "npm install" in cmd:
             return True
     return False
+
+
+def _agent_version_label_key(agent_name: str) -> str:
+    """Return a stable image label key for a given agent."""
+    safe = re.sub(r"[^a-z0-9_.-]+", "-", str(agent_name or "").strip().lower())
+    if not safe:
+        safe = "agent"
+    return f"{AGENT_VERSION_LABEL_PREFIX}{safe}"
+
+
+def _latest_npm_package_version(package_name: str) -> str:
+    """Return latest published npm package version, or empty string on failure."""
+    pkg = str(package_name or "").strip()
+    if not pkg:
+        return ""
+    try:
+        result = subprocess.run(
+            ["npm", "view", pkg, "version"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def latest_agent_client_version(agent_name: str) -> str:
+    """Return latest upstream client version for a known agent, else empty."""
+    normalized = str(agent_name or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized in _AGENT_VERSION_CACHE:
+        return _AGENT_VERSION_CACHE[normalized]
+    package_name = AGENT_VERSION_NPM_PACKAGES.get(normalized, "")
+    version = _latest_npm_package_version(package_name)
+    _AGENT_VERSION_CACHE[normalized] = version
+    return version
+
+
+def _build_agent_version_labels(agent: AgentConfig = None, agents: list = None) -> dict:
+    """Return image labels that record resolved upstream client versions."""
+    labels = {}
+    names = []
+    if agent and getattr(agent, "name", ""):
+        names.append(str(agent.name).strip().lower())
+    for item in agents or []:
+        if item and getattr(item, "name", ""):
+            names.append(str(item.name).strip().lower())
+
+    seen = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        version = latest_agent_client_version(name)
+        if version:
+            labels[_agent_version_label_key(name)] = version
+    return labels
+
+
+def floating_agent_update_available(image_name: str, agent: AgentConfig = None) -> tuple:
+    """Return (needs_refresh, reason) when a floating-installed agent has an update."""
+    if not agent_install_uses_floating_version(agent):
+        return False, ""
+
+    agent_name = str(getattr(agent, "name", "") or "").strip().lower()
+    if not agent_name:
+        return False, ""
+
+    latest = latest_agent_client_version(agent_name)
+    if not latest:
+        return False, ""
+
+    label_key = _agent_version_label_key(agent_name)
+    current = _image_label(image_name, label_key)
+    if not current:
+        return True, (
+            f"latest {agent_name} client is {latest}, but image label '{label_key}' is missing"
+        )
+    if current != latest:
+        return True, f"{agent_name} client update available ({current} -> {latest})"
+    return False, ""
 
 
 def base_image_for_agent(default_base_image: str, agent: AgentConfig = None) -> str:
@@ -556,9 +648,11 @@ def build_image(
             "--build-arg", f"USER_GID={gid}",
             "--label", f"{MANAGED_IMAGE_LABEL}=true",
             "--label", f"{BUILD_CONTEXT_HASH_LABEL}={context_hash}",
-            "-t", image_name,
-            str(build_path),
         ]
+        version_labels = _build_agent_version_labels(agent=agent, agents=agents)
+        for key, value in sorted(version_labels.items()):
+            cmd.extend(["--label", f"{key}={value}"])
+        cmd.extend(["-t", image_name, str(build_path)])
         if pull:
             cmd.insert(-1, "--pull")
         if no_cache:
@@ -775,10 +869,12 @@ def build_run_command(
 
 # ── Container operations ─────────────────────────────────────────────────
 
-def exec_into_container(container_name: str):
-    """Exec into a running container, replacing this process.
+def exec_into_container(container_name: str, replace_process: bool = True) -> bool:
+    """Exec into a running container.
 
     Defaults to attaching to the container tmux session when available.
+    When ``replace_process`` is True, replaces the current process via ``execvp``.
+    Otherwise, runs as a subprocess and returns True on zero exit status.
     """
     attach_cmd = (
         'if [ "${SKUA_TMUX_ENABLE:-1}" = "0" ] || ! command -v tmux >/dev/null 2>&1; then '
@@ -791,10 +887,12 @@ def exec_into_container(container_name: str):
         'exec tmux attach-session -t "$session" \\; '
         'run-shell "/home/dev/.entrypoint.d/tmux-attach-banner.sh \\"$session\\""'
     )
-    os.execvp(
-        "docker",
-        ["docker", "exec", "-it", container_name, "bash", "-lc", attach_cmd],
-    )
+    cmd = ["docker", "exec", "-it", container_name, "bash", "-lc", attach_cmd]
+    if replace_process:
+        os.execvp("docker", cmd)
+        return False
+    result = subprocess.run(cmd, check=False)
+    return result.returncode == 0
 
 
 def run_container(docker_cmd: list):

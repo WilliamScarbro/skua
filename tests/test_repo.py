@@ -561,11 +561,15 @@ class TestBuildCommandImageDrift(unittest.TestCase):
         return store, project
 
     @mock.patch("skua.commands.build.build_image")
+    @mock.patch(
+        "skua.commands.build.floating_agent_update_available",
+        return_value=(True, "codex client update available (0.20.0 -> 0.21.0)"),
+    )
     @mock.patch("skua.commands.build.image_matches_build_context")
     @mock.patch("skua.commands.build.image_exists")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_floating_agent_install_forces_cache_busting_rebuild(
-        self, MockStore, mock_exists, mock_match, mock_build
+        self, MockStore, mock_exists, mock_match, _mock_update_check, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -648,6 +652,33 @@ class TestAgentInstallRefresh(unittest.TestCase):
             install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex@0.20.0"]),
         )
         self.assertFalse(agent_install_uses_floating_version(agent))
+
+    @mock.patch("skua.docker._image_label", return_value="0.20.0")
+    @mock.patch("skua.docker.latest_agent_client_version", return_value="0.20.0")
+    def test_floating_agent_update_available_false_when_versions_match(self, _mock_latest, _mock_label):
+        from skua.docker import floating_agent_update_available
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        needs_refresh, reason = floating_agent_update_available("skua-base-codex", agent)
+        self.assertFalse(needs_refresh)
+        self.assertEqual("", reason)
+
+    @mock.patch("skua.docker._image_label", return_value="0.20.0")
+    @mock.patch("skua.docker.latest_agent_client_version", return_value="0.21.0")
+    def test_floating_agent_update_available_true_when_latest_differs(self, _mock_latest, _mock_label):
+        from skua.docker import floating_agent_update_available
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        needs_refresh, reason = floating_agent_update_available("skua-base-codex", agent)
+        self.assertTrue(needs_refresh)
+        self.assertIn("0.20.0", reason)
+        self.assertIn("0.21.0", reason)
 
     @mock.patch("skua.docker.subprocess.run")
     @mock.patch("skua.docker.compute_build_context_hash", return_value="ctx-hash")

@@ -92,7 +92,7 @@ docker stop skua-myapp
 ### Prerequisites
 
 - Docker (daemon running)
-- Python 3 + PyYAML
+- Python 3 + PyYAML + Textual
 - git
 
 ### Alternative: .deb Package
@@ -106,7 +106,7 @@ skua build <name>
 ### Manual Setup
 
 ```bash
-pip install pyyaml
+pip install pyyaml textual
 ln -s /path/to/skua/bin/skua ~/.local/bin/skua
 skua init
 skua build <name>

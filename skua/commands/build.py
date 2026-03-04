@@ -7,6 +7,7 @@ from skua.config import ConfigStore
 from skua.docker import (
     agent_install_uses_floating_version,
     build_image,
+    floating_agent_update_available,
     image_exists,
     image_matches_build_context,
     image_name_for_project,
@@ -92,14 +93,15 @@ def cmd_build(args):
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
     )
-    force_refresh = agent_install_uses_floating_version(agent)
+    force_refresh = False
     needs_rebuild = False
     if image_exists(image_name):
+        if agent_install_uses_floating_version(agent):
+            refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
+            if refresh_needed:
+                force_refresh = True
+                print(f"-> {refresh_reason}; rebuilding '{image_name}' without Docker cache")
         if force_refresh:
-            print(
-                f"-> Agent '{agent.name}' uses a floating install; rebuilding '{image_name}' "
-                "without Docker cache to refresh the client"
-            )
             needs_rebuild = True
         elif image_matches_build_context(
             image_name=image_name,

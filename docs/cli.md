@@ -135,6 +135,7 @@ Default columns: NAME, ACTIVITY, STATUS, SOURCE.
 
 Start a live, interactive dashboard with a continuously refreshing project table.
 It uses the same filtering/column flags as `skua list`.
+The dashboard UI is powered by Textual.
 
 ```bash
 skua dashboard

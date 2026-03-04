@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua dashboard — live interactive project dashboard."""
 
-import curses
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from skua.commands.adapt import cmd_adapt
 from skua.commands.list_cmd import (
     _container_image_id,
     _container_image_name,
+    _agent_activity,
     _format_host,
     _format_source,
     _git_status,
@@ -45,6 +47,7 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     store = ConfigStore()
     project_names = store.list_resources("Project")
     running_by_host = {"": set(get_running_skua_containers())}
+    unreachable_hosts: set = set()
     show_agent = bool(getattr(args, "agent", False))
     show_security = bool(getattr(args, "security", False))
     show_git = bool(getattr(args, "git", False))
@@ -68,7 +71,12 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     def _running_for_host(host: str) -> set:
         normalized = host or ""
         if normalized not in running_by_host:
-            running_by_host[normalized] = set(get_running_skua_containers(host=normalized))
+            result = get_running_skua_containers(host=normalized)
+            if result is None:
+                unreachable_hosts.add(normalized)
+                running_by_host[normalized] = set()
+            else:
+                running_by_host[normalized] = set(result)
         return running_by_host[normalized]
 
     show_host = any(getattr(p, "host", "") for _, p in projects)
@@ -93,7 +101,18 @@ def _collect_snapshot(args) -> DashboardSnapshot:
             if running_name != "-":
                 needs_running_image = True
 
+    activity_values = {}
+    for name, project in projects:
+        container_name = f"skua-{name}"
+        host = getattr(project, "host", "") or ""
+        if container_name in _running_for_host(host):
+            activity_values[name] = _agent_activity(container_name, host=host)
+        else:
+            activity_values[name] = "-"
+
     columns = [("NAME", 16)]
+    columns.append(("ACTIVITY", 14))
+    columns.append(("STATUS", 12))
     if show_host:
         columns.append(("HOST", 14))
     columns.append(("SOURCE", 38))
@@ -107,7 +126,6 @@ def _collect_snapshot(args) -> DashboardSnapshot:
         columns.extend([("AGENT", 10), ("CREDENTIAL", 20)])
     if show_security:
         columns.extend([("SECURITY", 12), ("NETWORK", 10)])
-    columns.append(("STATUS", 10))
 
     pending_count = 0
     running_count = 0
@@ -123,6 +141,8 @@ def _collect_snapshot(args) -> DashboardSnapshot:
         if container_name in running:
             status = "running"
             running_count += 1
+        elif host and host in unreachable_hosts:
+            status = "unreachable"
         else:
             status = "built" if image_exists(img_name) else "missing"
         if pending_adapt:
@@ -130,6 +150,8 @@ def _collect_snapshot(args) -> DashboardSnapshot:
             pending_count += 1
 
         row = [name]
+        row.append(activity_values.get(name, "-"))
+        row.append(status)
         if show_host:
             row.append(_format_host(project))
         row.append(_format_source(project))
@@ -152,7 +174,6 @@ def _collect_snapshot(args) -> DashboardSnapshot:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"
             row.extend([project.security, network])
-        row.append(status)
         rows.append({"name": name, "cells": row})
 
     summary = [f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt"]
@@ -167,20 +188,6 @@ def _collect_snapshot(args) -> DashboardSnapshot:
         summary.append("  RUNNING-IMAGE indicates a restart is needed to use the latest image")
 
     return DashboardSnapshot(columns=columns, rows=rows, summary=summary)
-
-
-def _render_cells(columns: list, cells: list) -> str:
-    return " ".join(f"{str(value):<{width}}" for (title, width), value in zip(columns, cells))
-
-
-def _clip_line(text: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    if len(text) <= width:
-        return text
-    if width == 1:
-        return text[:1]
-    return text[: width - 1] + ">"
 
 
 def _build_selected_project(name: str, verbose: bool = False) -> bool:
@@ -255,7 +262,7 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
 
 def _run_action(action_key: str, project_name: str) -> bool:
     if action_key == "run":
-        cmd_run(SimpleNamespace(name=project_name))
+        cmd_run(SimpleNamespace(name=project_name, replace_process=False))
         return True
     if action_key == "build":
         return _build_selected_project(project_name, verbose=False)
@@ -287,7 +294,7 @@ def _run_action(action_key: str, project_name: str) -> bool:
         cmd_remove(SimpleNamespace(name=project_name))
         return True
     if action_key == "restart":
-        cmd_restart(SimpleNamespace(name=project_name, force=True))
+        cmd_restart(SimpleNamespace(name=project_name, force=True, replace_process=False))
         return True
     return False
 
@@ -303,149 +310,180 @@ def _execute_action(action_key: str, project_name: str) -> tuple:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _run_action_interactive(stdscr, action_key: str, project_name: str) -> str:
+def _run_action_interactive(action_key: str, project_name: str, suspend=None) -> str:
     action_label = {"run": "run", "build": "build", "stop": "stop", "adapt": "adapt", "remove": "remove", "restart": "restart"}[action_key]
-    curses.def_prog_mode()
-    curses.endwin()
-    print(f"[dashboard] {action_label} {project_name}")
-    success, detail = _execute_action(action_key, project_name)
-    if detail:
-        print(detail)
-    try:
-        input("Press Enter to return to dashboard...")
-    except EOFError:
-        pass
-    curses.reset_prog_mode()
-    stdscr.refresh()
+    suspend_cm = suspend() if suspend is not None else nullcontext()
+    with suspend_cm:
+        print(f"[dashboard] {action_label} {project_name}")
+        success, detail = _execute_action(action_key, project_name)
+        if detail:
+            print(detail)
+        try:
+            input("Press Enter to return to dashboard...")
+        except EOFError:
+            pass
     return f"{action_label} {project_name}: {'ok' if success else 'failed'}"
 
 
-def _draw_dashboard(stdscr, snapshot: DashboardSnapshot, selected: int, show_help: bool, message: str):
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-    line = 0
-    title = "skua dashboard (auto-refresh: 2s)"
-    stdscr.addstr(line, 0, _clip_line(title, width - 1))
-    line += 1
-    if message:
-        stdscr.addstr(line, 0, _clip_line(message, width - 1))
-        line += 1
-
-    if show_help:
-        help_lines = [
-            "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart",
-            "      h toggle help | q quit",
-            "",
-            "Actions run for the selected project and then return to the dashboard.",
-        ]
-        for text in help_lines:
-            if line >= height:
-                break
-            stdscr.addstr(line, 0, _clip_line(text, width - 1))
-            line += 1
-        stdscr.refresh()
-        return
-
-    if not snapshot.rows:
-        for text in snapshot.summary:
-            if line >= height:
-                break
-            stdscr.addstr(line, 0, _clip_line(text, width - 1))
-            line += 1
-        if line < height:
-            stdscr.addstr(line, 0, _clip_line("Press q to quit. Press h for help.", width - 1))
-        stdscr.refresh()
-        return
-
-    header = " ".join(f"{title:<{col_width}}" for title, col_width in snapshot.columns)
-    stdscr.addstr(line, 0, _clip_line(header, width - 1))
-    line += 1
-    divider_len = min(sum(col_width for _, col_width in snapshot.columns) + (len(snapshot.columns) - 1), width - 1)
-    stdscr.addstr(line, 0, "-" * max(1, divider_len))
-    line += 1
-
-    available = max(0, height - line - len(snapshot.summary) - 2)
-    start = 0
-    if selected >= available > 0:
-        start = selected - available + 1
-    visible = snapshot.rows[start: start + available] if available else []
-    for idx, row in enumerate(visible, start=start):
-        row_text = _render_cells(snapshot.columns, row["cells"])
-        if line >= height:
-            break
-        attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
-        stdscr.addstr(line, 0, _clip_line(row_text, width - 1), attr)
-        line += 1
-
-    if line < height:
-        stdscr.addstr(line, 0, _clip_line("", width - 1))
-        line += 1
-
-    for text in snapshot.summary:
-        if line >= height:
-            break
-        stdscr.addstr(line, 0, _clip_line(text, width - 1))
-        line += 1
-    if line < height:
-        stdscr.addstr(line, 0, _clip_line("Press h for help. Press q to quit.", width - 1))
-    stdscr.refresh()
-
-
-def _dashboard_main(stdscr, args):
-    curses.curs_set(0)
-    stdscr.keypad(True)
-    stdscr.timeout(2000)
-
-    selected = 0
-    show_help = False
-    message = ""
-
-    while True:
-        snapshot = _collect_snapshot(args)
-        if selected >= len(snapshot.rows):
-            selected = max(0, len(snapshot.rows) - 1)
-        _draw_dashboard(stdscr, snapshot, selected, show_help, message)
-        message = ""
-        key = stdscr.getch()
-        if key == -1:
-            continue
-        if key in (ord("q"), 27):
-            return
-        if key in (ord("h"),):
-            show_help = not show_help
-            continue
-        if show_help:
-            continue
-        if key in (curses.KEY_UP, ord("k")):
-            if snapshot.rows:
-                selected = max(0, selected - 1)
-            continue
-        if key in (curses.KEY_DOWN, ord("j")):
-            if snapshot.rows:
-                selected = min(len(snapshot.rows) - 1, selected + 1)
-            continue
-        if not snapshot.rows:
-            continue
-
-        project_name = snapshot.rows[selected]["name"]
-        if key in (10, 13, curses.KEY_ENTER):
-            message = _run_action_interactive(stdscr, "run", project_name)
-            continue
-        if key == ord("b"):
-            message = _run_action_interactive(stdscr, "build", project_name)
-            continue
-        if key == ord("s"):
-            message = _run_action_interactive(stdscr, "stop", project_name)
-            continue
-        if key == ord("a"):
-            message = _run_action_interactive(stdscr, "adapt", project_name)
-            continue
-        if key == ord("d"):
-            message = _run_action_interactive(stdscr, "remove", project_name)
-            continue
-        if key == ord("r"):
-            message = _run_action_interactive(stdscr, "restart", project_name)
-
-
 def cmd_dashboard(args):
-    curses.wrapper(_dashboard_main, args)
+    try:
+        from rich.console import Group
+        from rich.table import Table
+        from rich.text import Text
+        from textual.app import App, ComposeResult
+        from textual.binding import Binding
+        from textual.widgets import Footer, Static
+    except ImportError:
+        print("Error: 'skua dashboard' requires the 'textual' package.")
+        print("Install it with: pip3 install textual")
+        raise SystemExit(1)
+
+    class DashboardApp(App):
+        BINDINGS = [
+            Binding("q", "quit", "Quit"),
+            Binding("h", "toggle_help", "Help"),
+            Binding("up,k", "cursor_up", "Up"),
+            Binding("down,j", "cursor_down", "Down"),
+            Binding("enter", "run_selected", "Run"),
+            Binding("b", "build_selected", "Build"),
+            Binding("s", "stop_selected", "Stop"),
+            Binding("a", "adapt_selected", "Adapt"),
+            Binding("d", "remove_selected", "Remove"),
+            Binding("r", "restart_selected", "Restart"),
+        ]
+
+        def __init__(self, dashboard_args):
+            super().__init__()
+            self.dashboard_args = dashboard_args
+            self.snapshot = DashboardSnapshot(columns=[], rows=[], summary=[])
+            self.selected = 0
+            self.show_help = False
+            self.message = ""
+            self._refresh_lock = threading.Lock()
+            self._refresh_inflight = False
+
+        def compose(self) -> ComposeResult:
+            yield Static(id="dashboard-view")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self._request_refresh()
+            self.set_interval(2.0, self._request_refresh)
+
+        def _request_refresh(self) -> None:
+            with self._refresh_lock:
+                if self._refresh_inflight:
+                    return
+                self._refresh_inflight = True
+            thread = threading.Thread(target=self._refresh_worker, daemon=True)
+            thread.start()
+
+        def _refresh_worker(self) -> None:
+            try:
+                snapshot = _collect_snapshot(self.dashboard_args)
+                self.call_from_thread(self._apply_snapshot, snapshot)
+            except Exception as exc:  # pragma: no cover - defensive runtime guard
+                self.call_from_thread(self._apply_refresh_error, f"{type(exc).__name__}: {exc}")
+
+        def _apply_refresh_error(self, detail: str) -> None:
+            with self._refresh_lock:
+                self._refresh_inflight = False
+            self.message = f"refresh failed: {detail}"
+            self._refresh_view()
+
+        def _apply_snapshot(self, snapshot: DashboardSnapshot) -> None:
+            with self._refresh_lock:
+                self._refresh_inflight = False
+            prev_name = self._selected_project_name()
+            self.snapshot = snapshot
+            if self.snapshot.rows:
+                if prev_name is not None:
+                    for idx, row in enumerate(self.snapshot.rows):
+                        if row["name"] == prev_name:
+                            self.selected = idx
+                            break
+                    else:
+                        self.selected = min(self.selected, len(self.snapshot.rows) - 1)
+                else:
+                    self.selected = min(self.selected, len(self.snapshot.rows) - 1)
+            else:
+                self.selected = 0
+            self._refresh_view()
+
+        def _selected_project_name(self) -> str | None:
+            if not self.snapshot.rows:
+                return None
+            if self.selected < 0 or self.selected >= len(self.snapshot.rows):
+                return None
+            return self.snapshot.rows[self.selected]["name"]
+
+        def _refresh_view(self) -> None:
+            view = self.query_one("#dashboard-view", Static)
+            title = Text("skua dashboard (auto-refresh: 2s)", style="bold")
+            message = Text(self.message) if self.message else Text("")
+
+            if self.show_help:
+                help_text = Text(
+                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart\n"
+                    "      h toggle help | q quit\n\n"
+                    "Actions run for the selected project and then return to the dashboard."
+                )
+                view.update(Group(title, message, help_text))
+                return
+
+            if not self.snapshot.rows:
+                summary = Text("\n".join(self.snapshot.summary + ["Press q to quit. Press h for help."]))
+                view.update(Group(title, message, summary))
+                return
+
+            table = Table(box=None, show_edge=False, pad_edge=False)
+            for col_name, col_width in self.snapshot.columns:
+                table.add_column(col_name, width=col_width, overflow="ellipsis", no_wrap=True)
+            for idx, row in enumerate(self.snapshot.rows):
+                style = "reverse" if idx == self.selected else ""
+                table.add_row(*[str(cell) for cell in row["cells"]], style=style)
+
+            summary = Text("\n".join(self.snapshot.summary + ["Press h for help. Press q to quit."]))
+            view.update(Group(title, message, table, summary))
+
+        def action_toggle_help(self) -> None:
+            self.show_help = not self.show_help
+            self._refresh_view()
+
+        def action_cursor_up(self) -> None:
+            if self.snapshot.rows:
+                self.selected = max(0, self.selected - 1)
+                self._refresh_view()
+
+        def action_cursor_down(self) -> None:
+            if self.snapshot.rows:
+                self.selected = min(len(self.snapshot.rows) - 1, self.selected + 1)
+                self._refresh_view()
+
+        def _run_selected(self, action_key: str) -> None:
+            project_name = self._selected_project_name()
+            if not project_name:
+                return
+            self.message = _run_action_interactive(action_key, project_name, suspend=self.suspend)
+            self._refresh_view()
+            self._request_refresh()
+
+        def action_run_selected(self) -> None:
+            self._run_selected("run")
+
+        def action_build_selected(self) -> None:
+            self._run_selected("build")
+
+        def action_stop_selected(self) -> None:
+            self._run_selected("stop")
+
+        def action_adapt_selected(self) -> None:
+            self._run_selected("adapt")
+
+        def action_remove_selected(self) -> None:
+            self._run_selected("remove")
+
+        def action_restart_selected(self) -> None:
+            self._run_selected("restart")
+
+    DashboardApp(args).run()

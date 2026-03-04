@@ -19,6 +19,7 @@ from skua.docker import (
     agent_install_uses_floating_version,
     is_container_running,
     exec_into_container,
+    floating_agent_update_available,
     build_run_command,
     build_image,
     image_exists,
@@ -586,6 +587,8 @@ def _detached_run_command(docker_cmd: list) -> list:
 def cmd_run(args):
     store = ConfigStore()
     name = args.name
+    no_attach = bool(getattr(args, "no_attach", False))
+    replace_process = bool(getattr(args, "replace_process", True))
 
     project = store.resolve_project(name)
     if project is None:
@@ -604,8 +607,14 @@ def cmd_run(args):
     # Check if already running
     if is_container_running(container_name):
         print(f"Container '{container_name}' is already running.")
+        if no_attach:
+            print("Leaving container running (detached mode).")
+            return
         print("Attaching to container tmux session (detach: Ctrl-b then d)...")
-        exec_into_container(container_name)
+        attached_ok = exec_into_container(container_name, replace_process=replace_process)
+        if not replace_process and not attached_ok:
+            print(f"Error: failed to attach to '{container_name}'.")
+            sys.exit(1)
         return
 
     preset_dir = Path(__file__).resolve().parent.parent / "presets"
@@ -689,24 +698,26 @@ def cmd_run(args):
         global_extra_commands=global_extra_commands,
     )
 
-    force_refresh = agent_install_uses_floating_version(agent)
+    force_refresh = False
     image_available = image_exists(image_name)
     needs_rebuild = not image_available
     if not image_available:
         print(f"Image '{image_name}' not found for agent '{project.agent}'.")
         print("Building image lazily...")
-    elif force_refresh:
-        print(
-            f"Image '{image_name}' uses floating install commands for agent "
-            f"'{project.agent}'; rebuilding to refresh."
-        )
-        needs_rebuild = True
     else:
+        if agent_install_uses_floating_version(agent):
+            refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
+            if refresh_needed:
+                force_refresh = True
+                print(f"Image '{image_name}' has an available client update: {refresh_reason}.")
+                print("Rebuilding lazily without Docker cache...")
+                needs_rebuild = True
+
         container_dir = store.get_container_dir()
-        if container_dir is None:
+        if not needs_rebuild and container_dir is None:
             print("Warning: Cannot verify image build context (missing container assets).")
             print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
-        elif not image_matches_build_context(
+        elif not needs_rebuild and not image_matches_build_context(
             image_name=image_name,
             container_dir=container_dir,
             security=build_security,
@@ -826,5 +837,11 @@ def cmd_run(args):
     if not wait_for_running_container(container_name):
         print(f"Error: container '{container_name}' did not start correctly.")
         sys.exit(1)
+    if no_attach:
+        print("Container started in detached mode.")
+        return
     print("Attaching to container tmux session (detach: Ctrl-b then d)...")
-    exec_into_container(container_name)
+    attached_ok = exec_into_container(container_name, replace_process=replace_process)
+    if not replace_process and not attached_ok:
+        print(f"Error: failed to attach to '{container_name}'.")
+        sys.exit(1)
