@@ -152,6 +152,7 @@ Keybindings:
 - `a`: adapt selected project
 - `d`: remove selected project
 - `r`: restart selected project
+- `n`: create a new project (interactive add flow)
 - `q`: quit
 
 The dashboard auto-refreshes every 2 seconds.

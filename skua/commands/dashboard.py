@@ -4,9 +4,11 @@
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 from skua.commands.adapt import cmd_adapt
+from skua.commands.add import cmd_add, _cred_matches_agent
 from skua.commands.list_cmd import (
     _container_image_id,
     _container_image_name,
@@ -32,6 +34,7 @@ from skua.docker import (
     image_name_for_project,
     resolve_project_image_inputs,
 )
+from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
 
 
 @dataclass
@@ -299,6 +302,283 @@ def _run_action(action_key: str, project_name: str) -> bool:
     return False
 
 
+def _prompt_text(prompt: str, default: str = "", required: bool = False) -> tuple:
+    label = f"{prompt} [{default}]: " if default else f"{prompt}: "
+    while True:
+        raw = input(label).strip()
+        if raw == ":q":
+            return "cancel", ""
+        if raw == ":b":
+            return "back", ""
+        value = raw or default
+        if required and not value:
+            print("Value is required.")
+            continue
+        return "ok", value
+
+
+def _prompt_select(prompt: str, options: list, default_index: int = 0) -> tuple:
+    if not options:
+        return "cancel", ""
+    base = [str(o) for o in options]
+    if "(Back)" not in base:
+        base.append("(Back)")
+    if "(Cancel)" not in base:
+        base.append("(Cancel)")
+    selected = select_option(prompt, base, default_index=max(0, min(default_index, len(base) - 1)))
+    if selected == "(Back)":
+        return "back", ""
+    if selected == "(Cancel)":
+        return "cancel", ""
+    return "ok", selected
+
+
+def _step_enabled(step: int, values: dict) -> bool:
+    if step == 3:
+        return values.get("source_mode") == "Git repository"
+    if step == 4:
+        return values.get("source_mode") == "Git repository" and values.get("run_mode") == "Remote SSH host"
+    return True
+
+
+def _advance_step(step: int, values: dict) -> int:
+    nxt = step + 1
+    while nxt <= 10 and not _step_enabled(nxt, values):
+        nxt += 1
+    return nxt
+
+
+def _retreat_step(step: int, values: dict) -> int:
+    prev = step - 1
+    while prev >= 0 and not _step_enabled(prev, values):
+        prev -= 1
+    return prev
+
+
+def _prompt_new_project_args() -> SimpleNamespace | None:
+    store = ConfigStore()
+    if not store.is_initialized():
+        print("Skua is not initialized. Run 'skua init' first.")
+        return None
+
+    g = store.load_global()
+    defaults = g.get("defaults", {})
+
+    print("[dashboard] add project (:b back, :q cancel on text prompts; use selector entries for Back/Cancel)")
+    values = {
+        "name": "",
+        "source_mode": "Local directory",
+        "dir": "",
+        "repo": "",
+        "run_mode": "Local docker host",
+        "host": "",
+        "ssh_key": "",
+        "env": defaults.get("environment", "local-docker"),
+        "security": defaults.get("security", "open"),
+        "agent": defaults.get("agent", "claude"),
+        "credential": "",
+        "no_credential": False,
+        "image": "",
+    }
+    step = 0
+    while step <= 10:
+        status = "ok"
+        result = ""
+        if step == 0:
+            status, result = _prompt_text("Project name", values["name"], required=True)
+            if status == "ok":
+                values["name"] = result
+        elif step == 1:
+            status, result = _prompt_select("Project source:", ["Local directory", "Git repository"], 0 if values["source_mode"] == "Local directory" else 1)
+            if status == "ok":
+                values["source_mode"] = result
+                if result == "Local directory":
+                    values["repo"] = ""
+                    values["host"] = ""
+                    values["run_mode"] = "Local docker host"
+                else:
+                    values["dir"] = ""
+        elif step == 2:
+            if values["source_mode"] == "Local directory":
+                default_dir = values["dir"] or str(Path.cwd())
+                status, result = _prompt_text("Project directory", default_dir, required=True)
+                if status == "ok":
+                    values["dir"] = result
+            else:
+                status, result = _prompt_text("Git repository URL (SSH preferred)", values["repo"], required=True)
+                if status == "ok":
+                    values["repo"] = result
+        elif step == 3:
+            status, result = _prompt_select(
+                "Run location:",
+                ["Local docker host", "Remote SSH host"],
+                0 if values["run_mode"] == "Local docker host" else 1,
+            )
+            if status == "ok":
+                values["run_mode"] = result
+                if result != "Remote SSH host":
+                    values["host"] = ""
+        elif step == 4:
+            hosts = parse_ssh_config_hosts()
+            options = hosts + ["Manual entry..."] if hosts else ["Manual entry..."]
+            default_idx = 0
+            if values["host"] and values["host"] in hosts:
+                default_idx = hosts.index(values["host"])
+            status, result = _prompt_select("Select SSH host:", options, default_idx)
+            if status == "ok":
+                if result == "Manual entry...":
+                    status, host_value = _prompt_text("SSH host (must exist in ~/.ssh/config)", values["host"], required=True)
+                    if status == "ok":
+                        values["host"] = host_value
+                else:
+                    values["host"] = result
+        elif step == 5:
+            keys = [str(p) for p in find_ssh_keys()]
+            global_ssh = defaults.get("sshKey", "")
+            if global_ssh:
+                global_ssh_path = str(Path(global_ssh).expanduser().resolve())
+                if Path(global_ssh_path).is_file() and global_ssh_path not in keys:
+                    keys.append(global_ssh_path)
+            if keys:
+                keys = sorted(keys)
+                options = keys + ["None", "Manual entry..."]
+                default_idx = len(keys)
+                if values["ssh_key"] and values["ssh_key"] in keys:
+                    default_idx = keys.index(values["ssh_key"])
+                elif global_ssh:
+                    resolved_global_ssh = str(Path(global_ssh).expanduser().resolve())
+                    if resolved_global_ssh in keys:
+                        default_idx = keys.index(resolved_global_ssh)
+                status, result = _prompt_select("Select SSH private key:", options, default_idx)
+                if status == "ok":
+                    if result == "None":
+                        values["ssh_key"] = ""
+                    elif result == "Manual entry...":
+                        status, key_value = _prompt_text("SSH private key path (leave empty for none)", values["ssh_key"], required=False)
+                        if status == "ok":
+                            values["ssh_key"] = key_value
+                    else:
+                        values["ssh_key"] = result
+            else:
+                status, result = _prompt_text("SSH private key path (leave empty for none)", values["ssh_key"], required=False)
+                if status == "ok":
+                    values["ssh_key"] = result
+        elif step == 6:
+            envs = store.list_resources("Environment")
+            opts = envs if envs else [values["env"]]
+            status, result = _prompt_select(
+                "Select environment:",
+                opts + ["Manual entry..."],
+                opts.index(values["env"]) if values["env"] in opts else 0,
+            )
+            if status == "ok":
+                if result == "Manual entry...":
+                    status, env_value = _prompt_text("Environment", values["env"], required=True)
+                    if status == "ok":
+                        values["env"] = env_value
+                else:
+                    values["env"] = result
+        elif step == 7:
+            secs = store.list_resources("SecurityProfile")
+            opts = secs if secs else [values["security"]]
+            status, result = _prompt_select(
+                "Select security profile:",
+                opts + ["Manual entry..."],
+                opts.index(values["security"]) if values["security"] in opts else 0,
+            )
+            if status == "ok":
+                if result == "Manual entry...":
+                    status, sec_value = _prompt_text("Security profile", values["security"], required=True)
+                    if status == "ok":
+                        values["security"] = sec_value
+                else:
+                    values["security"] = result
+        elif step == 8:
+            agents = store.list_resources("AgentConfig")
+            opts = agents if agents else [values["agent"]]
+            status, result = _prompt_select(
+                "Select agent:",
+                opts + ["Manual entry..."],
+                opts.index(values["agent"]) if values["agent"] in opts else 0,
+            )
+            if status == "ok":
+                if result == "Manual entry...":
+                    status, agent_value = _prompt_text("Agent", values["agent"], required=True)
+                    if status == "ok":
+                        values["agent"] = agent_value
+                else:
+                    values["agent"] = result
+                values["credential"] = ""
+                values["no_credential"] = False
+        elif step == 9:
+            available_creds = sorted(
+                c for c in store.list_resources("Credential") if _cred_matches_agent(store, c, values["agent"])
+            )
+            if available_creds:
+                options = ["Auto-detect/add local credential", "None (log in in container)"] + available_creds
+                status, result = _prompt_select("Credential:", options, 0)
+                if status == "ok":
+                    values["credential"] = ""
+                    values["no_credential"] = False
+                    if result == "None (log in in container)":
+                        values["no_credential"] = True
+                    elif result in available_creds:
+                        values["credential"] = result
+            else:
+                values["credential"] = ""
+                values["no_credential"] = False
+                step = _advance_step(step, values)
+                continue
+        elif step == 10:
+            status, result = _prompt_text("Project base image override (optional)", values["image"], required=False)
+            if status == "ok":
+                values["image"] = result
+
+        if status == "cancel":
+            print("Cancelled.")
+            return None
+        if status == "back":
+            prev_step = _retreat_step(step, values)
+            if prev_step < 0:
+                print("Already at the first prompt.")
+                continue
+            step = prev_step
+            continue
+        step = _advance_step(step, values)
+
+    return SimpleNamespace(
+        name=values["name"],
+        repo=values["repo"],
+        host=values["host"],
+        dir=values["dir"],
+        ssh_key=values["ssh_key"],
+        env=values["env"],
+        security=values["security"],
+        agent=values["agent"],
+        image=values["image"],
+        quick=False,
+        no_prompt=False,
+        no_credential=values["no_credential"],
+        credential=values["credential"],
+    )
+
+
+def _run_add_project_interactive(suspend=None) -> str:
+    suspend_cm = suspend() if suspend is not None else nullcontext()
+    with suspend_cm:
+        args = _prompt_new_project_args()
+        if args is None:
+            return "new project: cancelled"
+        try:
+            cmd_add(args)
+            return f"new project {args.name}: ok"
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            return f"new project {args.name}: failed (status {code})"
+        except Exception as exc:  # pragma: no cover - defensive runtime guard
+            return f"new project {args.name}: failed ({type(exc).__name__}: {exc})"
+
+
 def _execute_action(action_key: str, project_name: str) -> tuple:
     try:
         success = _run_action(action_key, project_name)
@@ -318,10 +598,6 @@ def _run_action_interactive(action_key: str, project_name: str, suspend=None) ->
         success, detail = _execute_action(action_key, project_name)
         if detail:
             print(detail)
-        try:
-            input("Press Enter to return to dashboard...")
-        except EOFError:
-            pass
     return f"{action_label} {project_name}: {'ok' if success else 'failed'}"
 
 
@@ -350,6 +626,7 @@ def cmd_dashboard(args):
             Binding("a", "adapt_selected", "Adapt"),
             Binding("d", "remove_selected", "Remove"),
             Binding("r", "restart_selected", "Restart"),
+            Binding("n", "new_project", "New"),
         ]
 
         def __init__(self, dashboard_args):
@@ -424,7 +701,7 @@ def cmd_dashboard(args):
 
             if self.show_help:
                 help_text = Text(
-                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart\n"
+                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
                     "      h toggle help | q quit\n\n"
                     "Actions run for the selected project and then return to the dashboard."
                 )
@@ -485,5 +762,10 @@ def cmd_dashboard(args):
 
         def action_restart_selected(self) -> None:
             self._run_selected("restart")
+
+        def action_new_project(self) -> None:
+            self.message = _run_add_project_interactive(suspend=self.suspend)
+            self._refresh_view()
+            self._request_refresh()
 
     DashboardApp(args).run()

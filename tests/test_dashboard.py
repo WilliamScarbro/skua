@@ -123,3 +123,101 @@ class TestDashboardActions(unittest.TestCase):
         self.assertTrue(args.force)
         self.assertFalse(hasattr(args, "no_attach"))
         self.assertFalse(args.replace_process)
+
+
+class TestDashboardAddFlow(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.cmd_add")
+    @mock.patch("skua.commands.dashboard._prompt_new_project_args")
+    def test_run_add_project_interactive_calls_cmd_add(self, mock_prompt, mock_cmd_add):
+        from skua.commands.dashboard import _run_add_project_interactive
+
+        mock_prompt.return_value = SimpleNamespace(name="proj")
+        message = _run_add_project_interactive()
+
+        self.assertEqual("new project proj: ok", message)
+        mock_cmd_add.assert_called_once_with(mock_prompt.return_value)
+
+    @mock.patch("skua.commands.dashboard.select_option")
+    @mock.patch("skua.commands.dashboard.input")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_prompt_new_project_args_remote_repo_flow(self, MockStore, mock_input, mock_select):
+        from skua.commands.dashboard import _prompt_new_project_args
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_global.return_value = {"defaults": {"environment": "local-docker", "security": "open", "agent": "claude"}}
+        store.list_resources.side_effect = lambda kind: {
+            "Environment": ["local-docker", "remote-docker"],
+            "SecurityProfile": ["open", "standard"],
+            "AgentConfig": ["claude", "codex"],
+            "Credential": [],
+        }.get(kind, [])
+
+        mock_select.side_effect = [
+            "Git repository",      # source
+            "Remote SSH host",     # run location
+            "qar",                 # host
+            "local-docker",        # env
+            "open",                # security
+            "claude",              # agent
+        ]
+        mock_input.side_effect = ["demo", "git@github.com:org/repo.git", "", ""]
+
+        with mock.patch("skua.commands.dashboard.parse_ssh_config_hosts", return_value=["qar"]):
+            with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
+                args = _prompt_new_project_args()
+
+        self.assertEqual("demo", args.name)
+        self.assertEqual("git@github.com:org/repo.git", args.repo)
+        self.assertEqual("qar", args.host)
+        self.assertEqual("", args.dir)
+        self.assertEqual("local-docker", args.env)
+        self.assertEqual("open", args.security)
+        self.assertEqual("claude", args.agent)
+
+    @mock.patch("skua.commands.dashboard.select_option")
+    @mock.patch("skua.commands.dashboard.input")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_prompt_new_project_args_supports_back_and_cancel(self, MockStore, mock_input, mock_select):
+        from skua.commands.dashboard import _prompt_new_project_args
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_global.return_value = {"defaults": {"environment": "local-docker", "security": "open", "agent": "claude"}}
+        store.list_resources.side_effect = lambda kind: {
+            "Environment": ["local-docker"],
+            "SecurityProfile": ["open"],
+            "AgentConfig": ["claude"],
+            "Credential": [],
+        }.get(kind, [])
+
+        # First attempt: cancel immediately from first text prompt.
+        mock_input.side_effect = [":q"]
+        mock_select.side_effect = []
+        with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
+            self.assertIsNone(_prompt_new_project_args())
+
+        # Second attempt: choose git, go back from repo prompt, then choose local dir.
+        mock_select.side_effect = [
+            "Git repository",    # source
+            "Local directory",   # source after back
+            "local-docker",      # env
+            "open",              # security
+            "claude",            # agent
+        ]
+        mock_input.side_effect = [
+            "demo",      # name
+            ":b",        # back from repo prompt to source selector
+            "/tmp",      # directory
+            "",          # ssh key
+            "",          # env
+            "",          # security
+            "",          # agent
+            "",          # base image
+        ]
+        with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
+            args = _prompt_new_project_args()
+
+        self.assertEqual("demo", args.name)
+        self.assertEqual("/tmp", args.dir)
+        self.assertEqual("", args.repo)
