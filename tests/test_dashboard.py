@@ -129,18 +129,27 @@ class TestDashboardActions(unittest.TestCase):
 
 
 class TestDashboardJobs(unittest.TestCase):
-    def test_background_command_mapping(self):
+    @mock.patch("skua.commands.dashboard._resolve_skua_cli_prefix", return_value=["/usr/bin/skua"])
+    def test_background_command_mapping(self, _mock_prefix):
         from skua.commands.dashboard import _background_command
 
         self.assertEqual(
-            [sys.executable, "-m", "skua", "build", "demo"],
+            ["/usr/bin/skua", "build", "demo"],
             _background_command("build", "demo"),
         )
         self.assertEqual(
-            [sys.executable, "-m", "skua", "adapt", "demo", "--apply-only", "--force"],
+            ["/usr/bin/skua", "adapt", "demo", "--build", "--force"],
             _background_command("adapt", "demo"),
         )
         self.assertIsNone(_background_command("run", "demo"))
+
+    @mock.patch("skua.commands.dashboard.shutil.which", return_value=None)
+    def test_resolve_cli_prefix_falls_back_to_cli_py(self, _mock_which):
+        from skua.commands.dashboard import _resolve_skua_cli_prefix
+
+        prefix = _resolve_skua_cli_prefix()
+        self.assertEqual(sys.executable, prefix[0])
+        self.assertTrue(prefix[1].endswith("/skua/cli.py"))
 
     def test_job_manager_enqueue_poll_and_persist(self):
         from skua.commands.dashboard import DashboardJobManager
@@ -204,6 +213,63 @@ class TestDashboardJobs(unittest.TestCase):
             self.assertEqual(1, len(jobs))
             self.assertEqual("orphaned", jobs[0].status)
             self.assertTrue(jobs[0].ended_at)
+
+    def test_job_manager_remove_job(self):
+        from skua.commands.dashboard import DashboardJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            mgr = DashboardJobManager(config_dir=Path(td), max_jobs=20)
+            job = mgr.enqueue(
+                "build",
+                "demo",
+                command=[sys.executable, "-c", "print('done')"],
+            )
+            for _ in range(80):
+                mgr.poll()
+                jobs = mgr.list_for_view()
+                if jobs and jobs[0].status in ("success", "failed"):
+                    break
+                time.sleep(0.05)
+            ok, detail = mgr.remove_job(job.job_id)
+            self.assertTrue(ok)
+            self.assertEqual("", detail)
+            self.assertEqual([], mgr.list_for_view())
+
+    def test_job_manager_waiting_input_and_send(self):
+        from skua.commands.dashboard import DashboardJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            mgr = DashboardJobManager(config_dir=Path(td), max_jobs=20)
+            job = mgr.enqueue(
+                "remove",
+                "demo",
+                command=[sys.executable, "-c", "x=input('Continue? [y/N]: '); print('ans=' + x)"],
+            )
+
+            waiting = False
+            for _ in range(120):
+                mgr.poll()
+                current = next((j for j in mgr.list_for_view() if j.job_id == job.job_id), None)
+                if current and current.status == "waiting_input":
+                    waiting = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(waiting)
+
+            ok, detail = mgr.send_input(job.job_id, "y")
+            self.assertTrue(ok)
+            self.assertEqual("", detail)
+
+            for _ in range(120):
+                mgr.poll()
+                current = next((j for j in mgr.list_for_view() if j.job_id == job.job_id), None)
+                if current and current.status in ("success", "failed"):
+                    break
+                time.sleep(0.02)
+
+            current = next((j for j in mgr.list_for_view() if j.job_id == job.job_id), None)
+            self.assertIsNotNone(current)
+            self.assertEqual("success", current.status)
 
 
 class TestDashboardAddFlow(unittest.TestCase):

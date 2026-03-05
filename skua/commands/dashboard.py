@@ -2,15 +2,21 @@
 """skua dashboard — live interactive project dashboard."""
 
 import json
+import fcntl
 import os
+import pty
+import re
+import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import threading
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,6 +75,7 @@ class DashboardJob:
     pid: int | None
     log_path: str
     detail: str
+    prompt_text: str
 
     def to_dict(self) -> dict:
         return {
@@ -84,6 +91,7 @@ class DashboardJob:
             "pid": self.pid,
             "log_path": self.log_path,
             "detail": self.detail,
+            "prompt_text": self.prompt_text,
         }
 
     @classmethod
@@ -101,6 +109,7 @@ class DashboardJob:
             pid=data.get("pid"),
             log_path=str(data.get("log_path", "")),
             detail=str(data.get("detail", "")),
+            prompt_text=str(data.get("prompt_text", "")),
         )
 
 
@@ -127,15 +136,25 @@ def _shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(p) for p in parts)
 
 
+def _resolve_skua_cli_prefix() -> list[str]:
+    """Return the best command prefix to invoke skua from background jobs."""
+    cli_bin = shutil.which("skua")
+    if cli_bin:
+        return [cli_bin]
+    cli_py = Path(__file__).resolve().parents[1] / "cli.py"
+    return [sys.executable, str(cli_py)]
+
+
 def _background_command(action_key: str, project_name: str) -> list[str] | None:
+    prefix = _resolve_skua_cli_prefix()
     if action_key == "build":
-        return [sys.executable, "-m", "skua", "build", project_name]
+        return prefix + ["build", project_name]
     if action_key == "adapt":
-        return [sys.executable, "-m", "skua", "adapt", project_name, "--apply-only", "--force"]
+        return prefix + ["adapt", project_name, "--build", "--force"]
     if action_key == "stop":
-        return [sys.executable, "-m", "skua", "stop", project_name, "--force"]
+        return prefix + ["stop", project_name, "--force"]
     if action_key == "remove":
-        return [sys.executable, "-m", "skua", "remove", project_name]
+        return prefix + ["remove", project_name]
     return None
 
 
@@ -150,6 +169,8 @@ class DashboardJobManager:
         self.max_jobs = max(20, int(max_jobs))
         self.jobs: list[DashboardJob] = []
         self._processes: dict[int, subprocess.Popen] = {}
+        self._masters: dict[int, int] = {}
+        self._buffers: dict[int, str] = {}
         self._next_id = 1
         self._load()
 
@@ -175,7 +196,7 @@ class DashboardJobManager:
                 continue
             if job.job_id <= 0:
                 continue
-            if job.status in ("queued", "running"):
+            if job.status in ("queued", "running", "waiting_input"):
                 job.status = "orphaned"
                 if not job.ended_at:
                     job.ended_at = _utc_now_iso()
@@ -208,6 +229,20 @@ class DashboardJobManager:
                 f.write(f" return_code={job.return_code}")
             f.write("\n")
 
+    @staticmethod
+    def _detect_prompt(buffer: str) -> str:
+        marker = re.findall(r"\[\[SKUA_PROMPT\]\]\s*(.+)", buffer)
+        if marker:
+            return marker[-1].strip()
+        tail = buffer[-400:]
+        lines = tail.splitlines()
+        line = lines[-1] if lines else tail
+        if re.search(r"\[[Yy]/[Nn]\]:\s*$", line) or re.search(r"\[[Yy]/n\]:\s*$", line):
+            return line.strip()
+        if re.search(r"Type 'purge' to confirm:\s*$", line):
+            return line.strip()
+        return ""
+
     def enqueue(self, action_key: str, project_name: str, command: list[str] | None = None) -> DashboardJob:
         cmd = command if command is not None else _background_command(action_key, project_name)
         if not cmd:
@@ -228,6 +263,7 @@ class DashboardJobManager:
             pid=None,
             log_path=str(log_path),
             detail="",
+            prompt_text="",
         )
         self._next_id += 1
         self.jobs.append(job)
@@ -235,18 +271,24 @@ class DashboardJobManager:
 
         try:
             self._append_log_header(log_path, job)
-            with log_path.open("a", encoding="utf-8") as log_file:
-                proc = subprocess.Popen(
-                    job.command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                )
+            master_fd, slave_fd = pty.openpty()
+            flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+            fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            proc = subprocess.Popen(
+                job.command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+                env={**os.environ, "SKUA_PROMPT_MODE": "markers"},
+            )
+            os.close(slave_fd)
             job.pid = proc.pid
             job.status = "running"
             self._processes[job.job_id] = proc
+            self._masters[job.job_id] = master_fd
+            self._buffers[job.job_id] = ""
         except Exception as exc:
             job.status = "failed"
             job.ended_at = _utc_now_iso()
@@ -258,19 +300,58 @@ class DashboardJobManager:
     def poll(self) -> bool:
         changed = False
         for job in self.jobs:
-            if job.status != "running":
+            if job.status not in ("running", "waiting_input"):
                 continue
             proc = self._processes.get(job.job_id)
             if proc is None:
                 continue
+            master_fd = self._masters.get(job.job_id)
+            if master_fd is not None:
+                chunk = ""
+                while True:
+                    ready, _, _ = select.select([master_fd], [], [], 0)
+                    if not ready:
+                        break
+                    try:
+                        data = os.read(master_fd, 8192)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    chunk += data.decode("utf-8", errors="replace")
+                if chunk:
+                    with Path(job.log_path).open("a", encoding="utf-8") as logf:
+                        logf.write(chunk)
+                    buf = (self._buffers.get(job.job_id, "") + chunk)[-8000:]
+                    self._buffers[job.job_id] = buf
+                    if job.status == "waiting_input":
+                        job.status = "running"
+                        job.prompt_text = ""
+                        changed = True
             rc = proc.poll()
             if rc is None:
+                if job.status == "running":
+                    prompt = self._detect_prompt(self._buffers.get(job.job_id, ""))
+                    if prompt:
+                        job.status = "waiting_input"
+                        job.prompt_text = prompt
+                        changed = True
                 continue
             job.return_code = rc
             job.ended_at = _utc_now_iso()
             job.status = "success" if rc == 0 else "failed"
+            job.prompt_text = ""
             self._append_log_footer(Path(job.log_path), job)
             self._processes.pop(job.job_id, None)
+            master_fd = self._masters.pop(job.job_id, None)
+            self._buffers.pop(job.job_id, None)
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
             changed = True
         if changed:
             self._persist()
@@ -278,7 +359,7 @@ class DashboardJobManager:
 
     def cancel(self, job_id: int) -> bool:
         for job in self.jobs:
-            if job.job_id != job_id or job.status != "running":
+            if job.job_id != job_id or job.status not in ("running", "waiting_input"):
                 continue
             proc = self._processes.get(job_id)
             if proc is not None:
@@ -291,28 +372,75 @@ class DashboardJobManager:
             job.status = "canceled"
             job.ended_at = _utc_now_iso()
             job.detail = "Canceled from dashboard."
+            job.prompt_text = ""
             self._append_log_footer(Path(job.log_path), job)
             self._processes.pop(job_id, None)
+            master_fd = self._masters.pop(job_id, None)
+            self._buffers.pop(job_id, None)
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
             self._persist()
             return True
         return False
 
     def clear_completed(self) -> int:
         before = len(self.jobs)
-        self.jobs = [job for job in self.jobs if job.status in ("queued", "running")]
+        self.jobs = [job for job in self.jobs if job.status in ("queued", "running", "waiting_input")]
         removed = before - len(self.jobs)
         if removed:
             self._persist()
         return removed
+
+    def send_input(self, job_id: int, user_input: str) -> tuple[bool, str]:
+        for job in self.jobs:
+            if job.job_id != job_id:
+                continue
+            if job.status not in ("waiting_input", "running"):
+                return False, "job is not waiting for input"
+            master_fd = self._masters.get(job_id)
+            if master_fd is None:
+                return False, "job input channel is unavailable"
+            try:
+                os.write(master_fd, (user_input + "\n").encode("utf-8"))
+            except OSError as exc:
+                return False, f"failed to send input: {exc}"
+            job.status = "running"
+            job.prompt_text = ""
+            self._buffers[job_id] = ""
+            self._persist()
+            return True, ""
+        return False, "job not found"
+
+    def remove_job(self, job_id: int, delete_log: bool = False) -> tuple[bool, str]:
+        for idx, job in enumerate(self.jobs):
+            if job.job_id != job_id:
+                continue
+            if job.status in ("queued", "running", "waiting_input"):
+                return False, "job is still running; cancel it first with x"
+            self.jobs.pop(idx)
+            self._masters.pop(job_id, None)
+            self._buffers.pop(job_id, None)
+            if delete_log:
+                try:
+                    Path(job.log_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._persist()
+            return True, ""
+        return False, "job not found"
 
     def list_for_view(self) -> list[DashboardJob]:
         return list(reversed(self.jobs))
 
     def summary(self) -> str:
         running = sum(1 for j in self.jobs if j.status == "running")
+        waiting = sum(1 for j in self.jobs if j.status == "waiting_input")
         failed = sum(1 for j in self.jobs if j.status in ("failed", "orphaned"))
         done = sum(1 for j in self.jobs if j.status in ("success", "failed", "canceled", "orphaned"))
-        return f"Jobs: {running} running, {failed} failed/orphaned, {done} completed"
+        return f"Jobs: {running} running, {waiting} waiting, {failed} failed/orphaned, {done} completed"
 
     def tail(self, job: DashboardJob, max_lines: int = 200) -> str:
         path = Path(job.log_path)
@@ -320,6 +448,18 @@ class DashboardJobManager:
             return "(log file not found)"
         lines = path.read_text(errors="replace").splitlines()
         return "\n".join(lines[-max(20, max_lines):]) if lines else "(no output yet)"
+
+    def export_output(self, job: DashboardJob) -> Path:
+        export_dir = self.jobs_dir / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out = export_dir / f"job-{job.job_id:06d}-{job.action}-{job.project}-{stamp}.txt"
+        src = Path(job.log_path)
+        if src.exists():
+            out.write_text(src.read_text(errors="replace"))
+        else:
+            out.write_text("(log file not found)\n")
+        return out
 
 
 def _collect_snapshot(args) -> DashboardSnapshot:
@@ -882,19 +1022,33 @@ def cmd_dashboard(args):
         from rich.console import Group
         from rich.table import Table
         from rich.text import Text
+        from textual import events
         from textual.app import App, ComposeResult
         from textual.binding import Binding
-        from textual.widgets import Footer, Static
+        from textual.widgets import Static
     except ImportError:
         print("Error: 'skua dashboard' requires the 'textual' package.")
         print("Install it with: pip3 install textual")
         raise SystemExit(1)
 
     class DashboardApp(App):
+        DEFAULT_CSS = """
+        #dashboard-view {
+            height: 1fr;
+        }
+        #status-bar {
+            dock: bottom;
+            height: auto;
+            width: 100%;
+        }
+        """
         BINDINGS = [
             Binding("q", "quit", "Quit"),
             Binding("h", "toggle_help", "Help"),
             Binding("tab", "toggle_focus", "Focus"),
+            Binding("left", "task_prev_option", show=False),
+            Binding("right", "task_next_option", show=False),
+            Binding("escape", "task_cancel", show=False),
             Binding("up,k", "cursor_up", "Up"),
             Binding("down,j", "cursor_down", "Down"),
             Binding("enter", "run_selected", "Run"),
@@ -907,6 +1061,7 @@ def cmd_dashboard(args):
             Binding("o", "open_job_output", "Output"),
             Binding("x", "cancel_job", "Cancel Job"),
             Binding("c", "clear_jobs", "Clear Jobs"),
+            Binding("y", "export_job_output", "Export Output"),
         ]
 
         def __init__(self, dashboard_args):
@@ -920,16 +1075,41 @@ def cmd_dashboard(args):
             self.show_help = False
             self.message = ""
             self.jobs = DashboardJobManager()
+            self.task_mode = ""
+            self.task_step = 0
+            self.task_values = {}
+            self.task_input = ""
+            self.task_option_index = 0
+            self.task_catalog = {}
+            self.task_job_id = 0
+            self.task_remove_project = ""
+            self.task_error = ""
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
 
         def compose(self) -> ComposeResult:
             yield Static(id="dashboard-view")
-            yield Footer()
+            yield Static(id="status-bar")
 
         def on_mount(self) -> None:
             self._request_refresh()
             self.set_interval(2.0, self._request_refresh)
+
+        def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:  # pragma: no cover - runtime UI behavior
+            if not self.task_mode:
+                return True
+            if self.task_mode == "job_input":
+                return action in {"run_selected", "task_cancel"}
+            if self.task_mode == "remove_confirm":
+                return action in {"run_selected", "task_cancel"}
+            return action in {
+                "run_selected",
+                "cursor_up",
+                "cursor_down",
+                "task_prev_option",
+                "task_next_option",
+                "task_cancel",
+            }
 
         def _request_refresh(self) -> None:
             jobs_changed = self.jobs.poll()
@@ -981,27 +1161,438 @@ def cmd_dashboard(args):
                 return None
             return self.snapshot.rows[self.selected]["name"]
 
+        def _build_new_project_catalog(self) -> dict:
+            store = ConfigStore()
+            g = store.load_global()
+            defaults = g.get("defaults", {})
+            keys = [str(p) for p in find_ssh_keys()]
+            global_ssh = defaults.get("sshKey", "")
+            if global_ssh:
+                global_ssh_path = str(Path(global_ssh).expanduser().resolve())
+                if Path(global_ssh_path).is_file() and global_ssh_path not in keys:
+                    keys.append(global_ssh_path)
+            return {
+                "defaults": defaults,
+                "hosts": parse_ssh_config_hosts(),
+                "keys": sorted(set(keys)),
+                "envs": store.list_resources("Environment"),
+                "secs": store.list_resources("SecurityProfile"),
+                "agents": store.list_resources("AgentConfig"),
+            }
+
+        def _task_steps(self) -> list[dict]:
+            steps = [
+                {"key": "name", "kind": "text", "label": "Project name", "required": True},
+                {"key": "source_mode", "kind": "select", "label": "Project source", "options": ["Local directory", "Git repository"]},
+            ]
+            if self.task_values.get("source_mode") == "Local directory":
+                steps.append({"key": "dir", "kind": "text", "label": "Project directory", "required": True})
+            else:
+                steps.append({"key": "repo", "kind": "text", "label": "Git repository URL", "required": True})
+                steps.append(
+                    {
+                        "key": "run_mode",
+                        "kind": "select",
+                        "label": "Run location",
+                        "options": ["Local docker host", "Remote SSH host"],
+                    }
+                )
+                if self.task_values.get("run_mode") == "Remote SSH host":
+                    host_options = list(self.task_catalog.get("hosts", [])) + ["Manual entry..."]
+                    steps.append({"key": "host", "kind": "select", "label": "SSH host", "options": host_options})
+                    if self.task_values.get("host") == "Manual entry...":
+                        steps.append({"key": "host_manual", "kind": "text", "label": "SSH host", "required": True})
+
+            keys = list(self.task_catalog.get("keys", []))
+            if keys:
+                steps.append(
+                    {
+                        "key": "ssh_key",
+                        "kind": "select",
+                        "label": "SSH private key",
+                        "options": keys + ["None", "Manual entry..."],
+                    }
+                )
+                if self.task_values.get("ssh_key") == "Manual entry...":
+                    steps.append({"key": "ssh_key_manual", "kind": "text", "label": "SSH private key path"})
+            else:
+                steps.append({"key": "ssh_key_manual", "kind": "text", "label": "SSH private key path"})
+
+            envs = list(self.task_catalog.get("envs", []))
+            secs = list(self.task_catalog.get("secs", []))
+            agents = list(self.task_catalog.get("agents", []))
+            if envs:
+                steps.append({"key": "env", "kind": "select", "label": "Environment", "options": envs + ["Manual entry..."]})
+                if self.task_values.get("env") == "Manual entry...":
+                    steps.append({"key": "env_manual", "kind": "text", "label": "Environment", "required": True})
+            else:
+                steps.append({"key": "env_manual", "kind": "text", "label": "Environment", "required": True})
+            if secs:
+                steps.append({"key": "security", "kind": "select", "label": "Security profile", "options": secs + ["Manual entry..."]})
+                if self.task_values.get("security") == "Manual entry...":
+                    steps.append({"key": "security_manual", "kind": "text", "label": "Security profile", "required": True})
+            else:
+                steps.append({"key": "security_manual", "kind": "text", "label": "Security profile", "required": True})
+            if agents:
+                steps.append({"key": "agent", "kind": "select", "label": "Agent", "options": agents + ["Manual entry..."]})
+                if self.task_values.get("agent") == "Manual entry...":
+                    steps.append({"key": "agent_manual", "kind": "text", "label": "Agent", "required": True})
+            else:
+                steps.append({"key": "agent_manual", "kind": "text", "label": "Agent", "required": True})
+            agent_name = (
+                self.task_values.get("agent_manual", "").strip()
+                if self.task_values.get("agent") == "Manual entry..."
+                else self.task_values.get("agent", "").strip()
+            )
+            store = ConfigStore()
+            creds = sorted(
+                c for c in store.list_resources("Credential")
+                if agent_name and _cred_matches_agent(store, c, agent_name)
+            )
+            steps.append(
+                {
+                    "key": "credential_choice",
+                    "kind": "select",
+                    "label": "Credential",
+                    "options": ["None (log in in container)"] + creds,
+                }
+            )
+            steps.append({"key": "image", "kind": "text", "label": "Project base image override"})
+            steps.append({"key": "confirm", "kind": "select", "label": "Create project", "options": ["Create project", "Cancel"]})
+            return steps
+
+        def _current_task_step(self) -> dict | None:
+            steps = self._task_steps()
+            if not steps:
+                return None
+            self.task_step = max(0, min(self.task_step, len(steps) - 1))
+            return steps[self.task_step]
+
+        def _sync_task_editor(self) -> None:
+            step = self._current_task_step()
+            if step is None:
+                return
+            key = step["key"]
+            if step["kind"] == "text":
+                self.task_input = str(self.task_values.get(key, ""))
+                return
+            options = step.get("options", [])
+            current = self.task_values.get(key, "")
+            if options and current in options:
+                self.task_option_index = options.index(current)
+            else:
+                self.task_option_index = 0
+                if options:
+                    self.task_values[key] = options[0]
+
+        def _start_new_project_task(self) -> None:
+            defaults = self.task_catalog.get("defaults", {})
+            self.task_mode = "new_project"
+            self.task_step = 0
+            self.task_values = {
+                "name": "",
+                "source_mode": "Local directory",
+                "dir": str(Path.cwd()),
+                "repo": "",
+                "run_mode": "Local docker host",
+                "host": "",
+                "host_manual": "",
+                "ssh_key": "None",
+                "ssh_key_manual": "",
+                "env": defaults.get("environment", "local-docker"),
+                "env_manual": "",
+                "security": defaults.get("security", "open"),
+                "security_manual": "",
+                "agent": defaults.get("agent", "claude"),
+                "agent_manual": "",
+                "credential_choice": "None (log in in container)",
+                "image": "",
+                "confirm": "Create project",
+            }
+            self.focus = "task"
+            self.show_job_output = False
+            self.task_job_id = 0
+            self.task_error = ""
+            self._sync_task_editor()
+            self.message = "new project: wizard started"
+
+        def _start_job_input_task(self, job: DashboardJob) -> None:
+            self.task_mode = "job_input"
+            self.task_job_id = job.job_id
+            self.task_input = ""
+            self.focus = "task"
+            self.show_job_output = True
+            self.message = f"job #{job.job_id}: waiting for input"
+
+        def _start_remove_confirm_task(self, project_name: str) -> None:
+            self.task_mode = "remove_confirm"
+            self.task_remove_project = project_name
+            self.task_input = ""
+            self.focus = "task"
+            self.show_job_output = False
+            self.message = f"remove confirm: type '{project_name}'"
+
+        def _task_cancel(self, reason: str = "new project: cancelled") -> None:
+            self.task_mode = ""
+            self.task_job_id = 0
+            self.task_remove_project = ""
+            self.task_error = ""
+            if self.focus == "task":
+                self.focus = "projects" if self.snapshot.rows else "jobs"
+            self.message = reason
+
+        def _finish_new_project_task(self) -> None:
+            host = ""
+            if self.task_values.get("source_mode") == "Git repository" and self.task_values.get("run_mode") == "Remote SSH host":
+                host = self.task_values.get("host_manual", "").strip() if self.task_values.get("host") == "Manual entry..." else self.task_values.get("host", "").strip()
+            ssh_key = ""
+            if self.task_values.get("ssh_key") == "Manual entry...":
+                ssh_key = self.task_values.get("ssh_key_manual", "").strip()
+            elif self.task_values.get("ssh_key") not in ("", "None"):
+                ssh_key = self.task_values.get("ssh_key", "").strip()
+            env = self.task_values.get("env_manual", "").strip() if self.task_values.get("env") == "Manual entry..." else self.task_values.get("env", "").strip()
+            sec = self.task_values.get("security_manual", "").strip() if self.task_values.get("security") == "Manual entry..." else self.task_values.get("security", "").strip()
+            agent = self.task_values.get("agent_manual", "").strip() if self.task_values.get("agent") == "Manual entry..." else self.task_values.get("agent", "").strip()
+            credential_choice = self.task_values.get("credential_choice", "None (log in in container)")
+            no_credential = credential_choice == "None (log in in container)"
+            credential_name = "" if no_credential else credential_choice
+
+            args = SimpleNamespace(
+                name=self.task_values.get("name", "").strip(),
+                repo=self.task_values.get("repo", "").strip() if self.task_values.get("source_mode") == "Git repository" else "",
+                host=host,
+                dir=self.task_values.get("dir", "").strip() if self.task_values.get("source_mode") == "Local directory" else "",
+                ssh_key=ssh_key,
+                env=env,
+                security=sec,
+                agent=agent,
+                image=self.task_values.get("image", "").strip(),
+                quick=False,
+                no_prompt=True,
+                no_credential=no_credential,
+                credential=credential_name,
+            )
+
+            self.task_mode = ""
+            self.focus = "projects"
+            output = StringIO()
+            try:
+                with redirect_stdout(output), redirect_stderr(output):
+                    cmd_add(args)
+                self.message = f"new project {args.name}: ok"
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+                detail_lines = [ln for ln in output.getvalue().splitlines() if ln.strip()]
+                detail = detail_lines[-1] if detail_lines else f"status {code}"
+                self.message = f"new project {args.name}: failed ({detail})"
+            except Exception as exc:  # pragma: no cover - defensive runtime guard
+                self.message = f"new project failed ({type(exc).__name__}: {exc})"
+            self._request_refresh()
+
+        def _task_submit_step(self) -> None:
+            if self.task_mode == "job_input":
+                ok, detail = self.jobs.send_input(self.task_job_id, self.task_input)
+                if ok:
+                    self.message = f"job #{self.task_job_id}: input sent"
+                    self.task_mode = ""
+                    self.task_input = ""
+                    self.task_job_id = 0
+                    self.focus = "jobs"
+                else:
+                    self.message = detail
+                self._refresh_view()
+                return
+            if self.task_mode == "remove_confirm":
+                target = self.task_remove_project
+                if self.task_input.strip() != target:
+                    self.message = f"type '{target}' to confirm remove"
+                    self._refresh_view()
+                    return
+                background = _background_command("remove", target)
+                if not background:
+                    self.message = "remove action is unavailable"
+                    self._refresh_view()
+                    return
+                try:
+                    job = self.jobs.enqueue("remove", target, command=background)
+                    self.message = f"queued job #{job.job_id}: remove {target}"
+                    self.task_mode = ""
+                    self.task_remove_project = ""
+                    self.task_input = ""
+                    self.focus = "projects"
+                    self.show_job_output = False
+                    self.selected_job = 0
+                except Exception as exc:
+                    self.message = f"failed to queue remove {target}: {type(exc).__name__}: {exc}"
+                self._refresh_view()
+                self._request_refresh()
+                return
+            if self.task_mode != "new_project":
+                return
+            step = self._current_task_step()
+            if step is None:
+                return
+            key = step["key"]
+            if step["kind"] == "text":
+                value = self.task_input.strip() if step.get("required", False) else self.task_input
+                if step.get("required", False) and not value:
+                    self.message = f"{step['label']} is required"
+                    self._refresh_view()
+                    return
+                if key == "name":
+                    if not all(c.isalnum() or c in "-_" for c in value):
+                        self.task_error = "invalid project name"
+                        self.message = "project name must be alphanumeric (hyphens/underscores allowed)"
+                        self._refresh_view()
+                        return
+                    if ConfigStore().load_project(value) is not None:
+                        self.task_error = "duplicate project name"
+                        self.message = "duplicate project name"
+                        self._refresh_view()
+                        return
+                    self.task_error = ""
+                self.task_values[key] = value
+            else:
+                options = step.get("options", [])
+                if options:
+                    self.task_values[key] = options[self.task_option_index]
+
+            if key == "confirm":
+                if self.task_values.get("confirm") == "Create project":
+                    self._finish_new_project_task()
+                else:
+                    self._task_cancel()
+                self._refresh_view()
+                return
+
+            self.task_step += 1
+            self.task_error = ""
+            self._sync_task_editor()
+            self._refresh_view()
+
+        def _task_shift_option(self, delta: int) -> None:
+            step = self._current_task_step()
+            if step is None or step["kind"] != "select":
+                return
+            options = step.get("options", [])
+            if not options:
+                return
+            self.task_option_index = (self.task_option_index + delta) % len(options)
+            self.task_values[step["key"]] = options[self.task_option_index]
+            self._refresh_view()
+
+        def on_key(self, event) -> None:  # pragma: no cover - runtime UI behavior
+            if not self.task_mode:
+                return
+            if getattr(event, "key", "") == "backspace":
+                if self.task_input:
+                    self.task_input = self.task_input[:-1]
+                    if self.task_mode == "new_project":
+                        step = self._current_task_step()
+                        if step is not None and step.get("key") == "name":
+                            self.task_error = ""
+                    self._refresh_view()
+                event.stop()
+                return
+            if self.task_mode == "job_input":
+                ch = getattr(event, "character", None)
+                if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
+                    return
+                self.task_input += ch
+                self._refresh_view()
+                event.stop()
+                return
+            if self.task_mode == "remove_confirm":
+                ch = getattr(event, "character", None)
+                if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
+                    return
+                self.task_input += ch
+                self._refresh_view()
+                event.stop()
+                return
+            step = self._current_task_step()
+            if step is None or step["kind"] != "text":
+                return
+            ch = getattr(event, "character", None)
+            if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
+                return
+            self.task_input += ch
+            if step.get("key") == "name":
+                self.task_error = ""
+            self._refresh_view()
+            event.stop()
+
+        def on_paste(self, event: events.Paste) -> None:  # pragma: no cover - runtime UI behavior
+            if not self.task_mode:
+                return
+            pasted = (event.text or "").replace("\r", "")
+            if not pasted:
+                return
+            if self.task_mode == "job_input":
+                self.task_input += pasted
+                self._refresh_view()
+                event.stop()
+                return
+            if self.task_mode == "remove_confirm":
+                self.task_input += pasted
+                self._refresh_view()
+                event.stop()
+                return
+            step = self._current_task_step()
+            if step is None or step["kind"] != "text":
+                return
+            self.task_input += pasted
+            if step.get("key") == "name":
+                self.task_error = ""
+            self._refresh_view()
+            event.stop()
+
         def _refresh_view(self) -> None:
             view = self.query_one("#dashboard-view", Static)
-            title = Text("skua dashboard (auto-refresh: 2s)", style="bold")
-            message = Text(self.message) if self.message else Text("")
+            status_bar = self.query_one("#status-bar", Static)
+            title = self._render_header_line("skua dashboard", "auto-refresh: 2s")
             jobs_view = self.jobs.list_for_view()
+            visible_jobs = min(len(jobs_view), 10)
             if jobs_view:
-                self.selected_job = min(max(0, self.selected_job), len(jobs_view) - 1)
+                self.selected_job = min(max(0, self.selected_job), visible_jobs - 1)
             else:
                 self.selected_job = 0
-            focus_line = Text(
-                f"Focus: {self.focus} | {self.jobs.summary()}",
-                style="cyan bold" if self.focus == "jobs" else "dim",
+                if self.show_job_output:
+                    self.show_job_output = False
+            if self.focus == "jobs" and not jobs_view and self.snapshot.rows:
+                self.focus = "projects"
+                self.show_job_output = False
+            if self.focus == "projects" and not self.snapshot.rows and jobs_view:
+                self.focus = "jobs"
+            if self.show_job_output and jobs_view:
+                selected_job = jobs_view[self.selected_job]
+                if selected_job.status == "waiting_input" and self.task_mode != "job_input":
+                    self._start_job_input_task(selected_job)
+                if self.task_mode == "job_input" and selected_job.job_id != self.task_job_id:
+                    self.task_mode = ""
+                    self.task_job_id = 0
+            focus_line = Text(f"Focus: {self.focus} | {self.jobs.summary()}", style="cyan bold")
+            status_bar.update(
+                Group(
+                    self._render_task_panel(),
+                    self._render_command_bar(self._context_actions(jobs_view)),
+                )
             )
 
             if self.show_help:
                 help_text = Text(
                     "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
-                    "      tab/j focus projects/jobs | o output | x cancel job | c clear completed jobs\n"
+                    "      tab focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
                     "      h toggle help | q quit"
                 )
-                view.update(Group(title, message, focus_line, help_text))
+                view.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Help"),
+                        help_text,
+                    )
+                )
                 return
 
             if self.show_job_output and jobs_view:
@@ -1011,27 +1602,33 @@ def cmd_dashboard(args):
                     style="bold",
                 )
                 log_text = Text(self.jobs.tail(selected), style="white")
-                view.update(Group(title, message, focus_line, log_title, Text(""), log_text))
+                view.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Job Output"),
+                        log_title,
+                        Text(""),
+                        log_text,
+                    )
+                )
                 return
 
+            content: list = [title, focus_line, self._section_header("Projects")]
             if not self.snapshot.rows:
-                divider = Text(self._divider_line(), style="dim")
-                summary = Text("\n".join(self.snapshot.summary))
-                hint = Text("Press q to quit. Press h for help.", style="dim")
-                jobs_table = self._render_jobs_table(jobs_view)
-                view.update(Group(title, message, focus_line, Text(""), divider, summary, Text(""), jobs_table, Text(""), divider, hint))
-                return
-
-            table = Table(box=None, show_edge=False, pad_edge=False)
-            for col_name, col_width in self.snapshot.columns:
-                table.add_column(col_name, width=col_width, overflow="ellipsis", no_wrap=True)
-            for idx, row in enumerate(self.snapshot.rows):
-                style = "reverse" if idx == self.selected else ""
-                rendered_cells = []
-                for col_index, cell in enumerate(row["cells"]):
-                    col_name = self.snapshot.columns[col_index][0] if col_index < len(self.snapshot.columns) else ""
-                    rendered_cells.append(Text(str(cell), style=self._cell_style(col_name, str(cell))))
-                table.add_row(*rendered_cells, style=style)
+                content.append(Text("No projects configured.", style="dim"))
+            else:
+                table = Table(box=None, show_edge=False, pad_edge=False)
+                for col_name, col_width in self.snapshot.columns:
+                    table.add_column(col_name, width=col_width, overflow="ellipsis", no_wrap=True)
+                for idx, row in enumerate(self.snapshot.rows):
+                    style = "reverse" if self.focus == "projects" and idx == self.selected else ""
+                    rendered_cells = []
+                    for col_index, cell in enumerate(row["cells"]):
+                        col_name = self.snapshot.columns[col_index][0] if col_index < len(self.snapshot.columns) else ""
+                        rendered_cells.append(Text(str(cell), style=self._cell_style(col_name, str(cell))))
+                    table.add_row(*rendered_cells, style=style)
+                content.append(table)
 
             summary = Text()
             for idx, line in enumerate(self.snapshot.summary):
@@ -1039,16 +1636,190 @@ def cmd_dashboard(args):
                 if idx < len(self.snapshot.summary) - 1:
                     summary.append("\n")
             jobs_table = self._render_jobs_table(jobs_view)
-            divider = Text(self._divider_line(), style="dim")
-            hint = Text("Press h for help. Press q to quit.", style="dim")
-            view.update(Group(title, message, focus_line, table, Text(""), divider, summary, Text(""), jobs_table, Text(""), divider, hint))
+            content.extend(
+                [
+                    Text(""),
+                    self._section_header("Project Summary"),
+                    summary,
+                    Text(""),
+                    self._section_header("Jobs"),
+                    jobs_table,
+                ]
+            )
+            view.update(Group(*content))
+
+        def _render_header_line(self, left: str, right: str) -> Text:
+            width = max(20, (getattr(self, "size", None).width or 80))
+            spacer = "  "
+            raw = f"{left}{spacer}{right}"
+            if len(raw) >= width:
+                return Text(raw[: max(0, width - 1)], style="bold")
+            pad = " " * (width - len(left) - len(right))
+            return Text(f"{left}{pad}{right}", style="bold")
+
+        def _section_header(self, label: str) -> Text:
+            width = max(20, (getattr(self, "size", None).width or 80))
+            prefix = f"── {label} "
+            if len(prefix) >= width:
+                return Text(prefix[: max(0, width - 1)], style="bold white")
+            return Text(prefix + ("─" * (width - len(prefix))), style="bold white")
+
+        def _render_task_panel(self):
+            width = max(20, (getattr(self, "size", None).width or 80))
+            if self.task_mode:
+                if self.task_mode == "job_input":
+                    job = next((j for j in self.jobs.jobs if j.job_id == self.task_job_id), None)
+                    prompt = job.prompt_text if job and job.prompt_text else f"job #{self.task_job_id} input"
+                    prefix = f"{prompt} "
+                    suffix = f"{self.task_input}|"
+                    full = prefix + suffix
+                    if len(full) <= width:
+                        return Text(full.ljust(width), style="bold black on white")
+                    keep = max(1, width - len(prefix) - 1)
+                    scrolled = "…" + suffix[-keep:]
+                    line = prefix + scrolled
+                    if len(line) > width:
+                        line = line[:width]
+                    return Text(line.ljust(width), style="bold black on white")
+                if self.task_mode == "remove_confirm":
+                    prefix = f"confirm remove '{self.task_remove_project}': "
+                    suffix = f"{self.task_input}|"
+                    full = prefix + suffix
+                    if len(full) <= width:
+                        return Text(full.ljust(width), style="bold black on white")
+                    keep = max(1, width - len(prefix) - 1)
+                    scrolled = "…" + suffix[-keep:]
+                    line = prefix + scrolled
+                    if len(line) > width:
+                        line = line[:width]
+                    return Text(line.ljust(width), style="bold black on white")
+                step = self._current_task_step()
+                steps = self._task_steps()
+                if step is None:
+                    text = "new project wizard"
+                    return Text(text.ljust(width), style="bold black on white")
+                idx = self.task_step + 1
+                total = len(steps)
+                if step["kind"] == "text":
+                    prefix = f"new project [{idx}/{total}] {step['label']}: "
+                    suffix = f"{self.task_input}|"
+                    show_name_error = step.get("key") == "name" and bool(self.task_error)
+                    if show_name_error:
+                        suffix = f"{suffix}  ({self.task_error})"
+                    full = prefix + suffix
+                    if len(full) <= width:
+                        if show_name_error:
+                            text = Text(prefix, style="bold black on white")
+                            text.append(self.task_input + "|", style="bold black on white")
+                            text.append("  ", style="bold black on white")
+                            text.append(f"({self.task_error})", style="bold red on white")
+                            if len(text.plain) < width:
+                                text.append(" " * (width - len(text.plain)), style="bold black on white")
+                            return text
+                        return Text(full.ljust(width), style="bold black on white")
+                    # Keep the cursor visible by scrolling horizontally with input growth.
+                    keep = max(1, width - len(prefix) - 1)
+                    scrolled = "…" + suffix[-keep:]
+                    line = (prefix + scrolled)
+                    if len(line) > width:
+                        line = line[:width]
+                    return Text(line.ljust(width), style="bold black on white")
+                prompt = f"new project [{idx}/{total}] {step['label']}:"
+                if len(prompt) >= width:
+                    prompt = prompt[: max(0, width - 1)]
+                options = step.get("options", [])
+                selected = self.task_option_index
+                lines = [Text(prompt.ljust(width), style="bold black on white")]
+                for i, option in enumerate(options):
+                    prefix = "> " if i == selected else "  "
+                    line = prefix + option
+                    if len(line) >= width:
+                        line = line[: max(0, width - 1)]
+                    style = "bold white on blue" if i == selected else "bold black on white"
+                    lines.append(Text(line.ljust(width), style=style))
+                return Group(*lines)
+            msg = self.message.strip() if self.message else "(idle)"
+            text = msg
+            if len(text) >= width:
+                text = text[: max(0, width - 1)]
+            return Text(text.ljust(width), style="bold black on white")
+
+        def _context_actions(self, jobs_view: list[DashboardJob]) -> list[tuple[str, str, str]]:
+            if self.task_mode:
+                if self.task_mode == "job_input":
+                    return [
+                        ("type", "Reply", "bold cyan"),
+                        ("⏎", "Send Input", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
+                if self.task_mode == "remove_confirm":
+                    return [
+                        ("type", "Type Project Name", "bold cyan"),
+                        ("⏎", "Confirm Remove", "bold red"),
+                        ("Esc", "Cancel", "bold yellow"),
+                    ]
+                return [
+                    ("←/→", "Select", "bold yellow"),
+                    ("type", "Edit Text", "bold cyan"),
+                    ("⏎", "Next", "bold green"),
+                    ("Esc", "Cancel", "bold red"),
+                ]
+            nav = [
+                ("↑/↓", "Move", "bold white"),
+            ]
+            if self.show_job_output:
+                return nav + [
+                    ("o", "Close Output", "bold cyan"),
+                    ("d", "Remove Job", "bold red"),
+                    ("y", "Export Output", "bold blue"),
+                    ("q", "Quit", "bold bright_black"),
+                ]
+            if self.focus == "jobs":
+                if jobs_view:
+                    return nav + [
+                        ("o", "Output", "bold cyan"),
+                        ("x", "Cancel", "bold red"),
+                        ("d", "Remove Job", "bold red"),
+                        ("c", "Clear Done", "bold yellow"),
+                        ("y", "Export", "bold blue"),
+                        ("q", "Quit", "bold bright_black"),
+                    ]
+                return [
+                    ("q", "Quit", "bold bright_black"),
+                ]
+            return nav + [
+                ("⏎", "Run", "bold green"),
+                ("b", "Build", "bold yellow"),
+                ("s", "Stop", "bold yellow"),
+                ("a", "Adapt", "bold cyan"),
+                ("d", "Remove", "bold red"),
+                ("r", "Restart", "bold blue"),
+                ("n", "New", "bold green"),
+                ("q", "Quit", "bold bright_black"),
+            ]
+
+        def _render_command_bar(self, actions: list[tuple[str, str, str]]) -> Text:
+            width = max(20, (getattr(self, "size", None).width or 80))
+            text = Text(style="white on black")
+            for idx, (key, label, style) in enumerate(actions):
+                if idx > 0:
+                    text.append("  ·  ", style="bold white on black")
+                text.append(f"{key} ", style=f"{style} on black")
+                text.append(label, style="bold white on black")
+            content = text.plain
+            if len(content) > width:
+                clipped = content[: max(0, width - 1)]
+                return Text(clipped, style="bold white on black")
+            if len(content) < width:
+                text.append(" " * (width - len(content)), style="white on black")
+            return text
 
         def _render_jobs_table(self, jobs_view: list[DashboardJob]):
             table = Table(box=None, show_edge=False, pad_edge=False)
             table.add_column("JOBS", width=6)
             table.add_column("ACTION", width=8)
             table.add_column("PROJECT", width=18, overflow="ellipsis", no_wrap=True)
-            table.add_column("STATUS", width=10)
+            table.add_column("STATUS", width=14)
             table.add_column("AGE", width=6)
             table.add_column("EXIT", width=6)
             if not jobs_view:
@@ -1073,6 +1844,8 @@ def cmd_dashboard(args):
         def _job_status_style(status: str) -> str:
             if status in ("running", "queued"):
                 return "yellow bold"
+            if status in ("waiting_input",):
+                return "magenta bold"
             if status in ("success",):
                 return "green bold"
             if status in ("failed", "orphaned"):
@@ -1174,33 +1947,115 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_toggle_focus(self) -> None:
+            if self.task_mode:
+                self.focus = "task"
+                self._refresh_view()
+                return
+            if self.show_job_output:
+                # Job output mode is jobs-only; keep focus stable.
+                self.focus = "jobs"
+                self._refresh_view()
+                return
             self.focus = "jobs" if self.focus == "projects" else "projects"
             self.show_job_output = False
             self._refresh_view()
 
         def action_cursor_up(self) -> None:
+            if self.task_mode:
+                if self.task_mode == "job_input":
+                    return
+                step = self._current_task_step()
+                if step is not None and step["kind"] == "select":
+                    self._task_shift_option(-1)
+                return
+            jobs_view = self.jobs.list_for_view()
+            project_count = len(self.snapshot.rows)
+            visible_jobs = min(len(jobs_view), 10)
+            if self.show_job_output:
+                if jobs_view and self.selected_job > 0:
+                    self.selected_job -= 1
+                self.focus = "jobs"
+                self._refresh_view()
+                return
             if self.focus == "jobs":
-                jobs_view = self.jobs.list_for_view()
+                if not jobs_view and project_count:
+                    self.focus = "projects"
+                    self.selected = max(0, min(self.selected, project_count - 1))
+                    self._refresh_view()
+                    return
                 if jobs_view:
-                    self.selected_job = max(0, self.selected_job - 1)
+                    if self.selected_job > 0:
+                        self.selected_job -= 1
+                    elif project_count:
+                        self.focus = "projects"
+                        self.selected = project_count - 1
                     self._refresh_view()
                 return
-            if self.snapshot.rows:
-                self.selected = max(0, self.selected - 1)
+            if not project_count and jobs_view:
+                self.focus = "jobs"
+                self.selected_job = max(0, visible_jobs - 1)
+                self._refresh_view()
+                return
+            if project_count:
+                if self.selected > 0:
+                    self.selected -= 1
+                elif jobs_view:
+                    self.focus = "jobs"
+                    self.selected_job = max(0, visible_jobs - 1)
                 self._refresh_view()
 
         def action_cursor_down(self) -> None:
+            if self.task_mode:
+                if self.task_mode == "job_input":
+                    return
+                step = self._current_task_step()
+                if step is not None and step["kind"] == "select":
+                    self._task_shift_option(1)
+                return
+            jobs_view = self.jobs.list_for_view()
+            project_count = len(self.snapshot.rows)
+            visible_jobs = min(len(jobs_view), 10)
+            if self.show_job_output:
+                if jobs_view and self.selected_job < visible_jobs - 1:
+                    self.selected_job += 1
+                self.focus = "jobs"
+                self._refresh_view()
+                return
             if self.focus == "jobs":
-                jobs_view = self.jobs.list_for_view()
+                if not jobs_view and project_count:
+                    self.focus = "projects"
+                    self.selected = max(0, min(self.selected, project_count - 1))
+                    self._refresh_view()
+                    return
                 if jobs_view:
-                    self.selected_job = min(len(jobs_view) - 1, self.selected_job + 1)
+                    if self.selected_job < visible_jobs - 1:
+                        self.selected_job += 1
+                    elif project_count:
+                        self.focus = "projects"
+                        self.selected = 0
                     self._refresh_view()
                 return
-            if self.snapshot.rows:
-                self.selected = min(len(self.snapshot.rows) - 1, self.selected + 1)
+            if not project_count and jobs_view:
+                self.focus = "jobs"
+                self.selected_job = 0
+                self._refresh_view()
+                return
+            if project_count:
+                if self.selected < project_count - 1:
+                    self.selected += 1
+                elif jobs_view:
+                    self.focus = "jobs"
+                    self.selected_job = 0
                 self._refresh_view()
 
         def _run_selected(self, action_key: str) -> None:
+            if self.task_mode:
+                self._task_submit_step()
+                return
+            if self.show_job_output or self.focus != "projects":
+                self.message = "project actions are available only in projects view"
+                self._refresh_view()
+                return
             project_name = self._selected_project_name()
             if not project_name:
                 return
@@ -1209,7 +2064,6 @@ def cmd_dashboard(args):
                 try:
                     job = self.jobs.enqueue(action_key, project_name, command=background)
                     self.message = f"queued job #{job.job_id}: {action_key} {project_name}"
-                    self.focus = "jobs"
                     self.show_job_output = False
                     self.selected_job = 0
                 except Exception as exc:
@@ -1235,17 +2089,42 @@ def cmd_dashboard(args):
             self._run_selected("adapt")
 
         def action_remove_selected(self) -> None:
-            self._run_selected("remove")
+            if self.focus == "jobs" or self.show_job_output:
+                self.action_remove_job()
+                return
+            if self.focus != "projects":
+                self.message = "remove is available only in projects view"
+                self._refresh_view()
+                return
+            project_name = self._selected_project_name()
+            if not project_name:
+                return
+            self._start_remove_confirm_task(project_name)
+            self._refresh_view()
 
         def action_restart_selected(self) -> None:
             self._run_selected("restart")
 
         def action_new_project(self) -> None:
-            self.message = _run_add_project_interactive(suspend=self.suspend)
+            if self.task_mode:
+                self._refresh_view()
+                return
+            if self.show_job_output or self.focus not in ("projects", "jobs"):
+                self.message = "new project is not available in this view"
+                self._refresh_view()
+                return
+            self.task_catalog = self._build_new_project_catalog()
+            self._start_new_project_task()
             self._refresh_view()
-            self._request_refresh()
 
         def action_open_job_output(self) -> None:
+            if self.task_mode == "new_project":
+                self._refresh_view()
+                return
+            if self.focus != "jobs" and not self.show_job_output:
+                self.message = "switch focus to jobs to open output"
+                self._refresh_view()
+                return
             jobs_view = self.jobs.list_for_view()
             if not jobs_view:
                 self.message = "no jobs to display"
@@ -1254,9 +2133,19 @@ def cmd_dashboard(args):
             self.selected_job = min(self.selected_job, len(jobs_view) - 1)
             self.focus = "jobs"
             self.show_job_output = not self.show_job_output
+            job = jobs_view[self.selected_job]
+            if self.show_job_output and job.status == "waiting_input":
+                self._start_job_input_task(job)
+            elif self.task_mode == "job_input":
+                self.task_mode = ""
+                self.task_job_id = 0
             self._refresh_view()
 
         def action_cancel_job(self) -> None:
+            if self.focus != "jobs" and not self.show_job_output:
+                self.message = "switch focus to jobs to cancel jobs"
+                self._refresh_view()
+                return
             jobs_view = self.jobs.list_for_view()
             if not jobs_view:
                 self.message = "no running job selected"
@@ -1271,9 +2160,89 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_clear_jobs(self) -> None:
+            if self.focus != "jobs" and not self.show_job_output:
+                self.message = "switch focus to jobs to clear jobs"
+                self._refresh_view()
+                return
             removed = self.jobs.clear_completed()
             self.message = f"cleared {removed} completed job(s)"
             self.show_job_output = False
+            self._refresh_view()
+
+        def action_export_job_output(self) -> None:
+            if self.task_mode:
+                self._refresh_view()
+                return
+            if self.focus != "jobs" and not self.show_job_output:
+                self.message = "switch focus to jobs to export output"
+                self._refresh_view()
+                return
+            jobs_view = self.jobs.list_for_view()
+            if not jobs_view:
+                self.message = "no jobs to export"
+                self._refresh_view()
+                return
+            self.selected_job = min(self.selected_job, len(jobs_view) - 1)
+            job = jobs_view[self.selected_job]
+            path = self.jobs.export_output(job)
+            self.message = f"exported job #{job.job_id} output to {path}"
+            self._refresh_view()
+
+        def action_remove_job(self) -> None:
+            if self.task_mode:
+                self._refresh_view()
+                return
+            if self.focus != "jobs" and not self.show_job_output:
+                self.message = "switch focus to jobs to remove a job"
+                self._refresh_view()
+                return
+            jobs_view = self.jobs.list_for_view()
+            if not jobs_view:
+                self.message = "no jobs to remove"
+                self._refresh_view()
+                return
+            self.selected_job = min(self.selected_job, len(jobs_view) - 1)
+            job = jobs_view[self.selected_job]
+            ok, detail = self.jobs.remove_job(job.job_id, delete_log=False)
+            if ok:
+                self.message = f"removed job #{job.job_id}"
+                remaining = self.jobs.list_for_view()
+                if not remaining:
+                    self.selected_job = 0
+                    self.show_job_output = False
+                    if self.snapshot.rows:
+                        self.focus = "projects"
+                else:
+                    self.selected_job = min(self.selected_job, len(remaining) - 1)
+            else:
+                self.message = detail
+            self._refresh_view()
+
+        def action_task_prev_option(self) -> None:
+            if not self.task_mode:
+                return
+            self._task_shift_option(-1)
+
+        def action_task_next_option(self) -> None:
+            if not self.task_mode:
+                return
+            self._task_shift_option(1)
+
+        def action_task_cancel(self) -> None:
+            if not self.task_mode:
+                return
+            if self.task_mode == "job_input":
+                self.task_mode = ""
+                self.task_job_id = 0
+                self.focus = "jobs"
+                self.message = "job input cancelled"
+                self._refresh_view()
+                return
+            if self.task_mode == "remove_confirm":
+                self._task_cancel("remove cancelled")
+                self._refresh_view()
+                return
+            self._task_cancel()
             self._refresh_view()
 
     DashboardApp(args).run()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BUSL-1.1
 """Shared utilities for skua."""
 
+import os
 import subprocess
 import sys
 import shutil
@@ -40,6 +41,8 @@ def die(msg: str, code: int = 1):
 def confirm(prompt: str, default: bool = False) -> bool:
     """Ask a yes/no question. Returns True for yes."""
     suffix = "[Y/n]" if default else "[y/N]"
+    if os.environ.get("SKUA_PROMPT_MODE", "").strip().lower() == "markers":
+        print(f"[[SKUA_PROMPT]] {prompt} {suffix}:")
     answer = input(f"{prompt} {suffix}: ").strip().lower()
     if not answer:
         return default

@@ -151,15 +151,19 @@ Keybindings:
 - `b`: queue background build job for selected project
 - `s`: queue background stop job for selected project
 - `a`: queue background adapt job for selected project
-- `d`: queue background remove job for selected project
+- `d`: remove selected project (projects view) or remove selected job entry (jobs view)
 - `r`: restart selected project
 - `n`: create a new project (interactive add flow)
 - `o`: toggle selected job output viewer
 - `x`: cancel selected running job
 - `c`: clear completed jobs
+- `y`: export selected job output to `~/.config/skua/jobs/exports/`
 - `q`: quit
 
 The dashboard auto-refreshes every 2 seconds. Background job history and logs are persisted in `~/.config/skua/jobs/`.
+The bottom command bar is context-aware and changes based on whether focus is in projects, jobs, or job output view.
+Pressing `n` opens an in-dashboard wizard in the status bar (no terminal suspend): type text fields, use `←/→` or `↑/↓` for selectors, `Enter` to advance, and `Esc` to cancel.
+Background jobs now run in a PTY and can enter a `waiting_input` state when they prompt. Open the job output view and type a reply in the status bar, then press `Enter` to send input back to the running job.
 
 ### `skua clean [<name>]`
 
