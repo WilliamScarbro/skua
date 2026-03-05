@@ -157,7 +157,7 @@ Keybindings:
 - `o`: toggle selected job output viewer
 - `x`: cancel selected running job
 - `c`: clear completed jobs
-- `y`: export selected job output to `~/.config/skua/jobs/exports/`
+- `y`: export selected job output (choose save-to-file, clipboard, or both)
 - `q`: quit
 
 The dashboard auto-refreshes every 2 seconds. Background job history and logs are persisted in `~/.config/skua/jobs/`.

@@ -158,6 +158,33 @@ def _background_command(action_key: str, project_name: str) -> list[str] | None:
     return None
 
 
+def _copy_text_to_clipboard(text: str) -> tuple[bool, str]:
+    commands = []
+    if shutil.which("wl-copy"):
+        commands.append(["wl-copy"])
+    if shutil.which("xclip"):
+        commands.append(["xclip", "-selection", "clipboard"])
+    if shutil.which("xsel"):
+        commands.append(["xsel", "--clipboard", "--input"])
+    if shutil.which("pbcopy"):
+        commands.append(["pbcopy"])
+
+    if not commands:
+        return False, "no clipboard command found (wl-copy/xclip/xsel/pbcopy)"
+
+    last_err = ""
+    for cmd in commands:
+        try:
+            result = subprocess.run(cmd, input=text, text=True, capture_output=True, check=False)
+        except OSError as exc:
+            last_err = str(exc)
+            continue
+        if result.returncode == 0:
+            return True, ""
+        last_err = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+    return False, last_err or "clipboard copy failed"
+
+
 class DashboardJobManager:
     """Create, run, and persist background dashboard jobs."""
 
@@ -460,6 +487,15 @@ class DashboardJobManager:
         else:
             out.write_text("(log file not found)\n")
         return out
+
+    def output_lines(self, job: DashboardJob, max_lines: int = 5000) -> list[str]:
+        path = Path(job.log_path)
+        if not path.exists():
+            return ["(log file not found)"]
+        lines = path.read_text(errors="replace").splitlines()
+        if not lines:
+            return ["(no output yet)"]
+        return lines[-max(200, max_lines):]
 
 
 def _collect_snapshot(args) -> DashboardSnapshot:
@@ -1084,6 +1120,8 @@ def cmd_dashboard(args):
             self.task_job_id = 0
             self.task_remove_project = ""
             self.task_error = ""
+            self.task_export_options: list[str] = []
+            self.output_scroll = 0
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
 
@@ -1102,6 +1140,8 @@ def cmd_dashboard(args):
                 return action in {"run_selected", "task_cancel"}
             if self.task_mode == "remove_confirm":
                 return action in {"run_selected", "task_cancel"}
+            if self.task_mode == "export_choice":
+                return action in {"run_selected", "task_cancel", "cursor_up", "cursor_down", "task_prev_option", "task_next_option"}
             return action in {
                 "run_selected",
                 "cursor_up",
@@ -1332,11 +1372,32 @@ def cmd_dashboard(args):
             self.show_job_output = False
             self.message = f"remove confirm: type '{project_name}'"
 
+        def _start_export_choice_task(self, job: DashboardJob) -> None:
+            options = ["Save to file"]
+            if any(shutil.which(cmd) for cmd in ("wl-copy", "xclip", "xsel", "pbcopy")):
+                options.extend(["Copy to clipboard", "Save + clipboard"])
+            self.task_mode = "export_choice"
+            self.task_job_id = job.job_id
+            self.task_export_options = options
+            self.task_option_index = 0
+            self.focus = "task"
+            self.message = f"export job #{job.job_id}"
+
+        def _project_is_running(self, project_name: str) -> bool:
+            store = ConfigStore()
+            project = store.resolve_project(project_name)
+            if project is None:
+                return False
+            host = getattr(project, "host", "") or ""
+            running = get_running_skua_containers(host=host)
+            return f"skua-{project_name}" in set(running or [])
+
         def _task_cancel(self, reason: str = "new project: cancelled") -> None:
             self.task_mode = ""
             self.task_job_id = 0
             self.task_remove_project = ""
             self.task_error = ""
+            self.task_export_options = []
             if self.focus == "task":
                 self.focus = "projects" if self.snapshot.rows else "jobs"
             self.message = reason
@@ -1408,6 +1469,10 @@ def cmd_dashboard(args):
                     self.message = f"type '{target}' to confirm remove"
                     self._refresh_view()
                     return
+                if self._project_is_running(target):
+                    self.message = f"project '{target}' is running; stop it before remove"
+                    self._refresh_view()
+                    return
                 background = _background_command("remove", target)
                 if not background:
                     self.message = "remove action is unavailable"
@@ -1426,6 +1491,32 @@ def cmd_dashboard(args):
                     self.message = f"failed to queue remove {target}: {type(exc).__name__}: {exc}"
                 self._refresh_view()
                 self._request_refresh()
+                return
+            if self.task_mode == "export_choice":
+                job = next((j for j in self.jobs.jobs if j.job_id == self.task_job_id), None)
+                if job is None:
+                    self._task_cancel("export cancelled: job not found")
+                    self._refresh_view()
+                    return
+                option = self.task_export_options[self.task_option_index] if self.task_export_options else "Save to file"
+                path = self.jobs.export_output(job)
+                text = Path(path).read_text(errors="replace")
+                if option == "Save to file":
+                    self.message = f"exported job #{job.job_id} output to {path}"
+                elif option == "Copy to clipboard":
+                    ok, detail = _copy_text_to_clipboard(text)
+                    self.message = f"copied job #{job.job_id} output to clipboard" if ok else f"clipboard copy failed: {detail}"
+                else:
+                    ok, detail = _copy_text_to_clipboard(text)
+                    if ok:
+                        self.message = f"exported to {path} and copied to clipboard"
+                    else:
+                        self.message = f"exported to {path}; clipboard copy failed: {detail}"
+                self.task_mode = ""
+                self.task_job_id = 0
+                self.task_export_options = []
+                self.focus = "jobs"
+                self._refresh_view()
                 return
             if self.task_mode != "new_project":
                 return
@@ -1471,6 +1562,12 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def _task_shift_option(self, delta: int) -> None:
+            if self.task_mode == "export_choice":
+                if not self.task_export_options:
+                    return
+                self.task_option_index = (self.task_option_index + delta) % len(self.task_export_options)
+                self._refresh_view()
+                return
             step = self._current_task_step()
             if step is None or step["kind"] != "select":
                 return
@@ -1601,13 +1698,23 @@ def cmd_dashboard(args):
                     f"Job #{selected.job_id} {selected.action} {selected.project} [{selected.status}] (press o to close)",
                     style="bold",
                 )
-                log_text = Text(self.jobs.tail(selected), style="white")
+                lines = self.jobs.output_lines(selected)
+                available = max(5, (getattr(self, "size", None).height or 24) - 8)
+                max_scroll = max(0, len(lines) - available)
+                self.output_scroll = max(0, min(self.output_scroll, max_scroll))
+                window = lines[self.output_scroll:self.output_scroll + available]
+                scroll_hint = (
+                    f"lines {self.output_scroll + 1}-{self.output_scroll + len(window)} of {len(lines)}"
+                    if lines else "no output"
+                )
+                log_text = Text("\n".join(window), style="white")
                 view.update(
                     Group(
                         title,
                         focus_line,
                         self._section_header("Job Output"),
                         log_title,
+                        Text(scroll_hint, style="dim"),
                         Text(""),
                         log_text,
                     )
@@ -1693,6 +1800,24 @@ def cmd_dashboard(args):
                     if len(line) > width:
                         line = line[:width]
                     return Text(line.ljust(width), style="bold black on white")
+                if self.task_mode == "export_choice":
+                    prefix = "export output:"
+                    line = Text(prefix.ljust(width), style="bold black on white")
+                    options = self.task_export_options or ["Save to file"]
+                    rendered = Text(style="bold black on white")
+                    for i, option in enumerate(options):
+                        if i > 0:
+                            rendered.append("  |  ", style="black on white")
+                        if i == self.task_option_index:
+                            rendered.append(f"[{option}]", style="bold white on blue")
+                        else:
+                            rendered.append(option, style="bold black on white")
+                    plain = rendered.plain
+                    if len(plain) > width:
+                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
+                    elif len(plain) < width:
+                        rendered.append(" " * (width - len(plain)), style="black on white")
+                    return Group(line, rendered)
                 step = self._current_task_step()
                 steps = self._task_steps()
                 if step is None:
@@ -1758,6 +1883,12 @@ def cmd_dashboard(args):
                         ("⏎", "Confirm Remove", "bold red"),
                         ("Esc", "Cancel", "bold yellow"),
                     ]
+                if self.task_mode == "export_choice":
+                    return [
+                        ("←/→", "Choose", "bold yellow"),
+                        ("⏎", "Export", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
                 return [
                     ("←/→", "Select", "bold yellow"),
                     ("type", "Edit Text", "bold cyan"),
@@ -1768,7 +1899,9 @@ def cmd_dashboard(args):
                 ("↑/↓", "Move", "bold white"),
             ]
             if self.show_job_output:
-                return nav + [
+                return [
+                    ("↑/↓", "Scroll Output", "bold white"),
+                    ("←/→", "Switch Job", "bold yellow"),
                     ("o", "Close Output", "bold cyan"),
                     ("d", "Remove Job", "bold red"),
                     ("y", "Export Output", "bold blue"),
@@ -1972,8 +2105,8 @@ def cmd_dashboard(args):
             project_count = len(self.snapshot.rows)
             visible_jobs = min(len(jobs_view), 10)
             if self.show_job_output:
-                if jobs_view and self.selected_job > 0:
-                    self.selected_job -= 1
+                if self.output_scroll > 0:
+                    self.output_scroll -= 1
                 self.focus = "jobs"
                 self._refresh_view()
                 return
@@ -2016,8 +2149,13 @@ def cmd_dashboard(args):
             project_count = len(self.snapshot.rows)
             visible_jobs = min(len(jobs_view), 10)
             if self.show_job_output:
-                if jobs_view and self.selected_job < visible_jobs - 1:
-                    self.selected_job += 1
+                if jobs_view:
+                    selected = jobs_view[self.selected_job]
+                    lines = self.jobs.output_lines(selected)
+                    available = max(5, (getattr(self, "size", None).height or 24) - 8)
+                    max_scroll = max(0, len(lines) - available)
+                    if self.output_scroll < max_scroll:
+                        self.output_scroll += 1
                 self.focus = "jobs"
                 self._refresh_view()
                 return
@@ -2099,6 +2237,10 @@ def cmd_dashboard(args):
             project_name = self._selected_project_name()
             if not project_name:
                 return
+            if self._project_is_running(project_name):
+                self.message = f"project '{project_name}' is running; stop it before remove"
+                self._refresh_view()
+                return
             self._start_remove_confirm_task(project_name)
             self._refresh_view()
 
@@ -2133,6 +2275,8 @@ def cmd_dashboard(args):
             self.selected_job = min(self.selected_job, len(jobs_view) - 1)
             self.focus = "jobs"
             self.show_job_output = not self.show_job_output
+            if self.show_job_output:
+                self.output_scroll = 0
             job = jobs_view[self.selected_job]
             if self.show_job_output and job.status == "waiting_input":
                 self._start_job_input_task(job)
@@ -2184,8 +2328,7 @@ def cmd_dashboard(args):
                 return
             self.selected_job = min(self.selected_job, len(jobs_view) - 1)
             job = jobs_view[self.selected_job]
-            path = self.jobs.export_output(job)
-            self.message = f"exported job #{job.job_id} output to {path}"
+            self._start_export_choice_task(job)
             self._refresh_view()
 
         def action_remove_job(self) -> None:
@@ -2219,11 +2362,25 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_task_prev_option(self) -> None:
+            if self.show_job_output and not self.task_mode:
+                jobs_view = self.jobs.list_for_view()
+                if jobs_view:
+                    self.selected_job = max(0, self.selected_job - 1)
+                    self.output_scroll = 0
+                    self._refresh_view()
+                return
             if not self.task_mode:
                 return
             self._task_shift_option(-1)
 
         def action_task_next_option(self) -> None:
+            if self.show_job_output and not self.task_mode:
+                jobs_view = self.jobs.list_for_view()
+                if jobs_view:
+                    self.selected_job = min(min(len(jobs_view), 10) - 1, self.selected_job + 1)
+                    self.output_scroll = 0
+                    self._refresh_view()
+                return
             if not self.task_mode:
                 return
             self._task_shift_option(1)
