@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua dashboard — live interactive project dashboard."""
 
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +51,275 @@ class DashboardSnapshot:
     columns: list
     rows: list
     summary: list
+
+
+@dataclass
+class DashboardJob:
+    """Persistent metadata for a dashboard background job."""
+
+    job_id: int
+    action: str
+    project: str
+    command: list[str]
+    status: str
+    created_at: str
+    started_at: str
+    ended_at: str
+    return_code: int | None
+    pid: int | None
+    log_path: str
+    detail: str
+
+    def to_dict(self) -> dict:
+        return {
+            "job_id": self.job_id,
+            "action": self.action,
+            "project": self.project,
+            "command": list(self.command),
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "return_code": self.return_code,
+            "pid": self.pid,
+            "log_path": self.log_path,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DashboardJob":
+        return cls(
+            job_id=int(data.get("job_id", 0)),
+            action=str(data.get("action", "")),
+            project=str(data.get("project", "")),
+            command=[str(x) for x in (data.get("command") or [])],
+            status=str(data.get("status", "failed")),
+            created_at=str(data.get("created_at", "")),
+            started_at=str(data.get("started_at", "")),
+            ended_at=str(data.get("ended_at", "")),
+            return_code=data.get("return_code"),
+            pid=data.get("pid"),
+            log_path=str(data.get("log_path", "")),
+            detail=str(data.get("detail", "")),
+        )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _format_age(started_at: str) -> str:
+    if not started_at:
+        return "-"
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "-"
+    delta = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    return f"{delta // 3600}h"
+
+
+def _shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def _background_command(action_key: str, project_name: str) -> list[str] | None:
+    if action_key == "build":
+        return [sys.executable, "-m", "skua", "build", project_name]
+    if action_key == "adapt":
+        return [sys.executable, "-m", "skua", "adapt", project_name, "--apply-only", "--force"]
+    if action_key == "stop":
+        return [sys.executable, "-m", "skua", "stop", project_name, "--force"]
+    if action_key == "remove":
+        return [sys.executable, "-m", "skua", "remove", project_name]
+    return None
+
+
+class DashboardJobManager:
+    """Create, run, and persist background dashboard jobs."""
+
+    def __init__(self, config_dir: Path | None = None, max_jobs: int = 200):
+        base_dir = config_dir or ConfigStore().config_dir
+        self.jobs_dir = Path(base_dir) / "jobs"
+        self.logs_dir = self.jobs_dir / "logs"
+        self.state_file = self.jobs_dir / "jobs.json"
+        self.max_jobs = max(20, int(max_jobs))
+        self.jobs: list[DashboardJob] = []
+        self._processes: dict[int, subprocess.Popen] = {}
+        self._next_id = 1
+        self._load()
+
+    def _ensure_dirs(self) -> None:
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load(self) -> None:
+        self._ensure_dirs()
+        if not self.state_file.exists():
+            return
+        try:
+            data = json.loads(self.state_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        items = data.get("jobs", []) if isinstance(data, dict) else []
+        loaded = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                job = DashboardJob.from_dict(raw)
+            except Exception:
+                continue
+            if job.job_id <= 0:
+                continue
+            if job.status in ("queued", "running"):
+                job.status = "orphaned"
+                if not job.ended_at:
+                    job.ended_at = _utc_now_iso()
+                if not job.detail:
+                    job.detail = "Dashboard restarted before this job completed."
+            loaded.append(job)
+        self.jobs = loaded[-self.max_jobs:]
+        self._next_id = max((job.job_id for job in self.jobs), default=0) + 1
+
+    def _persist(self) -> None:
+        self._ensure_dirs()
+        payload = {
+            "version": 1,
+            "jobs": [job.to_dict() for job in self.jobs[-self.max_jobs:]],
+        }
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=False))
+        tmp.replace(self.state_file)
+
+    def _append_log_header(self, path: Path, job: DashboardJob) -> None:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"[job {job.job_id}] action={job.action} project={job.project}\n")
+            f.write(f"[job {job.job_id}] started={job.started_at}\n")
+            f.write(f"[job {job.job_id}] command={_shell_join(job.command)}\n\n")
+
+    def _append_log_footer(self, path: Path, job: DashboardJob) -> None:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"\n[job {job.job_id}] ended={job.ended_at} status={job.status}")
+            if job.return_code is not None:
+                f.write(f" return_code={job.return_code}")
+            f.write("\n")
+
+    def enqueue(self, action_key: str, project_name: str, command: list[str] | None = None) -> DashboardJob:
+        cmd = command if command is not None else _background_command(action_key, project_name)
+        if not cmd:
+            raise ValueError(f"Action does not support background execution: {action_key}")
+
+        now = _utc_now_iso()
+        log_path = self.logs_dir / f"{self._next_id:06d}-{action_key}-{project_name}.log"
+        job = DashboardJob(
+            job_id=self._next_id,
+            action=action_key,
+            project=project_name,
+            command=list(cmd),
+            status="queued",
+            created_at=now,
+            started_at=now,
+            ended_at="",
+            return_code=None,
+            pid=None,
+            log_path=str(log_path),
+            detail="",
+        )
+        self._next_id += 1
+        self.jobs.append(job)
+        self.jobs = self.jobs[-self.max_jobs:]
+
+        try:
+            self._append_log_header(log_path, job)
+            with log_path.open("a", encoding="utf-8") as log_file:
+                proc = subprocess.Popen(
+                    job.command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    start_new_session=True,
+                )
+            job.pid = proc.pid
+            job.status = "running"
+            self._processes[job.job_id] = proc
+        except Exception as exc:
+            job.status = "failed"
+            job.ended_at = _utc_now_iso()
+            job.detail = f"{type(exc).__name__}: {exc}"
+            self._append_log_footer(log_path, job)
+        self._persist()
+        return job
+
+    def poll(self) -> bool:
+        changed = False
+        for job in self.jobs:
+            if job.status != "running":
+                continue
+            proc = self._processes.get(job.job_id)
+            if proc is None:
+                continue
+            rc = proc.poll()
+            if rc is None:
+                continue
+            job.return_code = rc
+            job.ended_at = _utc_now_iso()
+            job.status = "success" if rc == 0 else "failed"
+            self._append_log_footer(Path(job.log_path), job)
+            self._processes.pop(job.job_id, None)
+            changed = True
+        if changed:
+            self._persist()
+        return changed
+
+    def cancel(self, job_id: int) -> bool:
+        for job in self.jobs:
+            if job.job_id != job_id or job.status != "running":
+                continue
+            proc = self._processes.get(job_id)
+            if proc is not None:
+                proc.terminate()
+            elif job.pid:
+                try:
+                    os.kill(int(job.pid), signal.SIGTERM)
+                except OSError:
+                    pass
+            job.status = "canceled"
+            job.ended_at = _utc_now_iso()
+            job.detail = "Canceled from dashboard."
+            self._append_log_footer(Path(job.log_path), job)
+            self._processes.pop(job_id, None)
+            self._persist()
+            return True
+        return False
+
+    def clear_completed(self) -> int:
+        before = len(self.jobs)
+        self.jobs = [job for job in self.jobs if job.status in ("queued", "running")]
+        removed = before - len(self.jobs)
+        if removed:
+            self._persist()
+        return removed
+
+    def list_for_view(self) -> list[DashboardJob]:
+        return list(reversed(self.jobs))
+
+    def summary(self) -> str:
+        running = sum(1 for j in self.jobs if j.status == "running")
+        failed = sum(1 for j in self.jobs if j.status in ("failed", "orphaned"))
+        done = sum(1 for j in self.jobs if j.status in ("success", "failed", "canceled", "orphaned"))
+        return f"Jobs: {running} running, {failed} failed/orphaned, {done} completed"
+
+    def tail(self, job: DashboardJob, max_lines: int = 200) -> str:
+        path = Path(job.log_path)
+        if not path.exists():
+            return "(log file not found)"
+        lines = path.read_text(errors="replace").splitlines()
+        return "\n".join(lines[-max(20, max_lines):]) if lines else "(no output yet)"
 
 
 def _collect_snapshot(args) -> DashboardSnapshot:
@@ -618,6 +894,7 @@ def cmd_dashboard(args):
         BINDINGS = [
             Binding("q", "quit", "Quit"),
             Binding("h", "toggle_help", "Help"),
+            Binding("tab", "toggle_focus", "Focus"),
             Binding("up,k", "cursor_up", "Up"),
             Binding("down,j", "cursor_down", "Down"),
             Binding("enter", "run_selected", "Run"),
@@ -627,6 +904,9 @@ def cmd_dashboard(args):
             Binding("d", "remove_selected", "Remove"),
             Binding("r", "restart_selected", "Restart"),
             Binding("n", "new_project", "New"),
+            Binding("o", "open_job_output", "Output"),
+            Binding("x", "cancel_job", "Cancel Job"),
+            Binding("c", "clear_jobs", "Clear Jobs"),
         ]
 
         def __init__(self, dashboard_args):
@@ -634,8 +914,12 @@ def cmd_dashboard(args):
             self.dashboard_args = dashboard_args
             self.snapshot = DashboardSnapshot(columns=[], rows=[], summary=[])
             self.selected = 0
+            self.selected_job = 0
+            self.focus = "projects"
+            self.show_job_output = False
             self.show_help = False
             self.message = ""
+            self.jobs = DashboardJobManager()
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
 
@@ -648,8 +932,11 @@ def cmd_dashboard(args):
             self.set_interval(2.0, self._request_refresh)
 
         def _request_refresh(self) -> None:
+            jobs_changed = self.jobs.poll()
             with self._refresh_lock:
                 if self._refresh_inflight:
+                    if jobs_changed:
+                        self._refresh_view()
                     return
                 self._refresh_inflight = True
             thread = threading.Thread(target=self._refresh_worker, daemon=True)
@@ -698,19 +985,41 @@ def cmd_dashboard(args):
             view = self.query_one("#dashboard-view", Static)
             title = Text("skua dashboard (auto-refresh: 2s)", style="bold")
             message = Text(self.message) if self.message else Text("")
+            jobs_view = self.jobs.list_for_view()
+            if jobs_view:
+                self.selected_job = min(max(0, self.selected_job), len(jobs_view) - 1)
+            else:
+                self.selected_job = 0
+            focus_line = Text(
+                f"Focus: {self.focus} | {self.jobs.summary()}",
+                style="cyan bold" if self.focus == "jobs" else "dim",
+            )
 
             if self.show_help:
                 help_text = Text(
                     "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
-                    "      h toggle help | q quit\n\n"
-                    "Actions run for the selected project and then return to the dashboard."
+                    "      tab/j focus projects/jobs | o output | x cancel job | c clear completed jobs\n"
+                    "      h toggle help | q quit"
                 )
-                view.update(Group(title, message, help_text))
+                view.update(Group(title, message, focus_line, help_text))
+                return
+
+            if self.show_job_output and jobs_view:
+                selected = jobs_view[self.selected_job]
+                log_title = Text(
+                    f"Job #{selected.job_id} {selected.action} {selected.project} [{selected.status}] (press o to close)",
+                    style="bold",
+                )
+                log_text = Text(self.jobs.tail(selected), style="white")
+                view.update(Group(title, message, focus_line, log_title, Text(""), log_text))
                 return
 
             if not self.snapshot.rows:
-                summary = Text("\n".join(self.snapshot.summary + ["Press q to quit. Press h for help."]))
-                view.update(Group(title, message, summary))
+                divider = Text(self._divider_line(), style="dim")
+                summary = Text("\n".join(self.snapshot.summary))
+                hint = Text("Press q to quit. Press h for help.", style="dim")
+                jobs_table = self._render_jobs_table(jobs_view)
+                view.update(Group(title, message, focus_line, Text(""), divider, summary, Text(""), jobs_table, Text(""), divider, hint))
                 return
 
             table = Table(box=None, show_edge=False, pad_edge=False)
@@ -718,21 +1027,175 @@ def cmd_dashboard(args):
                 table.add_column(col_name, width=col_width, overflow="ellipsis", no_wrap=True)
             for idx, row in enumerate(self.snapshot.rows):
                 style = "reverse" if idx == self.selected else ""
-                table.add_row(*[str(cell) for cell in row["cells"]], style=style)
+                rendered_cells = []
+                for col_index, cell in enumerate(row["cells"]):
+                    col_name = self.snapshot.columns[col_index][0] if col_index < len(self.snapshot.columns) else ""
+                    rendered_cells.append(Text(str(cell), style=self._cell_style(col_name, str(cell))))
+                table.add_row(*rendered_cells, style=style)
 
-            summary = Text("\n".join(self.snapshot.summary + ["Press h for help. Press q to quit."]))
-            view.update(Group(title, message, table, summary))
+            summary = Text()
+            for idx, line in enumerate(self.snapshot.summary):
+                summary.append(line, style=self._summary_style(line))
+                if idx < len(self.snapshot.summary) - 1:
+                    summary.append("\n")
+            jobs_table = self._render_jobs_table(jobs_view)
+            divider = Text(self._divider_line(), style="dim")
+            hint = Text("Press h for help. Press q to quit.", style="dim")
+            view.update(Group(title, message, focus_line, table, Text(""), divider, summary, Text(""), jobs_table, Text(""), divider, hint))
+
+        def _render_jobs_table(self, jobs_view: list[DashboardJob]):
+            table = Table(box=None, show_edge=False, pad_edge=False)
+            table.add_column("JOBS", width=6)
+            table.add_column("ACTION", width=8)
+            table.add_column("PROJECT", width=18, overflow="ellipsis", no_wrap=True)
+            table.add_column("STATUS", width=10)
+            table.add_column("AGE", width=6)
+            table.add_column("EXIT", width=6)
+            if not jobs_view:
+                table.add_row("-", "-", "-", "none", "-", "-", style="dim")
+                return table
+            for idx, job in enumerate(jobs_view[:10]):
+                style = "reverse" if self.focus == "jobs" and idx == self.selected_job else ""
+                rc = "-" if job.return_code is None else str(job.return_code)
+                status_style = self._job_status_style(job.status)
+                table.add_row(
+                    str(job.job_id),
+                    job.action,
+                    job.project,
+                    Text(job.status, style=status_style),
+                    _format_age(job.started_at),
+                    rc,
+                    style=style,
+                )
+            return table
+
+        @staticmethod
+        def _job_status_style(status: str) -> str:
+            if status in ("running", "queued"):
+                return "yellow bold"
+            if status in ("success",):
+                return "green bold"
+            if status in ("failed", "orphaned"):
+                return "red bold"
+            if status in ("canceled",):
+                return "magenta bold"
+            return ""
+
+        @staticmethod
+        def _summary_style(text: str) -> str:
+            lowered = text.lower()
+            if "pending" in lowered or "(a)" in lowered or "(b)" in lowered or "restart is needed" in lowered:
+                return "yellow bold"
+            if "missing" in lowered or "failed" in lowered:
+                return "red bold"
+            return ""
+
+        @staticmethod
+        def _cell_style(column: str, value: str) -> str:
+            value = str(value or "")
+            if column == "NAME":
+                return "white bold"
+            if column == "HOST":
+                if value.startswith("SSH:"):
+                    return "blue bold"
+                return "blue"
+            if column == "SOURCE":
+                if value.startswith("GITHUB:"):
+                    return "green"
+                if value.startswith("DIR:"):
+                    return "magenta"
+                return "yellow"
+            if column == "GIT":
+                if value in ("CURRENT",):
+                    return "green"
+                if value in ("AHEAD",):
+                    return "blue bold"
+                if value in ("BEHIND", "DIVERGED"):
+                    return "yellow bold"
+                if value in ("UNCLEAN",):
+                    return "red bold"
+                return "dim"
+            if column == "ACTIVITY":
+                if value in ("-", ""):
+                    return "dim"
+                if value in ("done",):
+                    return "green bold"
+                if value in ("idle",):
+                    return "blue"
+                if value in ("processing", "thinking") or value.startswith("think:"):
+                    return "yellow bold"
+                if set(value) <= {"X"}:
+                    if len(value) >= 4:
+                        return "yellow bold"
+                    if len(value) >= 2:
+                        return "green bold"
+                    return "blue bold"
+                if value in ("?",):
+                    return "red bold"
+                return "blue"
+            if column == "STATUS":
+                if "!" in value or value.startswith("stale") or value.endswith("*"):
+                    return "yellow bold"
+                if value.startswith("running"):
+                    return "green bold"
+                if value.startswith("built"):
+                    return "blue"
+                if value.startswith("missing") or value.startswith("unreachable"):
+                    return "red bold"
+                return ""
+            if column in ("IMAGE", "RUNNING-IMAGE"):
+                if "(A)" in value or "(B)" in value:
+                    return "magenta bold"
+                if value == "-":
+                    return "dim"
+                return ""
+            if column == "AGENT":
+                return "cyan bold"
+            if column == "CREDENTIAL":
+                if value == "(none)":
+                    return "dim"
+                return "cyan"
+            if column == "SECURITY":
+                if value in ("strict", "proxy"):
+                    return "green bold"
+                return "yellow"
+            if column == "NETWORK":
+                if value in ("none",):
+                    return "yellow bold"
+                return "blue"
+            return ""
+
+        def _divider_line(self) -> str:
+            width = getattr(self, "size", None).width if getattr(self, "size", None) else 80
+            return "─" * max(20, min(120, width - 2))
 
         def action_toggle_help(self) -> None:
             self.show_help = not self.show_help
             self._refresh_view()
 
+        def action_toggle_focus(self) -> None:
+            self.focus = "jobs" if self.focus == "projects" else "projects"
+            self.show_job_output = False
+            self._refresh_view()
+
         def action_cursor_up(self) -> None:
+            if self.focus == "jobs":
+                jobs_view = self.jobs.list_for_view()
+                if jobs_view:
+                    self.selected_job = max(0, self.selected_job - 1)
+                    self._refresh_view()
+                return
             if self.snapshot.rows:
                 self.selected = max(0, self.selected - 1)
                 self._refresh_view()
 
         def action_cursor_down(self) -> None:
+            if self.focus == "jobs":
+                jobs_view = self.jobs.list_for_view()
+                if jobs_view:
+                    self.selected_job = min(len(jobs_view) - 1, self.selected_job + 1)
+                    self._refresh_view()
+                return
             if self.snapshot.rows:
                 self.selected = min(len(self.snapshot.rows) - 1, self.selected + 1)
                 self._refresh_view()
@@ -741,11 +1204,25 @@ def cmd_dashboard(args):
             project_name = self._selected_project_name()
             if not project_name:
                 return
-            self.message = _run_action_interactive(action_key, project_name, suspend=self.suspend)
+            background = _background_command(action_key, project_name)
+            if background is not None:
+                try:
+                    job = self.jobs.enqueue(action_key, project_name, command=background)
+                    self.message = f"queued job #{job.job_id}: {action_key} {project_name}"
+                    self.focus = "jobs"
+                    self.show_job_output = False
+                    self.selected_job = 0
+                except Exception as exc:
+                    self.message = f"failed to queue {action_key} {project_name}: {type(exc).__name__}: {exc}"
+            else:
+                self.message = _run_action_interactive(action_key, project_name, suspend=self.suspend)
             self._refresh_view()
             self._request_refresh()
 
         def action_run_selected(self) -> None:
+            if self.focus == "jobs":
+                self.action_open_job_output()
+                return
             self._run_selected("run")
 
         def action_build_selected(self) -> None:
@@ -767,5 +1244,36 @@ def cmd_dashboard(args):
             self.message = _run_add_project_interactive(suspend=self.suspend)
             self._refresh_view()
             self._request_refresh()
+
+        def action_open_job_output(self) -> None:
+            jobs_view = self.jobs.list_for_view()
+            if not jobs_view:
+                self.message = "no jobs to display"
+                self._refresh_view()
+                return
+            self.selected_job = min(self.selected_job, len(jobs_view) - 1)
+            self.focus = "jobs"
+            self.show_job_output = not self.show_job_output
+            self._refresh_view()
+
+        def action_cancel_job(self) -> None:
+            jobs_view = self.jobs.list_for_view()
+            if not jobs_view:
+                self.message = "no running job selected"
+                self._refresh_view()
+                return
+            self.selected_job = min(self.selected_job, len(jobs_view) - 1)
+            job = jobs_view[self.selected_job]
+            if self.jobs.cancel(job.job_id):
+                self.message = f"canceled job #{job.job_id}"
+            else:
+                self.message = f"job #{job.job_id} is not running"
+            self._refresh_view()
+
+        def action_clear_jobs(self) -> None:
+            removed = self.jobs.clear_completed()
+            self.message = f"cleared {removed} completed job(s)"
+            self.show_job_output = False
+            self._refresh_view()
 
     DashboardApp(args).run()

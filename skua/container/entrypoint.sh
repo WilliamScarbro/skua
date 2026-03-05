@@ -245,6 +245,11 @@ tmux quickstart:
   Ctrl-b c      New window
   Ctrl-b n/p    Next/prev window
   Ctrl-b w      Window picker
+
+Agent commands:
+  Start agent: ${AGENT_NAME}
+  Skip permissions: ${AGENT_NAME}-dsp
+
 ============================================
 EOF
 
@@ -262,25 +267,25 @@ if [ ${#NEEDS_LOGIN[@]} -gt 0 ]; then
     echo ""
 fi
 
-echo "Usage:"
-if [ "$AGENT_NAME" = "claude" ]; then
-    echo "  claude         -> Start Claude"
-    echo "  claude-dsp     -> Start with --dangerously-skip-permissions"
-elif [ "$AGENT_NAME" = "codex" ]; then
-    echo "  codex          -> Start Codex"
-    echo "  codex-dsp      -> Start with --dangerously-bypass-approvals-and-sandbox"
-else
-    echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
-fi
-echo "  ~/.entrypoint.d/check_monitoring.sh -> Verify tcpdump monitoring permissions"
-if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
-    echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
-    echo "  tmux detach: Ctrl-b then d"
-fi
-echo ""
-echo "============================================"
-echo ""
-
+#echo "Usage:"
+#if [ "$AGENT_NAME" = "claude" ]; then
+#    echo "  claude         -> Start Claude"
+#    echo "  claude-dsp     -> Start with --dangerously-skip-permissions"
+#elif [ "$AGENT_NAME" = "codex" ]; then
+#    echo "  codex          -> Start Codex"
+#    echo "  codex-dsp      -> Start with --dangerously-bypass-approvals-and-sandbox"
+#else
+#    echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
+#fi
+#echo "  ~/.entrypoint.d/check_monitoring.sh -> Verify tcpdump monitoring permissions"
+#if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
+#    echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
+#    echo "  tmux detach: Ctrl-b then d"
+#fi
+#echo ""
+#echo "============================================"
+#echo ""
+#
 # Drop into interactive shell or run provided command
 if [ $# -eq 0 ]; then
     if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then

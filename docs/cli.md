@@ -145,17 +145,21 @@ skua dashboard --local
 
 Keybindings:
 - `h`: toggle help
-- `Up` / `Down`: move selection
+- `Tab`: switch focus between projects and jobs
+- `Up` / `Down`: move selection in focused pane
 - `Enter`: run selected project
-- `b`: build selected project image
-- `s`: stop selected project
-- `a`: adapt selected project
-- `d`: remove selected project
+- `b`: queue background build job for selected project
+- `s`: queue background stop job for selected project
+- `a`: queue background adapt job for selected project
+- `d`: queue background remove job for selected project
 - `r`: restart selected project
 - `n`: create a new project (interactive add flow)
+- `o`: toggle selected job output viewer
+- `x`: cancel selected running job
+- `c`: clear completed jobs
 - `q`: quit
 
-The dashboard auto-refreshes every 2 seconds.
+The dashboard auto-refreshes every 2 seconds. Background job history and logs are persisted in `~/.config/skua/jobs/`.
 
 ### `skua clean [<name>]`
 
