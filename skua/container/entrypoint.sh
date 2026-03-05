@@ -247,7 +247,7 @@ tmux quickstart:
   Ctrl-b w      Window picker
 
 Agent commands:
-  Start agent: ${AGENT_NAME}
+  Start agent:      ${AGENT_NAME}
   Skip permissions: ${AGENT_NAME}-dsp
 
 ============================================
