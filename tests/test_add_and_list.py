@@ -546,3 +546,38 @@ class TestAgentActivityFormatting(unittest.TestCase):
         )
 
         self.assertEqual("processing", _agent_activity("skua-demo"))
+
+
+class TestGitStatusMonitoring(unittest.TestCase):
+    def test_git_status_monitors_bind_directory_when_git_repo(self):
+        from skua.commands import list_cmd
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir)
+            (repo_dir / ".git").mkdir()
+            project = Project(name="demo", directory=str(repo_dir), repo="", host="")
+            store = mock.Mock()
+
+            with mock.patch.object(list_cmd.subprocess, "run") as mock_run:
+                mock_run.side_effect = [
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                    SimpleNamespace(returncode=0, stdout="", stderr=""),
+                    SimpleNamespace(returncode=0, stdout="0 0\n", stderr=""),
+                ]
+
+                status = list_cmd._git_status(project, store)
+
+        self.assertEqual("CURRENT", status)
+        self.assertEqual(3, mock_run.call_count)
+
+    def test_git_status_skips_bind_directory_when_not_git_repo(self):
+        from skua.commands import list_cmd
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Project(name="demo", directory=tmpdir, repo="", host="")
+            store = mock.Mock()
+            with mock.patch.object(list_cmd.subprocess, "run") as mock_run:
+                status = list_cmd._git_status(project, store)
+
+        self.assertEqual("", status)
+        mock_run.assert_not_called()

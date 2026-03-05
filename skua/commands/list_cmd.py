@@ -101,24 +101,20 @@ def _has_pending_adapt_request(project) -> bool:
 
 
 def _git_status(project, store: ConfigStore) -> str:
-    """Return git status for repo projects: BEHIND/AHEAD/UNCLEAN/CURRENT."""
-    if not project or not getattr(project, "repo", ""):
-        return ""
-    if getattr(project, "host", ""):
+    """Return git status for local git projects: BEHIND/AHEAD/UNCLEAN/CURRENT."""
+    if not project or getattr(project, "host", ""):
         return ""
 
     repo_dir = None
     if project.directory:
         candidate = Path(project.directory).expanduser()
-        if candidate.is_dir():
+        if candidate.is_dir() and (candidate / ".git").exists():
             repo_dir = candidate
-    if repo_dir is None:
+    if repo_dir is None and getattr(project, "repo", ""):
         candidate = store.repo_dir(project.name)
-        if candidate.is_dir():
+        if candidate.is_dir() and (candidate / ".git").exists():
             repo_dir = candidate
     if repo_dir is None:
-        return ""
-    if not (repo_dir / ".git").exists():
         return ""
 
     try:
