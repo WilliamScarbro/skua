@@ -561,15 +561,11 @@ class TestBuildCommandImageDrift(unittest.TestCase):
         return store, project
 
     @mock.patch("skua.commands.build.build_image")
-    @mock.patch(
-        "skua.commands.build.floating_agent_update_available",
-        return_value=(True, "codex client update available (0.20.0 -> 0.21.0)"),
-    )
-    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_rebuild_needed")
     @mock.patch("skua.commands.build.image_exists")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_floating_agent_install_forces_cache_busting_rebuild(
-        self, MockStore, mock_exists, mock_match, _mock_update_check, mock_build
+        self, MockStore, mock_exists, mock_rebuild_needed, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -583,22 +579,22 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             store.refresh_agent_preset = mock.Mock(return_value=True)
             MockStore.return_value = store
             mock_exists.return_value = True
+            mock_rebuild_needed.return_value = (True, True, "codex client update available (0.20.0 -> 0.21.0)")
             mock_build.return_value = (True, "")
 
-            cmd_build(argparse.Namespace(name="proj", verbose=False))
+            cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
 
-            mock_match.assert_not_called()
             mock_build.assert_called_once()
             self.assertTrue(mock_build.call_args.kwargs["pull"])
             self.assertTrue(mock_build.call_args.kwargs["no_cache"])
             store.refresh_agent_preset.assert_called_once()
 
     @mock.patch("skua.commands.build.build_image")
-    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_rebuild_needed")
     @mock.patch("skua.commands.build.image_exists")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_rebuilds_existing_image_when_context_drifted(
-        self, MockStore, mock_exists, mock_match, mock_build
+        self, MockStore, mock_exists, mock_rebuild_needed, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -606,19 +602,19 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             MockStore.return_value = store
             store.resolve_project.return_value = project
             mock_exists.return_value = True
-            mock_match.return_value = False
+            mock_rebuild_needed.return_value = (True, False, "build context changed")
             mock_build.return_value = (True, "")
 
-            cmd_build(argparse.Namespace(name="proj", verbose=False))
+            cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
             mock_build.assert_called_once()
-            mock_match.assert_called_once()
+            mock_rebuild_needed.assert_called_once()
 
     @mock.patch("skua.commands.build.build_image")
-    @mock.patch("skua.commands.build.image_matches_build_context")
+    @mock.patch("skua.commands.build.image_rebuild_needed")
     @mock.patch("skua.commands.build.image_exists")
     @mock.patch("skua.commands.build.ConfigStore")
     def test_skips_rebuild_when_existing_image_matches_context(
-        self, MockStore, mock_exists, mock_match, mock_build
+        self, MockStore, mock_exists, mock_rebuild_needed, mock_build
     ):
         from skua.commands.build import cmd_build
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -626,12 +622,12 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             MockStore.return_value = store
             store.resolve_project.return_value = project
             mock_exists.return_value = True
-            mock_match.return_value = True
+            mock_rebuild_needed.return_value = (False, False, "")
             mock_build.return_value = (True, "")
 
-            cmd_build(argparse.Namespace(name="proj", verbose=False))
+            cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
             mock_build.assert_not_called()
-            mock_match.assert_called_once()
+            mock_rebuild_needed.assert_called_once()
 
 
 class TestAgentInstallRefresh(unittest.TestCase):
@@ -703,6 +699,36 @@ class TestAgentInstallRefresh(unittest.TestCase):
         docker_cmd = mock_run.call_args_list[0].args[0]
         self.assertIn("--pull", docker_cmd)
         self.assertIn("--no-cache", docker_cmd)
+
+    @mock.patch("skua.docker.image_exists", return_value=False)
+    def test_image_rebuild_needed_when_image_missing(self, _mock_exists):
+        from skua.docker import image_rebuild_needed
+
+        needs_rebuild, force_refresh, reason = image_rebuild_needed("skua-base-codex", Path("/tmp"))
+        self.assertTrue(needs_rebuild)
+        self.assertFalse(force_refresh)
+        self.assertIn("missing", reason)
+
+    @mock.patch("skua.docker.floating_agent_update_available", return_value=(True, "codex client update available"))
+    @mock.patch("skua.docker.agent_install_uses_floating_version", return_value=True)
+    @mock.patch("skua.docker.image_exists", return_value=True)
+    def test_image_rebuild_needed_when_floating_client_updates(
+        self, _mock_exists, _mock_floating, _mock_update
+    ):
+        from skua.docker import image_rebuild_needed
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        needs_rebuild, force_refresh, reason = image_rebuild_needed(
+            "skua-base-codex",
+            Path("/tmp"),
+            agent=agent,
+        )
+        self.assertTrue(needs_rebuild)
+        self.assertTrue(force_refresh)
+        self.assertIn("update", reason)
 
 
 class TestContainerAttachCommand(unittest.TestCase):

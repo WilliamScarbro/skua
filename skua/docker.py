@@ -386,6 +386,41 @@ def floating_agent_update_available(image_name: str, agent: AgentConfig = None) 
     return False, ""
 
 
+def image_rebuild_needed(
+    image_name: str,
+    container_dir: Path | None,
+    security: SecurityProfile = None,
+    agent: AgentConfig = None,
+    base_image: str = "debian:bookworm-slim",
+    extra_packages: list = None,
+    extra_commands: list = None,
+) -> tuple:
+    """Return (needs_rebuild, force_refresh, reason) for an image preflight check."""
+    if not image_exists(image_name):
+        return True, False, "image is missing"
+
+    if agent_install_uses_floating_version(agent):
+        refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
+        if refresh_needed:
+            return True, True, refresh_reason or "floating client update available"
+
+    if container_dir is None:
+        return False, False, ""
+
+    if not image_matches_build_context(
+        image_name=image_name,
+        container_dir=container_dir,
+        security=security,
+        agent=agent,
+        base_image=base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    ):
+        return True, False, "build context changed"
+
+    return False, False, ""
+
+
 def base_image_for_agent(default_base_image: str, agent: AgentConfig = None) -> str:
     """Resolve the base image for a specific agent."""
     if not agent:

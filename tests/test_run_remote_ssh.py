@@ -77,7 +77,7 @@ class TestRemoteDockerSshPreflight(unittest.TestCase):
                     with mock.patch("skua.commands.run.is_container_running", return_value=True):
                         with mock.patch("skua.commands.run.exec_into_container"):
                             with mock.patch("builtins.input", return_value="n"):
-                                cmd_run(SimpleNamespace(name="qar"))
+                                cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                 mock_preflight.assert_called_once_with("docker.example.com")
 
 
@@ -239,7 +239,7 @@ class TestRemoteDockerTransportFallback(unittest.TestCase):
                     with mock.patch("skua.commands.run.is_container_running", return_value=True):
                         with mock.patch("skua.commands.run.exec_into_container"):
                             with mock.patch("builtins.input", return_value="n"):
-                                cmd_run(SimpleNamespace(name="qar"))
+                                cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                 mock_transport.assert_called_once_with("docker.example.com")
 
 
@@ -395,16 +395,15 @@ class TestRemoteRunImageRefresh(unittest.TestCase):
                             with mock.patch("skua.commands.run.image_name_for_project", return_value="skua-base-codex"):
                                 with mock.patch("skua.commands.run.resolve_project_image_inputs", return_value=("debian:bookworm-slim", [], [])):
                                     with mock.patch("skua.commands.run.image_exists", return_value=True):
-                                        with mock.patch("skua.commands.run.agent_install_uses_floating_version", return_value=False):
-                                            with mock.patch("skua.commands.run.image_matches_build_context", return_value=False):
-                                                with mock.patch("skua.commands.run.build_image", return_value=(True, "")) as mock_build:
-                                                    with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
-                                                        with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
-                                                            with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
-                                                                with mock.patch("skua.commands.run.start_container", return_value=True):
-                                                                    with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
-                                                                        with mock.patch("skua.commands.run.exec_into_container"):
-                                                                            cmd_run(SimpleNamespace(name="qar"))
+                                        with mock.patch("skua.commands.run.image_rebuild_needed", return_value=(True, False, "build context changed")):
+                                            with mock.patch("skua.commands.run.build_image", return_value=(True, "")) as mock_build:
+                                                with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
+                                                    with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
+                                                        with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
+                                                            with mock.patch("skua.commands.run.start_container", return_value=True):
+                                                                with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
+                                                                    with mock.patch("skua.commands.run.exec_into_container"):
+                                                                        cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                                     mock_build.assert_called_once()
 
     def test_cmd_run_skips_rebuild_when_existing_remote_image_is_current(self):
@@ -421,16 +420,15 @@ class TestRemoteRunImageRefresh(unittest.TestCase):
                             with mock.patch("skua.commands.run.image_name_for_project", return_value="skua-base-codex"):
                                 with mock.patch("skua.commands.run.resolve_project_image_inputs", return_value=("debian:bookworm-slim", [], [])):
                                     with mock.patch("skua.commands.run.image_exists", return_value=True):
-                                        with mock.patch("skua.commands.run.agent_install_uses_floating_version", return_value=False):
-                                            with mock.patch("skua.commands.run.image_matches_build_context", return_value=True):
-                                                with mock.patch("skua.commands.run.build_image", return_value=(True, "")) as mock_build:
-                                                    with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
-                                                        with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
-                                                            with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
-                                                                with mock.patch("skua.commands.run.start_container", return_value=True):
-                                                                    with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
-                                                                        with mock.patch("skua.commands.run.exec_into_container"):
-                                                                            cmd_run(SimpleNamespace(name="qar"))
+                                        with mock.patch("skua.commands.run.image_rebuild_needed", return_value=(False, False, "")):
+                                            with mock.patch("skua.commands.run.build_image", return_value=(True, "")) as mock_build:
+                                                with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
+                                                    with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
+                                                        with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
+                                                            with mock.patch("skua.commands.run.start_container", return_value=True):
+                                                                with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
+                                                                    with mock.patch("skua.commands.run.exec_into_container"):
+                                                                        cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                                     mock_build.assert_not_called()
 
 

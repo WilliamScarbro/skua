@@ -48,7 +48,7 @@ from skua.docker import (
     build_image,
     get_running_skua_containers,
     image_exists,
-    image_matches_build_context,
+    image_rebuild_needed,
     image_name_for_project,
     resolve_project_image_inputs,
 )
@@ -122,6 +122,17 @@ class DashboardJob:
             detail=str(data.get("detail", "")),
             prompt_text=str(data.get("prompt_text", "")),
         )
+
+
+@dataclass
+class BuildPreflightCheck:
+    """Preflight build decision for one project."""
+
+    project: str
+    needs_rebuild: bool
+    force_refresh: bool
+    reason: str
+    error: str
 
 
 def _utc_now_iso() -> str:
@@ -773,6 +784,97 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     return DashboardSnapshot(columns=columns, rows=rows, summary=summary)
 
 
+def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck:
+    g = store.load_global()
+    image_name_base = g.get("imageName", "skua-base")
+    base_image = g.get("baseImage", "debian:bookworm-slim")
+    defaults = g.get("defaults", {})
+    build_security_name = defaults.get("security", "open")
+    build_security = store.load_security(build_security_name)
+    if build_security is None:
+        build_security = store.load_security(getattr(project, "security", ""))
+    if build_security is None:
+        return BuildPreflightCheck(
+            project=project.name,
+            needs_rebuild=False,
+            force_refresh=False,
+            reason="",
+            error=f"security profile not found for project '{project.name}'",
+        )
+
+    agent = store.load_agent(project.agent)
+    if agent is None:
+        return BuildPreflightCheck(
+            project=project.name,
+            needs_rebuild=False,
+            force_refresh=False,
+            reason="",
+            error=f"agent config not found for project '{project.name}'",
+        )
+
+    image_config = g.get("image", {})
+    global_packages = image_config.get("extraPackages", [])
+    global_commands = image_config.get("extraCommands", [])
+    image_name = image_name_for_project(image_name_base, project)
+    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+        default_base_image=base_image,
+        agent=agent,
+        project=project,
+        global_extra_packages=global_packages,
+        global_extra_commands=global_commands,
+    )
+    needs_rebuild, force_refresh, reason = image_rebuild_needed(
+        image_name=image_name,
+        container_dir=store.get_container_dir(),
+        security=build_security,
+        agent=agent,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    return BuildPreflightCheck(
+        project=project.name,
+        needs_rebuild=bool(needs_rebuild),
+        force_refresh=bool(force_refresh),
+        reason=str(reason or ""),
+        error="",
+    )
+
+
+def _run_preflight_checks(project_name: str) -> tuple[list[BuildPreflightCheck], list[str]]:
+    store = ConfigStore()
+    target = store.resolve_project(project_name)
+    if target is None:
+        return [], [f"project '{project_name}' was not found"]
+
+    target_check = _project_build_preflight(store, target)
+    if target_check.error:
+        return [], [target_check.error]
+    if not target_check.needs_rebuild:
+        return [], []
+
+    checks = [target_check]
+    errors = []
+    if not target_check.force_refresh:
+        return checks, errors
+
+    # Floating client updates can impact multiple projects; validate all of them.
+    for name in store.list_resources("Project"):
+        name = str(name or "").strip()
+        if not name or name == project_name:
+            continue
+        project = store.resolve_project(name)
+        if project is None:
+            continue
+        check = _project_build_preflight(store, project)
+        if check.error:
+            errors.append(check.error)
+            continue
+        if check.needs_rebuild:
+            checks.append(check)
+    return checks, errors
+
+
 def _build_selected_project(name: str, verbose: bool = False) -> bool:
     store = ConfigStore()
     project = store.resolve_project(name)
@@ -810,7 +912,7 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         global_extra_commands=global_commands,
     )
 
-    if image_exists(image_name) and image_matches_build_context(
+    needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
         image_name=image_name,
         container_dir=container_dir,
         security=security,
@@ -818,12 +920,17 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         base_image=resolved_base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
-    ):
+    )
+
+    if not needs_rebuild:
         print(f"Image '{image_name}' is already up-to-date.")
         return True
 
     if image_exists(image_name):
-        print(f"Rebuilding image '{image_name}' for project '{name}'...")
+        if rebuild_reason:
+            print(f"Rebuilding image '{image_name}' for project '{name}' ({rebuild_reason})...")
+        else:
+            print(f"Rebuilding image '{image_name}' for project '{name}'...")
     else:
         print(f"Building image '{image_name}' for project '{name}'...")
     success, _ = build_image(
@@ -835,6 +942,8 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         extra_packages=extra_packages,
         extra_commands=extra_commands,
         verbose=verbose,
+        pull=force_refresh,
+        no_cache=force_refresh,
     )
     if success:
         print(f"Build complete for '{image_name}'.")
@@ -3247,6 +3356,57 @@ def cmd_dashboard(args):
                     self._start_adapt_discover_task(project_name)
                     self._refresh_view()
                     return
+            if action_key == "run":
+                checks: list[BuildPreflightCheck] = []
+                errors: list[str] = []
+                if not self._project_is_running(project_name):
+                    try:
+                        checks, errors = _run_preflight_checks(project_name)
+                    except Exception as exc:
+                        self.message = f"run preflight failed for '{project_name}': {type(exc).__name__}: {exc}"
+                        self._refresh_view()
+                        return
+                if checks:
+                    queued = []
+                    failures = []
+                    for check in checks:
+                        lock_msg = _lock_block_message(check.project, "build")
+                        if lock_msg:
+                            failures.append(lock_msg)
+                            continue
+                        background = _background_command("build", check.project)
+                        if not background:
+                            failures.append(f"build action is unavailable for project '{check.project}'")
+                            continue
+                        try:
+                            job = self.jobs.enqueue("build", check.project, command=background)
+                            queued.append((check.project, check.reason, job.job_id))
+                        except Exception as exc:
+                            failures.append(
+                                f"failed to queue build for '{check.project}': {type(exc).__name__}: {exc}"
+                            )
+
+                    if queued:
+                        queued_names = ", ".join(
+                            f"{name}#{job_id}" for name, _reason, job_id in queued
+                        )
+                        self.message = (
+                            f"queued preflight build(s): {queued_names}. "
+                            f"Run '{project_name}' again after the build job(s) complete."
+                        )
+                    else:
+                        self.message = f"run preflight blocked for '{project_name}': no build job could be queued."
+                    if errors or failures:
+                        detail = errors + failures
+                        self.message = f"{self.message} ({detail[0]})"
+                    self.show_job_output = False
+                    self.selected_job = 0
+                    self._refresh_view()
+                    self._request_refresh()
+                    return
+                if errors:
+                    self.message = f"run preflight warning: {errors[0]}"
+                    self._refresh_view()
             background = _background_command(action_key, project_name)
             if background is not None:
                 try:

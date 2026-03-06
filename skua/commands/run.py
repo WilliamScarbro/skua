@@ -16,19 +16,17 @@ from pathlib import Path
 from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
 from skua.docker import (
-    agent_install_uses_floating_version,
     is_container_running,
     exec_into_container,
-    floating_agent_update_available,
     build_run_command,
     build_image,
     image_exists,
-    image_matches_build_context,
     image_name_for_project,
     resolve_project_image_inputs,
     start_container,
     wait_for_running_container,
     _project_mount_path,
+    image_rebuild_needed,
 )
 from skua.project_adapt import ensure_adapt_workspace
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
@@ -711,36 +709,27 @@ def cmd_run(args, lock_project: bool = True):
         global_extra_commands=global_extra_commands,
     )
 
-    force_refresh = False
-    image_available = image_exists(image_name)
-    needs_rebuild = not image_available
-    if not image_available:
+    container_dir = store.get_container_dir()
+    needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
+        image_name=image_name,
+        container_dir=container_dir,
+        security=build_security,
+        agent=agent,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    if not image_exists(image_name):
         print(f"Image '{image_name}' not found for agent '{project.agent}'.")
         print("Building image lazily...")
-    else:
-        if agent_install_uses_floating_version(agent):
-            refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
-            if refresh_needed:
-                force_refresh = True
-                print(f"Image '{image_name}' has an available client update: {refresh_reason}.")
-                print("Rebuilding lazily without Docker cache...")
-                needs_rebuild = True
-
-        container_dir = store.get_container_dir()
-        if not needs_rebuild and container_dir is None:
-            print("Warning: Cannot verify image build context (missing container assets).")
-            print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
-        elif not needs_rebuild and not image_matches_build_context(
-            image_name=image_name,
-            container_dir=container_dir,
-            security=build_security,
-            agent=agent,
-            base_image=resolved_base_image,
-            extra_packages=extra_packages,
-            extra_commands=extra_commands,
-        ):
-            print(f"Image '{image_name}' is out-of-date; rebuilding lazily...")
-            needs_rebuild = True
+    elif force_refresh:
+        print(f"Image '{image_name}' has an available client update: {rebuild_reason}.")
+        print("Rebuilding lazily without Docker cache...")
+    elif needs_rebuild and rebuild_reason:
+        print(f"Image '{image_name}' is out-of-date ({rebuild_reason}); rebuilding lazily...")
+    elif container_dir is None:
+        print("Warning: Cannot verify image build context (missing container assets).")
+        print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
 
     if needs_rebuild:
         container_dir = store.get_container_dir()

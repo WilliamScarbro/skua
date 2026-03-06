@@ -187,6 +187,53 @@ class TestDashboardActions(unittest.TestCase):
         self.assertFalse(args.replace_process)
 
 
+class TestDashboardRunPreflight(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard._project_build_preflight")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_run_preflight_returns_target_only_when_not_force_refresh(self, MockStore, mock_preflight):
+        from skua.commands.dashboard import BuildPreflightCheck, _run_preflight_checks
+
+        store = MockStore.return_value
+        project = SimpleNamespace(name="demo")
+        store.resolve_project.return_value = project
+        mock_preflight.return_value = BuildPreflightCheck(
+            project="demo",
+            needs_rebuild=True,
+            force_refresh=False,
+            reason="build context changed",
+            error="",
+        )
+
+        checks, errors = _run_preflight_checks("demo")
+        self.assertEqual([], errors)
+        self.assertEqual(["demo"], [c.project for c in checks])
+        self.assertEqual(1, mock_preflight.call_count)
+
+    @mock.patch("skua.commands.dashboard._project_build_preflight")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_run_preflight_checks_other_projects_on_force_refresh(self, MockStore, mock_preflight):
+        from skua.commands.dashboard import BuildPreflightCheck, _run_preflight_checks
+
+        store = MockStore.return_value
+        projects = {
+            "demo": SimpleNamespace(name="demo"),
+            "api": SimpleNamespace(name="api"),
+            "web": SimpleNamespace(name="web"),
+        }
+        store.resolve_project.side_effect = lambda name: projects.get(name)
+        store.list_resources.return_value = ["demo", "api", "web"]
+
+        mock_preflight.side_effect = [
+            BuildPreflightCheck("demo", True, True, "codex client update available", ""),
+            BuildPreflightCheck("api", True, False, "build context changed", ""),
+            BuildPreflightCheck("web", False, False, "", ""),
+        ]
+
+        checks, errors = _run_preflight_checks("demo")
+        self.assertEqual([], errors)
+        self.assertEqual(["demo", "api"], [c.project for c in checks])
+
+
 class TestDashboardJobs(unittest.TestCase):
     @mock.patch("skua.commands.dashboard.project_busy_error_if_locked")
     def test_lock_block_message_when_busy(self, mock_busy):

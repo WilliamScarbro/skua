@@ -5,12 +5,10 @@ from pathlib import Path
 
 from skua.config import ConfigStore
 from skua.docker import (
-    agent_install_uses_floating_version,
     build_image,
-    floating_agent_update_available,
-    image_exists,
-    image_matches_build_context,
     image_name_for_project,
+    image_exists,
+    image_rebuild_needed,
     resolve_project_image_inputs,
 )
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
@@ -101,30 +99,23 @@ def cmd_build(args, lock_project: bool = True):
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
     )
-    force_refresh = False
-    needs_rebuild = False
+    needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
+        image_name=image_name,
+        container_dir=container_dir,
+        security=security,
+        agent=agent,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
     if image_exists(image_name):
-        if agent_install_uses_floating_version(agent):
-            refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
-            if refresh_needed:
-                force_refresh = True
-                print(f"-> {refresh_reason}; rebuilding '{image_name}' without Docker cache")
         if force_refresh:
-            needs_rebuild = True
-        elif image_matches_build_context(
-            image_name=image_name,
-            container_dir=container_dir,
-            security=security,
-            agent=agent,
-            base_image=resolved_base_image,
-            extra_packages=extra_packages,
-            extra_commands=extra_commands,
-        ):
+            print(f"-> {rebuild_reason}; rebuilding '{image_name}' without Docker cache")
+        elif needs_rebuild:
+            print(f"-> Image '{image_name}' is out-of-date ({rebuild_reason}); rebuilding (project: {project.name})")
+        else:
             print(f"-> Using existing image '{image_name}' (project: {project.name})")
             existing.append(image_name)
-        else:
-            print(f"-> Image '{image_name}' is out-of-date; rebuilding (project: {project.name})")
-            needs_rebuild = True
 
     if not existing:
         if not needs_rebuild:
