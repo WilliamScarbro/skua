@@ -190,6 +190,12 @@ def main():
         action="store_true",
         help="Only show projects running on the local host",
     )
+    p_dashboard.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=2.0,
+        help="Dashboard auto-refresh interval in seconds (0 disables periodic polling)",
+    )
 
     # clean
     p_clean = sub.add_parser("clean", help="Clean persisted agent credentials")

@@ -1330,6 +1330,16 @@ def cmd_dashboard(args):
 
     inside_emacs = bool(os.environ.get("INSIDE_EMACS"))
     screen_override = str(os.environ.get("SKUA_DASHBOARD_SCREEN", "")).strip().lower()
+    refresh_seconds_raw = getattr(args, "refresh_seconds", 2.0)
+    try:
+        refresh_seconds = float(refresh_seconds_raw)
+    except (TypeError, ValueError):
+        print("Error: --refresh-seconds must be a number >= 0.")
+        raise SystemExit(2)
+    if refresh_seconds < 0:
+        print("Error: --refresh-seconds must be >= 0.")
+        raise SystemExit(2)
+    refresh_label = "off" if refresh_seconds == 0 else f"{refresh_seconds:g}s"
 
     class DashboardApp(App):
         DEFAULT_CSS = """
@@ -1469,7 +1479,8 @@ def cmd_dashboard(args):
                 self._init_project_table()
                 self._init_jobs_table()
             self._request_refresh()
-            self.set_interval(2.0, self._request_refresh)
+            if refresh_seconds > 0:
+                self.set_interval(refresh_seconds, self._request_refresh)
 
         def _init_project_table(self) -> None:
             if not self._use_project_widget:
@@ -2400,7 +2411,7 @@ def cmd_dashboard(args):
                 return
             view = self.query_one("#dashboard-view", Static)
             status_bar = self.query_one("#status-bar", Static)
-            title = self._render_header_line("skua dashboard", "auto-refresh: 2s")
+            title = self._render_header_line("skua dashboard", f"auto-refresh: {refresh_label}")
             jobs_view = self.jobs.list_for_view()
             visible_jobs = min(len(jobs_view), 10)
             if jobs_view:
@@ -2550,7 +2561,7 @@ def cmd_dashboard(args):
             jobs_table_view = self.query_one("#jobs-table")
             footer = self.query_one("#dashboard-footer", Static)
             status_bar = self.query_one("#status-bar", Static)
-            title = self._render_header_line("skua dashboard", "auto-refresh: 2s")
+            title = self._render_header_line("skua dashboard", f"auto-refresh: {refresh_label}")
             jobs_view = self.jobs.list_for_view()
             visible_jobs = min(len(jobs_view), 10)
             if jobs_view:
