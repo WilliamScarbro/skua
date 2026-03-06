@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1273,6 +1274,7 @@ def cmd_dashboard(args):
             self._refresh_inflight = False
             self._last_logged_message = ""
             self._ui_log_path = self.jobs.jobs_dir / "dashboard-ui.log"
+            self._resume_mask_until = 0.0
 
         def _log_ui_event(self, event: str, **fields) -> None:
             try:
@@ -1287,6 +1289,15 @@ def cmd_dashboard(args):
             except Exception:
                 # Logging must never impact dashboard interactivity.
                 pass
+
+        def _resume_mask_active(self) -> bool:
+            return time.monotonic() < float(self._resume_mask_until)
+
+        def _begin_resume_mask(self, seconds: float = 1.0) -> None:
+            hold = max(0.05, float(seconds))
+            self._resume_mask_until = max(float(self._resume_mask_until), time.monotonic() + hold)
+            self.set_timer(hold, self._refresh_view)
+            self.set_timer(hold, self._request_refresh)
 
         def compose(self) -> ComposeResult:
             if self._use_project_widget:
@@ -2240,6 +2251,17 @@ def cmd_dashboard(args):
                     self._render_command_bar(self._context_actions(jobs_view)),
                 )
             )
+            if self._resume_mask_active():
+                waiting = Text("Restoring dashboard layout...", style="bold white on black")
+                view.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Please Wait"),
+                        waiting,
+                    )
+                )
+                return
 
             if self.show_help:
                 help_text = Text(
@@ -2382,6 +2404,36 @@ def cmd_dashboard(args):
                     self._render_command_bar(self._context_actions(jobs_view)),
                 )
             )
+            if self._resume_mask_active():
+                header.update(Group(title, focus_line, self._section_header("Please Wait"), Text("Restoring dashboard layout...", style="bold white on black")))
+                try:
+                    projects_table.styles.display = "none"
+                except Exception:
+                    pass
+                project_summary.update(Text(""))
+                try:
+                    project_summary.styles.display = "none"
+                except Exception:
+                    pass
+                jobs_header.update(Text(""))
+                try:
+                    jobs_header.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.clear()
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    footer.styles.display = "none"
+                except Exception:
+                    pass
+                footer.update(Text(""))
+                return
 
             if self.show_help:
                 help_text = Text(
@@ -2401,7 +2453,7 @@ def cmd_dashboard(args):
                     pass
                 jobs_header.update(Text(""))
                 try:
-                    jobs_header.styles.display = "block"
+                    jobs_header.styles.display = "none"
                 except Exception:
                     pass
                 try:
@@ -2409,7 +2461,7 @@ def cmd_dashboard(args):
                 except Exception:
                     pass
                 try:
-                    jobs_table_view.styles.display = "block"
+                    jobs_table_view.styles.display = "none"
                 except Exception:
                     pass
                 try:
@@ -3131,6 +3183,18 @@ def cmd_dashboard(args):
                     suspend=self.suspend,
                     replace_process=interactive_replace,
                 )
+                if self._use_project_widget:
+                    # Returning from suspend can briefly report a transiently
+                    # narrow viewport. Defer redraw so column fitting uses the
+                    # settled terminal size.
+                    self._project_table_sig = None
+                    self._jobs_table_sig = None
+                    self._begin_resume_mask(1.0)
+                else:
+                    self.set_timer(0.1, self._refresh_view)
+                    self.set_timer(0.1, self._request_refresh)
+                self._refresh_view()
+                return
             self._refresh_view()
             self._request_refresh()
 
