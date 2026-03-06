@@ -15,6 +15,8 @@ from skua.docker import (
     resolve_project_image_inputs,
 )
 from skua.project_adapt import image_request_path, load_image_request, request_changes_project
+from skua.project_lock import project_operation_state
+from skua.commands.run import _credential_refresh_reason
 
 
 def _shorten_home_path(path: str) -> str:
@@ -98,6 +100,34 @@ def _has_pending_adapt_request(project) -> bool:
         return False
     request = load_image_request(req_path)
     return request_changes_project(project, request)
+
+
+def _credential_state(store: ConfigStore, project) -> tuple:
+    """Return (state, reason, display_label) for project credential health."""
+    if project is None:
+        return "unknown", "", "(none)"
+
+    label = project.credential or "(none)"
+    agent = store.load_agent(project.agent)
+    if agent is None:
+        return "unknown", "", label
+
+    cred = None
+    if project.credential:
+        cred = store.load_credential(project.credential)
+    try:
+        reason = _credential_refresh_reason(cred, agent)
+    except Exception:
+        return "unknown", "", label
+    if not reason:
+        return "ok", "", label
+
+    state = "missing" if "no local credential files" in reason.lower() else "stale"
+    if project.credential:
+        display = f"{project.credential} !{state}"
+    else:
+        display = f"(default) !{state}"
+    return state, reason, display
 
 
 def _git_status(project, store: ConfigStore) -> str:
@@ -271,6 +301,26 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
     return "".join(ordered), flags
 
 
+def _base_project_status(
+    project,
+    running: set,
+    unreachable_hosts: set,
+    image_name: str,
+) -> str:
+    """Return base project status before adapt/credential suffix markers."""
+    operation = project_operation_state(project)
+    if operation:
+        return operation
+
+    container_name = f"skua-{project.name}"
+    host = getattr(project, "host", "") or ""
+    if container_name in running:
+        return "running"
+    if host and host in unreachable_hosts:
+        return "unreachable"
+    return "built" if image_exists(image_name) else "missing"
+
+
 def _agent_activity(container_name: str, host: str = "") -> str:
     """Return agent activity state by reading /tmp/skua-agent-status inside the container.
 
@@ -414,21 +464,20 @@ def cmd_list(args):
     pending_count = 0
     needs_adapt = False
     needs_build = False
+    stale_credential_count = 0
     for name, project in projects:
-        container_name = f"skua-{name}"
         host = getattr(project, "host", "") or ""
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
         img_name = image_name_for_project(image_name_base, project)
-        if container_name in running:
-            status = "running"
-        elif host and host in unreachable_hosts:
-            status = "unreachable"
-        else:
-            status = "built" if image_exists(img_name) else "missing"
+        status = _base_project_status(project, running, unreachable_hosts, img_name)
         if pending_adapt:
             status += "*"
             pending_count += 1
+        cred_state, _cred_reason, cred_display = _credential_state(store, project)
+        if cred_state in {"missing", "stale"}:
+            status += "!"
+            stale_credential_count += 1
         row = [_col(name, 16)]
         activity = activity_values.get(name, "-")
         row.append(_col(activity, 14))
@@ -452,8 +501,7 @@ def cmd_list(args):
                 row.append(_col(running_image_values.get(name, "-"), 36))
 
         if show_agent:
-            credential = project.credential or "(none)"
-            row.extend([_col(project.agent, 10), _col(credential, 20)])
+            row.extend([_col(project.agent, 10), _col(cred_display, 20)])
         if show_security:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"
@@ -469,6 +517,9 @@ def cmd_list(args):
     print(f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt")
     if pending_count:
         print("  * pending image-request changes")
+    if stale_credential_count:
+        print(f"  ! stale/missing local credentials for {stale_credential_count} project(s)")
+        print("    run 'skua run <name>' and complete agent login to refresh")
     if show_image and (needs_adapt or needs_build):
         if needs_adapt:
             print("  (A) image-request changes pending; run 'skua adapt'")

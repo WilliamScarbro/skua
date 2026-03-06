@@ -14,7 +14,7 @@ from unittest import mock
 # Ensure the skua package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from skua.config.resources import AgentAuthSpec, AgentConfig, Credential, Project
+from skua.config.resources import AgentAuthSpec, AgentConfig, Credential, Project, ProjectStateSpec
 
 
 class TestAddCredentialSelection(unittest.TestCase):
@@ -242,6 +242,35 @@ class TestAddCredentialSelection(unittest.TestCase):
 
 class TestListColumns(unittest.TestCase):
     @mock.patch("skua.commands.list_cmd.get_running_skua_containers")
+    @mock.patch("skua.commands.list_cmd.ConfigStore")
+    def test_list_shows_active_project_operation_state(self, MockStore, mock_running):
+        from skua.commands.list_cmd import cmd_list
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = Project(
+            name="demo",
+            directory="/tmp/demo",
+            environment="local-docker",
+            security="open",
+            agent="claude",
+            credential="",
+            state=ProjectStateSpec(status="building", lock_owner="host:1234", lock_acquired_at="2026-03-06T00:00:00+00:00"),
+        )
+        store.load_environment.return_value = SimpleNamespace(
+            network=SimpleNamespace(mode="bridge")
+        )
+        mock_running.return_value = set()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list(argparse.Namespace())
+        out = buf.getvalue()
+
+        self.assertIn("building", out)
+
+    @mock.patch("skua.commands.list_cmd.get_running_skua_containers")
     @mock.patch("skua.commands.list_cmd._has_pending_adapt_request", return_value=True)
     @mock.patch("skua.commands.list_cmd.ConfigStore")
     def test_list_default_shows_default_columns(self, MockStore, _mock_pending, mock_running):
@@ -315,6 +344,37 @@ class TestListColumns(unittest.TestCase):
         self.assertIn("cred-main", out)
         self.assertIn("open", out)
         self.assertIn("bridge", out)
+
+    @mock.patch("skua.commands.list_cmd._credential_state", return_value=("stale", "expired", "cred-main !stale"))
+    @mock.patch("skua.commands.list_cmd.get_running_skua_containers")
+    @mock.patch("skua.commands.list_cmd.ConfigStore")
+    def test_list_marks_status_when_credential_is_stale(self, MockStore, mock_running, _mock_cred_state):
+        from skua.commands.list_cmd import cmd_list
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = Project(
+            name="demo",
+            directory="/tmp/demo",
+            environment="local-docker",
+            security="open",
+            agent="claude",
+            credential="cred-main",
+        )
+        store.load_environment.return_value = SimpleNamespace(
+            network=SimpleNamespace(mode="bridge")
+        )
+        mock_running.return_value = {"skua-demo"}
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list(argparse.Namespace(agent=True))
+        out = buf.getvalue()
+
+        self.assertIn("running!", out)
+        self.assertIn("cred-main !stale", out)
+        self.assertIn("stale/missing local credentials", out)
 
     @mock.patch("skua.commands.list_cmd.image_exists", return_value=False)
     @mock.patch("skua.commands.list_cmd.get_running_skua_containers")

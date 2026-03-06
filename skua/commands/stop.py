@@ -7,6 +7,7 @@ from pathlib import Path
 
 from skua.config import ConfigStore
 from skua.docker import get_running_skua_containers
+from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 from skua.utils import confirm
 
 
@@ -84,13 +85,21 @@ def _should_continue_for_git(project, store: ConfigStore, force: bool) -> bool:
     return confirm("Stop container anyway?", default=False)
 
 
-def cmd_stop(args) -> bool:
+def cmd_stop(args, lock_project: bool = True) -> bool:
     store = ConfigStore()
     name = str(getattr(args, "name", "") or "").strip()
     force = bool(getattr(args, "force", False))
     if not name:
         print("Error: Provide a project name.")
         sys.exit(1)
+
+    if lock_project:
+        try:
+            with project_operation_lock(store, name, "stopping"):
+                return cmd_stop(args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "stop this project"))
+            sys.exit(1)
 
     project = store.resolve_project(name)
     if project is None:

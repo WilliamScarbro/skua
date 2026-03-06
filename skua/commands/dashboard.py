@@ -36,6 +36,8 @@ from skua.commands.list_cmd import (
     _image_id,
     _image_suffix,
     _short_image_id,
+    _credential_state,
+    _base_project_status,
 )
 from skua.commands.remove import cmd_remove
 from skua.commands.restart import cmd_restart
@@ -360,6 +362,15 @@ class DashboardJobManager:
         cmd = command if command is not None else _background_command(action_key, project_name)
         if not cmd:
             raise ValueError(f"Action does not support background execution: {action_key}")
+        for existing in self.jobs:
+            if (
+                existing.project == project_name
+                and existing.status in ("queued", "running", "waiting_input")
+            ):
+                raise ValueError(
+                    f"project '{project_name}' already has active job #{existing.job_id} "
+                    f"({existing.action})"
+                )
 
         now = _utc_now_iso()
         log_path = self.logs_dir / f"{self._next_id:06d}-{action_key}-{project_name}.log"
@@ -672,23 +683,23 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     running_count = 0
     needs_adapt = False
     needs_build = False
+    stale_credential_count = 0
     rows = []
     for name, project in projects:
-        container_name = f"skua-{name}"
         host = getattr(project, "host", "") or ""
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
         img_name = image_name_for_project(image_name_base, project)
-        if container_name in running:
-            status = "running"
+        status = _base_project_status(project, running, unreachable_hosts, img_name)
+        if status.startswith("running"):
             running_count += 1
-        elif host and host in unreachable_hosts:
-            status = "unreachable"
-        else:
-            status = "built" if image_exists(img_name) else "missing"
         if pending_adapt:
             status += "*"
             pending_count += 1
+        cred_state, _cred_reason, cred_display = _credential_state(store, project)
+        if cred_state in {"missing", "stale"}:
+            status += "!"
+            stale_credential_count += 1
 
         row = [name]
         row.append(activity_values.get(name, "-"))
@@ -709,8 +720,7 @@ def _collect_snapshot(args) -> DashboardSnapshot:
             if needs_running_image:
                 row.append(running_image_values.get(name, "-"))
         if show_agent:
-            credential = project.credential or "(none)"
-            row.extend([project.agent, credential])
+            row.extend([project.agent, cred_display])
         if show_security:
             env = store.load_environment(project.environment)
             network = env.network.mode if env else "?"
@@ -720,6 +730,9 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     summary = [f"{len(project_names)} project(s), {running_count} running, {pending_count} pending adapt"]
     if pending_count:
         summary.append("  * pending image-request changes")
+    if stale_credential_count:
+        summary.append(f"  ! stale/missing local credentials for {stale_credential_count} project(s)")
+        summary.append("    run 'skua run <name>' and complete agent login to refresh")
     if show_image and (needs_adapt or needs_build):
         if needs_adapt:
             summary.append("  (A) image-request changes pending; run 'skua adapt'")
@@ -2967,10 +2980,19 @@ def cmd_dashboard(args):
                     return "dim"
                 return ""
             if column == "AGENT":
+                agent = value.strip().lower()
+                if agent == "claude" or "anthropic" in agent:
+                    return "#D97706 bold"
+                if agent == "codex" or "openai" in agent or "gpt" in agent:
+                    return "#10A37F bold"
+                if agent == "gemini" or "google" in agent:
+                    return "#4285F4 bold"
                 return "cyan bold"
             if column == "CREDENTIAL":
                 if value == "(none)":
                     return "dim"
+                if "!" in value:
+                    return "yellow bold"
                 return "cyan"
             if column == "SECURITY":
                 if value in ("strict", "proxy"):

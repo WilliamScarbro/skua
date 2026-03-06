@@ -16,6 +16,33 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 class TestDashboardSnapshot(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.image_exists", return_value=True)
+    @mock.patch("skua.commands.dashboard.get_running_skua_containers")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_collect_snapshot_prefers_operation_state(self, MockStore, mock_running, _mock_image_exists):
+        from skua.commands.dashboard import _collect_snapshot
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = SimpleNamespace(
+            name="demo",
+            directory="/tmp/demo",
+            repo="",
+            host="",
+            environment="local-docker",
+            security="open",
+            agent="claude",
+            credential="",
+            state=SimpleNamespace(status="building", lock_owner="host:1234", lock_acquired_at="2026-03-06T00:00:00+00:00"),
+        )
+        store.load_environment.return_value = SimpleNamespace(network=SimpleNamespace(mode="bridge"))
+        mock_running.return_value = []
+
+        snap = _collect_snapshot(argparse.Namespace())
+        status_idx = [c[0] for c in snap.columns].index("STATUS")
+        self.assertEqual("building", snap.rows[0]["cells"][status_idx])
+
     @mock.patch("skua.commands.dashboard.image_exists", return_value=False)
     @mock.patch("skua.commands.dashboard.get_running_skua_containers")
     @mock.patch("skua.commands.dashboard.ConfigStore")
@@ -88,6 +115,37 @@ class TestDashboardSnapshot(unittest.TestCase):
         self.assertEqual("remote", snap.rows[0]["name"])
         status_idx = [c[0] for c in snap.columns].index("STATUS")
         self.assertEqual("unreachable", snap.rows[0]["cells"][status_idx])
+
+    @mock.patch("skua.commands.dashboard._credential_state", return_value=("stale", "expired", "cred-main !stale"))
+    @mock.patch("skua.commands.dashboard.get_running_skua_containers")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_collect_snapshot_marks_stale_credentials(self, MockStore, mock_running, _mock_cred_state):
+        from skua.commands.dashboard import _collect_snapshot
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = SimpleNamespace(
+            name="demo",
+            directory="/tmp/demo",
+            repo="",
+            host="",
+            environment="local-docker",
+            security="open",
+            agent="claude",
+            credential="cred-main",
+        )
+        store.load_environment.return_value = SimpleNamespace(network=SimpleNamespace(mode="bridge"))
+        mock_running.return_value = ["skua-demo"]
+
+        snap = _collect_snapshot(argparse.Namespace(agent=True))
+        columns = [c[0] for c in snap.columns]
+        status_idx = columns.index("STATUS")
+        cred_idx = columns.index("CREDENTIAL")
+
+        self.assertEqual("running!", snap.rows[0]["cells"][status_idx])
+        self.assertEqual("cred-main !stale", snap.rows[0]["cells"][cred_idx])
+        self.assertTrue(any("stale/missing local credentials" in line for line in snap.summary))
 
 
 class TestDashboardCli(unittest.TestCase):
@@ -181,6 +239,23 @@ class TestDashboardJobs(unittest.TestCase):
             self.assertEqual("success", persisted["status"])
             self.assertEqual(0, persisted["return_code"])
             self.assertTrue(Path(persisted["log_path"]).exists())
+
+    def test_job_manager_rejects_duplicate_active_project_jobs(self):
+        from skua.commands.dashboard import DashboardJobManager
+
+        with tempfile.TemporaryDirectory() as td:
+            mgr = DashboardJobManager(config_dir=Path(td), max_jobs=20)
+            mgr.enqueue(
+                "build",
+                "demo",
+                command=[sys.executable, "-c", "import time; time.sleep(0.3)"],
+            )
+            with self.assertRaises(ValueError):
+                mgr.enqueue(
+                    "adapt",
+                    "demo",
+                    command=[sys.executable, "-c", "print('second job')"],
+                )
 
     def test_job_manager_marks_inflight_jobs_orphaned_on_reload(self):
         from skua.commands.dashboard import DashboardJobManager

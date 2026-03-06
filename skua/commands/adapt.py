@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from skua.commands.credential import resolve_credential_sources
+from skua.commands.run import _credential_refresh_reason, _run_local_login
 from skua.config import ConfigStore, validate_project
 from skua.docker import (
     build_run_command,
@@ -31,9 +32,10 @@ from skua.project_adapt import (
     write_applied_image_request,
     smoke_test_path,
 )
+from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 
 
-def cmd_adapt(args):
+def cmd_adapt(args, lock_project: bool = True):
     store = ConfigStore()
     all_mode = bool(getattr(args, "all", False))
     name = str(getattr(args, "name", "") or "").strip()
@@ -45,6 +47,14 @@ def cmd_adapt(args):
     if not name:
         print("Error: Provide a project name or use --all.")
         sys.exit(1)
+
+    if lock_project:
+        try:
+            with project_operation_lock(store, name, "adapting"):
+                return cmd_adapt(args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "adapt this project"))
+            sys.exit(1)
 
     project = store.resolve_project(name)
     if project is None:
@@ -645,6 +655,54 @@ def _confirm_apply_wishlist(agent_name: str, request: dict) -> bool:
     return answer != "n"
 
 
+def _agent_login_command(agent) -> str:
+    _login_subcmd = "\\login" if agent.name == "codex" else "login"
+    return (agent.auth.login_command or f"{agent.runtime.command or agent.name} {_login_subcmd}").strip()
+
+
+def _maybe_refresh_local_credentials_for_adapt(agent, cred, allow_missing_local: bool = False) -> bool:
+    """Refresh local credentials before adapt when they look missing/stale."""
+    reason = _credential_refresh_reason(cred, agent)
+    if not reason:
+        return False
+    if allow_missing_local and "no local credential files" in reason.lower():
+        return False
+
+    login_cmd = _agent_login_command(agent)
+    if not login_cmd:
+        print(f"[adapt] Warning: {reason}. No login command is configured for agent '{agent.name}'.")
+        return False
+
+    print(f"[adapt] Warning: {reason}.")
+    if not _is_interactive_tty():
+        print(f"[adapt] Error: credential refresh is required. Run '{login_cmd}' locally, then retry.")
+        sys.exit(1)
+
+    answer = input(f"[adapt] Run '{login_cmd}' locally to refresh now? [Y/n]: ").strip().lower()
+    if answer == "n":
+        return False
+
+    if not _run_local_login(login_cmd):
+        return False
+
+    post_reason = _credential_refresh_reason(cred, agent)
+    if post_reason:
+        print(f"[adapt] Warning: credentials still look stale after login: {post_reason}")
+    return True
+
+
+def _looks_like_auth_failure(text: str) -> bool:
+    lowered = str(text or "").lower()
+    indicators = (
+        "authentication_error",
+        "failed to authenticate",
+        "oauth token has expired",
+        "token has expired",
+        "401",
+    )
+    return any(indicator in lowered for indicator in indicators)
+
+
 def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_error: str = "", prompt_override: str = "", needs_smoke_test: bool = False) -> list:
     agent_name = (agent.name or "").strip().lower()
     prompt = prompt_override or _agent_prompt(project_name, agent_name, build_error, smoke_error, needs_smoke_test)
@@ -708,9 +766,14 @@ def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, d
 
     auth_dir = (agent.auth.dir or ".claude").lstrip("/")
     primary_auth = auth_files[0]
-
     if env.persistence.mode == "bind":
         data_dir = store.project_data_dir(project.name, project.agent)
+        has_persisted_auth = (data_dir / primary_auth).is_file()
+        _maybe_refresh_local_credentials_for_adapt(
+            agent,
+            cred,
+            allow_missing_local=has_persisted_auth,
+        )
         copied = _sync_auth_from_host(data_dir, cred, agent)
         if copied:
             print(f"Synced {copied} auth file(s) from host.")
@@ -744,6 +807,7 @@ def _run_agent_adapt_session(
     prompt_override: str = "",
     warn_on_failure: bool = False,
     needs_smoke_test: bool = False,
+    allow_auth_retry: bool = True,
 ):
     """Start an adapt container session and ask the agent to update image-request.yaml."""
     print("[adapt] Preparing base agent image...")
@@ -788,6 +852,29 @@ def _run_agent_adapt_session(
         for line in summary_lines:
             print(f"  {line}")
     if result.returncode != 0:
+        combined = "\n".join(part for part in [result.stderr, result.stdout] if part)
+        if allow_auth_retry and _looks_like_auth_failure(combined):
+            login_cmd = _agent_login_command(agent)
+            if login_cmd:
+                print(f"[adapt] Detected agent authentication failure. Refresh with '{login_cmd}'.")
+            if _is_interactive_tty() and login_cmd:
+                answer = input("[adapt] Run local login now and retry discover once? [Y/n]: ").strip().lower()
+                if answer != "n" and _run_local_login(login_cmd):
+                    print("[adapt] Re-syncing credentials and retrying discover once...")
+                    _run_agent_adapt_session(
+                        store=store,
+                        project=project,
+                        env=env,
+                        sec=sec,
+                        agent=agent,
+                        build_error=build_error,
+                        smoke_error=smoke_error,
+                        prompt_override=prompt_override,
+                        warn_on_failure=warn_on_failure,
+                        needs_smoke_test=needs_smoke_test,
+                        allow_auth_retry=False,
+                    )
+                    return
         if warn_on_failure:
             print("Warning: Agent session failed; continuing without result.")
             if not summary_lines:

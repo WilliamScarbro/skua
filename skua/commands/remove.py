@@ -7,6 +7,7 @@ import sys
 
 from skua.config import ConfigStore
 from skua.docker import is_container_running, image_name_for_project
+from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 from skua.utils import confirm
 
 
@@ -24,9 +25,20 @@ def _run_docker_remove(cmd: list, label: str) -> bool:
     return True
 
 
-def cmd_remove(args):
+def cmd_remove(args, lock_project: bool = True):
     store = ConfigStore()
-    name = args.name
+    name = str(getattr(args, "name", "") or "").strip()
+    if not name:
+        print("Error: Provide a project name.")
+        sys.exit(1)
+
+    if lock_project:
+        try:
+            with project_operation_lock(store, name, "removing"):
+                return cmd_remove(args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "remove this project"))
+            sys.exit(1)
 
     project = store.load_project(name)
     if project is None:

@@ -251,6 +251,13 @@ class ProjectImageSpec:
 
 
 @dataclass
+class ProjectStateSpec:
+    status: str = ""                # idle when empty; adapting | building | stopping | ...
+    lock_owner: str = ""            # host:pid that currently holds the project lock
+    lock_acquired_at: str = ""      # ISO-8601 UTC timestamp
+
+
+@dataclass
 class Project:
     """Ties Environment, SecurityProfile, and AgentConfig together for a codebase."""
     name: str = ""
@@ -264,6 +271,7 @@ class Project:
     git: ProjectGitSpec = field(default_factory=ProjectGitSpec)
     ssh: ProjectSshSpec = field(default_factory=ProjectSshSpec)
     image: ProjectImageSpec = field(default_factory=ProjectImageSpec)
+    state: ProjectStateSpec = field(default_factory=ProjectStateSpec)
 
 
 # ── Serialization helpers ────────────────────────────────────────────────

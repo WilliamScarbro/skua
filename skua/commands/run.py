@@ -31,6 +31,7 @@ from skua.docker import (
     _project_mount_path,
 )
 from skua.project_adapt import ensure_adapt_workspace
+from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 
 
 def _is_snap_binary(path: str) -> bool:
@@ -584,11 +585,23 @@ def _detached_run_command(docker_cmd: list) -> list:
     return cmd
 
 
-def cmd_run(args):
+def cmd_run(args, lock_project: bool = True):
+    name = str(getattr(args, "name", "") or "").strip()
+    if not name:
+        print("Error: Provide a project name.")
+        sys.exit(1)
+
     store = ConfigStore()
-    name = args.name
     no_attach = bool(getattr(args, "no_attach", False))
     replace_process = bool(getattr(args, "replace_process", True))
+
+    if lock_project:
+        try:
+            with project_operation_lock(store, name, "starting"):
+                return cmd_run(args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "start this project"))
+            sys.exit(1)
 
     project = store.resolve_project(name)
     if project is None:

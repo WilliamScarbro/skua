@@ -13,6 +13,7 @@ from skua.docker import (
     image_name_for_project,
     resolve_project_image_inputs,
 )
+from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 
 
 def _required_projects(store: ConfigStore) -> list:
@@ -25,8 +26,17 @@ def _required_projects(store: ConfigStore) -> list:
     return required
 
 
-def cmd_build(args):
+def cmd_build(args, lock_project: bool = True):
     store = ConfigStore()
+    project_name = str(getattr(args, "name", "") or "").strip()
+
+    if lock_project and project_name:
+        try:
+            with project_operation_lock(store, project_name, "building"):
+                return cmd_build(args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "build this project"))
+            sys.exit(1)
 
     if not store.is_initialized():
         print("Skua is not initialized. Run 'skua init' first.")
@@ -42,7 +52,6 @@ def cmd_build(args):
     g = store.load_global()
     preset_dir = Path(__file__).resolve().parent.parent / "presets"
     if preset_dir and preset_dir.exists():
-        project_name = getattr(args, "name", "")
         project = store.resolve_project(project_name)
         if project is not None:
             store.refresh_agent_preset(preset_dir, project.agent, overwrite=True)
@@ -53,7 +62,6 @@ def cmd_build(args):
     defaults = g.get("defaults", {})
     security_name = defaults.get("security", "open")
     security = store.load_security(security_name)
-    project_name = getattr(args, "name", "")
     project = store.resolve_project(project_name)
     if project is None:
         print(f"Error: Project '{project_name}' not found.")
