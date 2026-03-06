@@ -102,6 +102,37 @@ def _clear_project_state(store: ConfigStore, project_name: str, owner: str) -> N
     store.save_resource(project)
 
 
+def project_busy_error_if_locked(store: ConfigStore, project_name: str) -> ProjectBusyError | None:
+    """Return ProjectBusyError when the project lock is currently held."""
+    name = str(project_name or "").strip()
+    if not name:
+        return None
+
+    lock_path = _lock_file_path(store, name)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            project = store.load_project(name)
+            state, owner, acquired_at = _project_state_details(project)
+            return ProjectBusyError(
+                project_name=name,
+                operation=state,
+                owner=owner,
+                acquired_at=acquired_at,
+            )
+        finally:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fd.close()
+    return None
+
+
 @contextmanager
 def project_operation_lock(store: ConfigStore, project_name: str, operation: str) -> Iterator[None]:
     """Acquire a non-blocking lock for a project's mutating operation."""

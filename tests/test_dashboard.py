@@ -188,6 +188,39 @@ class TestDashboardActions(unittest.TestCase):
 
 
 class TestDashboardJobs(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.project_busy_error_if_locked")
+    def test_lock_block_message_when_busy(self, mock_busy):
+        from skua.commands.dashboard import _lock_block_message
+        from skua.project_lock import ProjectBusyError
+
+        mock_busy.return_value = ProjectBusyError(
+            project_name="demo",
+            operation="building",
+            owner="host:1234",
+            acquired_at="2026-03-06T00:00:00+00:00",
+        )
+        msg = _lock_block_message("demo", "stop")
+        self.assertIn("Project 'demo' is busy", msg)
+        self.assertIn("cannot stop this project", msg)
+
+    @mock.patch("skua.commands.dashboard.project_busy_error_if_locked", return_value=None)
+    def test_lock_block_message_empty_when_not_busy(self, _mock_busy):
+        from skua.commands.dashboard import _lock_block_message
+
+        self.assertEqual("", _lock_block_message("demo", "build"))
+
+    def test_extract_lock_busy_error(self):
+        from skua.commands.dashboard import _extract_lock_busy_error
+
+        lines = [
+            "[job 1] action=build project=demo",
+            "Error: Project 'demo' is busy (adapting) by host:1234 since 2026-03-06T00:00:00+00:00; cannot build this project.",
+            "[job 1] ended=2026-03-06T00:00:01+00:00 status=failed return_code=1",
+        ]
+        msg = _extract_lock_busy_error(lines)
+        self.assertIn("Project 'demo' is busy", msg)
+        self.assertIn("cannot build this project", msg)
+
     @mock.patch("skua.commands.dashboard._resolve_skua_cli_prefix", return_value=["/usr/bin/skua"])
     def test_background_command_mapping(self, _mock_prefix):
         from skua.commands.dashboard import _background_command

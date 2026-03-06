@@ -154,6 +154,18 @@ class TestProjectAdaptHelpers(unittest.TestCase):
             )
             self.assertTrue(_project_has_pending_request(project))
 
+    @mock.patch("skua.commands.adapt._credential_refresh_reason", return_value="no local credential files were found")
+    @mock.patch("skua.commands.adapt._is_interactive_tty", return_value=False)
+    def test_refresh_check_allows_missing_local_when_persisted_auth_exists(self, _mock_tty, _mock_reason):
+        from skua.commands.adapt import _maybe_refresh_local_credentials_for_adapt
+
+        refreshed = _maybe_refresh_local_credentials_for_adapt(
+            agent=AgentConfig(name="claude", auth=AgentAuthSpec(login_command="claude /login")),
+            cred=None,
+            allow_missing_local=True,
+        )
+        self.assertFalse(refreshed)
+
 
 class TestAdaptCommand(unittest.TestCase):
     def _new_store(self, config_dir: Path) -> ConfigStore:

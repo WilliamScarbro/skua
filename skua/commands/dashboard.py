@@ -52,6 +52,7 @@ from skua.docker import (
     image_name_for_project,
     resolve_project_image_inputs,
 )
+from skua.project_lock import format_project_busy_error, project_busy_error_if_locked
 from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
 
 _OSC52_MAX_BYTES = 100_000
@@ -271,6 +272,34 @@ def _copy_text_to_clipboard_osc52(text: str) -> tuple[bool, str]:
         return True, ""
     except OSError as exc:
         return False, f"OSC52 clipboard unavailable: {exc}"
+
+
+def _extract_lock_busy_error(lines: list[str]) -> str:
+    """Return lock-contention error text from command output lines, if present."""
+    for raw in reversed(lines):
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if "Project '" in line and " is busy" in line and "; cannot " in line:
+            return line
+    return ""
+
+
+def _lock_block_message(project_name: str, action_key: str) -> str:
+    """Return a user-facing lock contention message for an action, if blocked."""
+    label = {
+        "run": "start this project",
+        "build": "build this project",
+        "stop": "stop this project",
+        "adapt": "adapt this project",
+        "remove": "remove this project",
+        "restart": "restart this project",
+    }.get(str(action_key or "").strip(), "perform this action")
+
+    busy = project_busy_error_if_locked(ConfigStore(), project_name)
+    if busy is None:
+        return ""
+    return format_project_busy_error(busy, label)
 
 
 class DashboardJobManager:
@@ -1286,6 +1315,7 @@ def cmd_dashboard(args):
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
             self._last_logged_message = ""
+            self._job_status_seen = {job.job_id: job.status for job in self.jobs.jobs}
             self._ui_log_path = self.jobs.jobs_dir / "dashboard-ui.log"
             self._resume_mask_until = 0.0
 
@@ -1655,6 +1685,8 @@ def cmd_dashboard(args):
 
         def _request_refresh(self) -> None:
             jobs_changed = self.jobs.poll()
+            if jobs_changed:
+                self._update_job_messages()
             with self._refresh_lock:
                 if self._refresh_inflight:
                     if jobs_changed:
@@ -1663,6 +1695,21 @@ def cmd_dashboard(args):
                 self._refresh_inflight = True
             thread = threading.Thread(target=self._refresh_worker, daemon=True)
             thread.start()
+
+        def _update_job_messages(self) -> None:
+            current = {}
+            for job in self.jobs.jobs:
+                current[job.job_id] = job.status
+                prev = self._job_status_seen.get(job.job_id)
+                if prev == job.status:
+                    continue
+                if job.status != "failed":
+                    continue
+                lines = self.jobs.output_lines(job, max_lines=160)
+                reason = _extract_lock_busy_error(lines)
+                if reason:
+                    self.message = reason
+            self._job_status_seen = current
 
         def _refresh_worker(self) -> None:
             try:
@@ -2011,6 +2058,11 @@ def cmd_dashboard(args):
                     self.message = f"project '{target}' is running; stop it before remove"
                     self._refresh_view()
                     return
+                lock_msg = _lock_block_message(target, "remove")
+                if lock_msg:
+                    self.message = lock_msg
+                    self._refresh_view()
+                    return
                 background = _background_command("remove", target)
                 if not background:
                     self.message = "remove action is unavailable"
@@ -2067,6 +2119,11 @@ def cmd_dashboard(args):
                     else "Cancel"
                 )
                 if option.startswith("Discover"):
+                    lock_msg = _lock_block_message(project_name, "adapt")
+                    if lock_msg:
+                        self.message = lock_msg
+                        self._refresh_view()
+                        return
                     background = _background_command("adapt", project_name, discover=True)
                     if not background:
                         self.message = "adapt action is unavailable"
@@ -3175,6 +3232,11 @@ def cmd_dashboard(args):
                 return
             project_name = self._selected_project_name()
             if not project_name:
+                return
+            lock_msg = _lock_block_message(project_name, action_key)
+            if lock_msg:
+                self.message = lock_msg
+                self._refresh_view()
                 return
             if action_key == "adapt":
                 try:
