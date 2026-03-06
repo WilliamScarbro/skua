@@ -23,6 +23,7 @@ Package: ${PKG_NAME}
 Version: ${VERSION}
 Architecture: all
 Depends: python3, python3-yaml, docker.io | docker-ce
+Recommends: python3-rich, python3-textual, xclip | xsel | wl-clipboard
 Maintainer: William Scarbro
 Description: Skua - Dockerized Claude Code Manager
  A CLI tool for building, running, and managing Dockerized Claude Code

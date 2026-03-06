@@ -4,6 +4,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKUA="$SCRIPT_DIR/bin/skua"
+REQ_FILE="$SCRIPT_DIR/requirements.txt"
 
 echo "============================================"
 echo "  skua installer"
@@ -23,16 +24,26 @@ if [ -n "$missing" ]; then
     exit 1
 fi
 
-# Check for PyYAML
-if ! python3 -c "import yaml" 2>/dev/null; then
-    echo "Installing PyYAML..."
-    pip3 install --break-system-packages pyyaml 2>/dev/null || pip3 install pyyaml
+# Check/install Python runtime dependencies for skua.
+if ! python3 -c "import yaml, rich, textual" 2>/dev/null; then
+    echo "Installing Python dependencies from requirements.txt..."
+    if [ -f "$REQ_FILE" ]; then
+        pip3 install --break-system-packages -r "$REQ_FILE" 2>/dev/null || pip3 install -r "$REQ_FILE"
+    else
+        pip3 install --break-system-packages pyyaml rich textual 2>/dev/null || pip3 install pyyaml rich textual
+    fi
 fi
 
-# Check for Textual (dashboard UI)
-if ! python3 -c "import textual" 2>/dev/null; then
-    echo "Installing Textual..."
-    pip3 install --break-system-packages textual 2>/dev/null || pip3 install textual
+# Try to install a clipboard tool for export/copy convenience.
+if ! command -v wl-copy >/dev/null 2>&1 && ! command -v xclip >/dev/null 2>&1 && ! command -v xsel >/dev/null 2>&1 && ! command -v pbcopy >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "Installing xclip for clipboard support..."
+        if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y xclip || true
+        elif [ "$(id -u)" -eq 0 ]; then
+            apt-get update -y && apt-get install -y xclip || true
+        fi
+    fi
 fi
 
 # Verify Docker daemon is running
@@ -42,7 +53,7 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
-echo "[OK] Prerequisites: docker, python3, git, pyyaml, textual"
+echo "[OK] Prerequisites: docker, python3, git, pyyaml, rich, textual"
 echo ""
 
 # ── Install skua to PATH ─────────────────────────────────────────────
@@ -110,13 +121,6 @@ echo ""
 
 echo ""
 
-# ── Build the Docker image ────────────────────────────────────────────
-echo "Building Docker image (this may take a few minutes)..."
-echo ""
-"$SKUA" build
-
-echo ""
-
 # ── Done ──────────────────────────────────────────────────────────────
 echo ""
 echo "============================================"
@@ -125,6 +129,7 @@ echo "============================================"
 echo ""
 echo "Quick start:"
 echo ""
+echo "  skua build"
 echo "  skua add <project-name> --dir /path/to/project"
 echo "  skua run <project-name>"
 echo ""
