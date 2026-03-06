@@ -142,6 +142,10 @@ class TestDashboardJobs(unittest.TestCase):
             ["/usr/bin/skua", "adapt", "demo", "--build", "--force"],
             _background_command("adapt", "demo"),
         )
+        self.assertEqual(
+            ["/usr/bin/skua", "adapt", "demo", "--discover", "--force"],
+            _background_command("adapt", "demo", discover=True),
+        )
         self.assertIsNone(_background_command("run", "demo"))
 
     @mock.patch("skua.commands.dashboard.shutil.which", return_value=None)

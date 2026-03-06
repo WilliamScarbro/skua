@@ -152,11 +152,13 @@ def _resolve_skua_cli_prefix() -> list[str]:
     return [sys.executable, str(cli_py)]
 
 
-def _background_command(action_key: str, project_name: str) -> list[str] | None:
+def _background_command(action_key: str, project_name: str, discover: bool = False) -> list[str] | None:
     prefix = _resolve_skua_cli_prefix()
     if action_key == "build":
         return prefix + ["build", project_name]
     if action_key == "adapt":
+        if discover:
+            return prefix + ["adapt", project_name, "--discover", "--force"]
         return prefix + ["adapt", project_name, "--build", "--force"]
     if action_key == "stop":
         return prefix + ["stop", project_name, "--force"]
@@ -1253,6 +1255,8 @@ def cmd_dashboard(args):
             self.task_remove_project = ""
             self.task_error = ""
             self.task_export_options: list[str] = []
+            self.task_adapt_project = ""
+            self.task_adapt_options: list[str] = []
             self.output_scroll = 0
             self.output_follow = False
             self.project_scroll = 0
@@ -1870,6 +1874,25 @@ def cmd_dashboard(args):
             self.focus = "task"
             self.message = f"export job #{job.job_id}"
 
+        def _start_adapt_discover_task(self, project_name: str) -> None:
+            self.task_mode = "adapt_discover"
+            self.task_adapt_project = project_name
+            self.task_adapt_options = ["Discover adaptations (--discover)", "Cancel"]
+            self.task_option_index = 0
+            self.focus = "task"
+            self.show_job_output = False
+            self.message = (
+                f"project '{project_name}' has no pending image-request changes; "
+                "discover adaptations with --discover?"
+            )
+
+        def _project_has_pending_adapt(self, project_name: str) -> bool:
+            store = ConfigStore()
+            project = store.resolve_project(project_name)
+            if project is None:
+                return False
+            return bool(_has_pending_adapt_request(project))
+
         def _project_is_running(self, project_name: str) -> bool:
             store = ConfigStore()
             project = store.resolve_project(project_name)
@@ -1885,6 +1908,8 @@ def cmd_dashboard(args):
             self.task_remove_project = ""
             self.task_error = ""
             self.task_export_options = []
+            self.task_adapt_project = ""
+            self.task_adapt_options = []
             if self.focus == "task":
                 self.focus = "projects" if self.snapshot.rows else "jobs"
             self.message = reason
@@ -2010,6 +2035,38 @@ def cmd_dashboard(args):
                 self.focus = "jobs"
                 self._refresh_view()
                 return
+            if self.task_mode == "adapt_discover":
+                project_name = self.task_adapt_project
+                option = (
+                    self.task_adapt_options[self.task_option_index]
+                    if self.task_adapt_options
+                    else "Cancel"
+                )
+                if option.startswith("Discover"):
+                    background = _background_command("adapt", project_name, discover=True)
+                    if not background:
+                        self.message = "adapt action is unavailable"
+                        self._refresh_view()
+                        return
+                    try:
+                        job = self.jobs.enqueue("adapt", project_name, command=background)
+                        self.message = f"queued job #{job.job_id}: adapt {project_name} --discover"
+                        self.show_job_output = False
+                        self.selected_job = 0
+                    except Exception as exc:
+                        self.message = (
+                            f"failed to queue adapt {project_name} --discover: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                else:
+                    self.message = f"adapt cancelled for '{project_name}'"
+                self.task_mode = ""
+                self.task_adapt_project = ""
+                self.task_adapt_options = []
+                self.focus = "projects"
+                self._refresh_view()
+                self._request_refresh()
+                return
             if self.task_mode != "new_project":
                 return
             step = self._current_task_step()
@@ -2058,6 +2115,12 @@ def cmd_dashboard(args):
                 if not self.task_export_options:
                     return
                 self.task_option_index = (self.task_option_index + delta) % len(self.task_export_options)
+                self._refresh_view()
+                return
+            if self.task_mode == "adapt_discover":
+                if not self.task_adapt_options:
+                    return
+                self.task_option_index = (self.task_option_index + delta) % len(self.task_adapt_options)
                 self._refresh_view()
                 return
             step = self._current_task_step()
@@ -2328,12 +2391,12 @@ def cmd_dashboard(args):
                 )
                 header.update(Group(title, focus_line, self._section_header("Help"), help_text))
                 try:
-                    projects_table.styles.display = "block"
+                    projects_table.styles.display = "none"
                 except Exception:
                     pass
                 project_summary.update(Text(""))
                 try:
-                    project_summary.styles.display = "block"
+                    project_summary.styles.display = "none"
                 except Exception:
                     pass
                 jobs_header.update(Text(""))
@@ -2527,6 +2590,24 @@ def cmd_dashboard(args):
                     elif len(plain) < width:
                         rendered.append(" " * (width - len(plain)), style="black on white")
                     return Group(line, rendered)
+                if self.task_mode == "adapt_discover":
+                    prefix = f"no pending changes for '{self.task_adapt_project}':"
+                    line = Text(prefix[:width].ljust(width), style="bold black on white")
+                    options = self.task_adapt_options or ["Discover adaptations (--discover)", "Cancel"]
+                    rendered = Text(style="bold black on white")
+                    for i, option in enumerate(options):
+                        if i > 0:
+                            rendered.append("  |  ", style="black on white")
+                        if i == self.task_option_index:
+                            rendered.append(f"[{option}]", style="bold white on blue")
+                        else:
+                            rendered.append(option, style="bold black on white")
+                    plain = rendered.plain
+                    if len(plain) > width:
+                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
+                    elif len(plain) < width:
+                        rendered.append(" " * (width - len(plain)), style="black on white")
+                    return Group(line, rendered)
                 step = self._current_task_step()
                 steps = self._task_steps()
                 if step is None:
@@ -2598,6 +2679,12 @@ def cmd_dashboard(args):
                         ("⏎", "Export", "bold green"),
                         ("Esc", "Cancel", "bold red"),
                     ]
+                if self.task_mode == "adapt_discover":
+                    return [
+                        ("←/→", "Choose", "bold yellow"),
+                        ("⏎", "Confirm", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
                 return [
                     ("←/→", "Select", "bold yellow"),
                     ("type", "Edit Text", "bold cyan"),
@@ -2612,6 +2699,7 @@ def cmd_dashboard(args):
                     ("↑/↓", "Scroll Output", "bold white"),
                     ("←/→", "Switch Job", "bold yellow"),
                     ("o", "Close Output", "bold cyan"),
+                    ("x", "Cancel", "bold red"),
                     ("d", "Remove Job", "bold red"),
                     ("y", "Export Output", "bold blue"),
                     ("q", "Quit", "bold bright_black"),
@@ -3014,6 +3102,15 @@ def cmd_dashboard(args):
             project_name = self._selected_project_name()
             if not project_name:
                 return
+            if action_key == "adapt":
+                try:
+                    pending_adapt = self._project_has_pending_adapt(project_name)
+                except Exception:
+                    pending_adapt = True
+                if not pending_adapt:
+                    self._start_adapt_discover_task(project_name)
+                    self._refresh_view()
+                    return
             background = _background_command(action_key, project_name)
             if background is not None:
                 try:
@@ -3281,6 +3378,10 @@ def cmd_dashboard(args):
                 return
             if self.task_mode == "remove_confirm":
                 self._task_cancel("remove cancelled")
+                self._refresh_view()
+                return
+            if self.task_mode == "adapt_discover":
+                self._task_cancel("adapt cancelled")
                 self._refresh_view()
                 return
             self._task_cancel()
