@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: BUSL-1.1
 """skua dashboard — live interactive project dashboard."""
 
+import base64
 import json
 import fcntl
+import inspect
 import os
 import pty
 import re
@@ -48,6 +50,11 @@ from skua.docker import (
     resolve_project_image_inputs,
 )
 from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
+
+_OSC52_MAX_BYTES = 100_000
+_CLIPBOARD_FAST_TIMEOUT_SEC = 0.35
+_DASHBOARD_UI_LOG_MAX_BYTES = 2_000_000
+_CLIPBOARD_BACKEND_CACHE: str | None = None
 
 
 @dataclass
@@ -159,30 +166,106 @@ def _background_command(action_key: str, project_name: str) -> list[str] | None:
 
 
 def _copy_text_to_clipboard(text: str) -> tuple[bool, str]:
-    commands = []
-    if shutil.which("wl-copy"):
-        commands.append(["wl-copy"])
-    if shutil.which("xclip"):
-        commands.append(["xclip", "-selection", "clipboard"])
-    if shutil.which("xsel"):
-        commands.append(["xsel", "--clipboard", "--input"])
-    if shutil.which("pbcopy"):
-        commands.append(["pbcopy"])
+    global _CLIPBOARD_BACKEND_CACHE
+    commands = _clipboard_commands()
+    terminal_only = (not os.environ.get("DISPLAY")) and (not os.environ.get("WAYLAND_DISPLAY"))
+    has_tty = Path("/dev/tty").exists()
 
-    if not commands:
-        return False, "no clipboard command found (wl-copy/xclip/xsel/pbcopy)"
+    # Preferred order:
+    # 1) last known-good backend, 2) OSC52 first for terminal-only sessions, 3) local clipboard commands.
+    backends: list[tuple[str, list[str] | None]] = []
+    if _CLIPBOARD_BACKEND_CACHE == "osc52" and has_tty:
+        backends.append(("osc52", None))
+    elif _CLIPBOARD_BACKEND_CACHE:
+        cached = next((cmd for cmd in commands if cmd and cmd[0] == _CLIPBOARD_BACKEND_CACHE), None)
+        if cached:
+            backends.append((cached[0], cached))
+    if terminal_only and has_tty:
+        backends.append(("osc52", None))
+    for cmd in commands:
+        backends.append((cmd[0], cmd))
+    if has_tty and not terminal_only:
+        backends.append(("osc52", None))
+    if not backends:
+        return False, "clipboard unavailable: no backend and no tty for OSC52"
 
     last_err = ""
-    for cmd in commands:
+    for backend_name, cmd in backends:
+        if backend_name == "osc52":
+            ok, detail = _copy_text_to_clipboard_osc52(text)
+            if ok:
+                _CLIPBOARD_BACKEND_CACHE = "osc52"
+                return True, ""
+            last_err = detail
+            continue
         try:
-            result = subprocess.run(cmd, input=text, text=True, capture_output=True, check=False)
+            result = subprocess.run(
+                cmd,
+                input=text,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=_CLIPBOARD_FAST_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            last_err = f"{cmd[0]} timed out"
+            continue
         except OSError as exc:
             last_err = str(exc)
             continue
         if result.returncode == 0:
+            _CLIPBOARD_BACKEND_CACHE = backend_name
             return True, ""
         last_err = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
     return False, last_err or "clipboard copy failed"
+
+
+def _clipboard_copy_available() -> bool:
+    if _clipboard_commands():
+        return True
+    return Path("/dev/tty").exists()
+
+
+def _clipboard_commands() -> list[list[str]]:
+    commands: list[list[str]] = []
+    has_display = bool(os.environ.get("DISPLAY"))
+    has_wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+    if shutil.which("wl-copy") and (has_wayland or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
+        commands.append(["wl-copy"])
+    if shutil.which("xclip") and has_display:
+        commands.append(["xclip", "-selection", "clipboard"])
+    if shutil.which("xsel") and has_display:
+        commands.append(["xsel", "--clipboard", "--input"])
+    if shutil.which("pbcopy"):
+        commands.append(["pbcopy"])
+    return commands
+
+
+def _copy_text_to_clipboard_osc52(text: str) -> tuple[bool, str]:
+    try:
+        raw = text.encode("utf-8")
+    except Exception as exc:
+        return False, f"OSC52 encode failed: {exc}"
+    if len(raw) > _OSC52_MAX_BYTES:
+        return False, f"output too large for OSC52 clipboard ({len(raw)} bytes > {_OSC52_MAX_BYTES})"
+    try:
+        payload = base64.b64encode(raw).decode("ascii")
+    except Exception as exc:
+        return False, f"OSC52 encode failed: {exc}"
+    seq = f"\033]52;c;{payload}\a"
+    # tmux passthrough wrapper.
+    if os.environ.get("TMUX"):
+        seq = f"\033Ptmux;\033{seq}\033\\"
+    tty_path = Path("/dev/tty")
+    if not tty_path.exists():
+        return False, "OSC52 clipboard unavailable: no tty"
+    try:
+        with tty_path.open("w", encoding="utf-8", errors="ignore") as tty:
+            tty.write(seq)
+            tty.flush()
+        return True, ""
+    except OSError as exc:
+        return False, f"OSC52 clipboard unavailable: {exc}"
 
 
 class DashboardJobManager:
@@ -715,9 +798,9 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
     return success
 
 
-def _run_action(action_key: str, project_name: str) -> bool:
+def _run_action(action_key: str, project_name: str, replace_process: bool = False) -> bool:
     if action_key == "run":
-        cmd_run(SimpleNamespace(name=project_name, replace_process=False))
+        cmd_run(SimpleNamespace(name=project_name, replace_process=replace_process))
         return True
     if action_key == "build":
         return _build_selected_project(project_name, verbose=False)
@@ -749,7 +832,7 @@ def _run_action(action_key: str, project_name: str) -> bool:
         cmd_remove(SimpleNamespace(name=project_name))
         return True
     if action_key == "restart":
-        cmd_restart(SimpleNamespace(name=project_name, force=True, replace_process=False))
+        cmd_restart(SimpleNamespace(name=project_name, force=True, replace_process=replace_process))
         return True
     return False
 
@@ -1031,9 +1114,9 @@ def _run_add_project_interactive(suspend=None) -> str:
             return f"new project {args.name}: failed ({type(exc).__name__}: {exc})"
 
 
-def _execute_action(action_key: str, project_name: str) -> tuple:
+def _execute_action(action_key: str, project_name: str, replace_process: bool = False) -> tuple:
     try:
-        success = _run_action(action_key, project_name)
+        success = _run_action(action_key, project_name, replace_process=replace_process)
         return bool(success), ""
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
@@ -1042,14 +1125,34 @@ def _execute_action(action_key: str, project_name: str) -> tuple:
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _run_action_interactive(action_key: str, project_name: str, suspend=None) -> str:
+def _run_action_interactive(
+    action_key: str,
+    project_name: str,
+    suspend=None,
+    replace_process: bool = False,
+) -> str:
     action_label = {"run": "run", "build": "build", "stop": "stop", "adapt": "adapt", "remove": "remove", "restart": "restart"}[action_key]
-    suspend_cm = suspend() if suspend is not None else nullcontext()
-    with suspend_cm:
+
+    def _run_once() -> tuple[bool, str]:
         print(f"[dashboard] {action_label} {project_name}")
-        success, detail = _execute_action(action_key, project_name)
+        ok, detail = _execute_action(action_key, project_name, replace_process=replace_process)
         if detail:
             print(detail)
+        return ok, detail
+
+    success = False
+    detail = ""
+    if suspend is None:
+        success, detail = _run_once()
+    else:
+        try:
+            with suspend():
+                success, detail = _run_once()
+        except Exception as exc:
+            # Textual inline mode raises SuspendNotSupported; retry without suspend.
+            if type(exc).__name__ != "SuspendNotSupported":
+                raise
+            success, detail = _run_once()
     return f"{action_label} {project_name}: {'ok' if success else 'failed'}"
 
 
@@ -1062,15 +1165,42 @@ def cmd_dashboard(args):
         from textual.app import App, ComposeResult
         from textual.binding import Binding
         from textual.widgets import Static
+        try:
+            from textual.widgets import DataTable
+        except ImportError:  # pragma: no cover - compatibility for older Textual
+            DataTable = None
     except ImportError:
         print("Error: 'skua dashboard' requires the 'textual' package.")
         print("Install it with: pip3 install textual")
         raise SystemExit(1)
 
+    inside_emacs = bool(os.environ.get("INSIDE_EMACS"))
+    screen_override = str(os.environ.get("SKUA_DASHBOARD_SCREEN", "")).strip().lower()
+
     class DashboardApp(App):
         DEFAULT_CSS = """
         #dashboard-view {
             height: 1fr;
+        }
+        #dashboard-header {
+            height: auto;
+        }
+        #projects-table {
+            height: auto;
+            max-height: 14;
+        }
+        #project-summary {
+            height: auto;
+        }
+        #jobs-header {
+            height: auto;
+        }
+        #jobs-table {
+            height: auto;
+            max-height: 12;
+        }
+        #dashboard-footer {
+            height: auto;
         }
         #status-bar {
             dock: bottom;
@@ -1082,6 +1212,7 @@ def cmd_dashboard(args):
             Binding("q", "quit", "Quit"),
             Binding("h", "toggle_help", "Help"),
             Binding("tab", "toggle_focus", "Focus"),
+            Binding("f", "toggle_focus", "Focus"),
             Binding("left", "task_prev_option", show=False),
             Binding("right", "task_next_option", show=False),
             Binding("escape", "task_cancel", show=False),
@@ -1105,6 +1236,7 @@ def cmd_dashboard(args):
             self.dashboard_args = dashboard_args
             self.snapshot = DashboardSnapshot(columns=[], rows=[], summary=[])
             self.selected = 0
+            self.selected_project_name = None
             self.selected_job = 0
             self.focus = "projects"
             self.show_job_output = False
@@ -1122,34 +1254,376 @@ def cmd_dashboard(args):
             self.task_error = ""
             self.task_export_options: list[str] = []
             self.output_scroll = 0
+            self.output_follow = False
+            self.project_scroll = 0
+            self.project_hscroll = 0
+            self.jobs_hscroll = 0
+            self._project_table_scroll_x = 0
+            self._jobs_table_scroll_x = 0
+            self._use_project_widget = DataTable is not None
+            self._project_table_sig = None
+            self._jobs_table_sig = None
+            self._project_cursor_visible = None
+            self._jobs_cursor_visible = None
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
+            self._last_logged_message = ""
+            self._ui_log_path = self.jobs.jobs_dir / "dashboard-ui.log"
+
+        def _log_ui_event(self, event: str, **fields) -> None:
+            try:
+                payload = {"ts": _utc_now_iso(), "event": event}
+                payload.update(fields)
+                if self._ui_log_path.exists() and self._ui_log_path.stat().st_size > _DASHBOARD_UI_LOG_MAX_BYTES:
+                    rotated = self._ui_log_path.with_suffix(".log.1")
+                    self._ui_log_path.replace(rotated)
+                with self._ui_log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, sort_keys=True))
+                    f.write("\n")
+            except Exception:
+                # Logging must never impact dashboard interactivity.
+                pass
 
         def compose(self) -> ComposeResult:
-            yield Static(id="dashboard-view")
+            if self._use_project_widget:
+                yield Static(id="dashboard-header")
+                yield DataTable(id="projects-table")
+                yield Static(id="project-summary")
+                yield Static(id="jobs-header")
+                yield DataTable(id="jobs-table")
+                yield Static(id="dashboard-footer")
+            else:
+                yield Static(id="dashboard-view")
             yield Static(id="status-bar")
 
         def on_mount(self) -> None:
+            self._log_ui_event("mount", log_path=str(self._ui_log_path))
+            if self._use_project_widget:
+                self._init_project_table()
+                self._init_jobs_table()
             self._request_refresh()
             self.set_interval(2.0, self._request_refresh)
 
-        def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:  # pragma: no cover - runtime UI behavior
-            if not self.task_mode:
+        def _init_project_table(self) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#projects-table")
+            try:
+                table.cursor_type = "row"
+            except Exception:
+                pass
+            try:
+                table.zebra_stripes = False
+            except Exception:
+                pass
+            # Keep global app keybindings authoritative for cursor movement.
+            # DataTable should render selection but not consume focus/keys.
+            try:
+                table.can_focus = False
+            except Exception:
+                pass
+
+        def _set_project_cursor(self, idx: int) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#projects-table")
+            target = max(0, int(idx))
+            try:
+                table.cursor_row = target
+                return
+            except Exception:
+                pass
+            try:
+                table.move_cursor(row=target, column=0)
+            except Exception:
+                pass
+
+        def _init_jobs_table(self) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#jobs-table")
+            try:
+                table.cursor_type = "row"
+            except Exception:
+                pass
+            try:
+                table.zebra_stripes = False
+            except Exception:
+                pass
+            try:
+                table.can_focus = False
+            except Exception:
+                pass
+
+        def _set_jobs_cursor(self, idx: int) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#jobs-table")
+            target = max(0, int(idx))
+            try:
+                table.cursor_row = target
+                return
+            except Exception:
+                pass
+            try:
+                table.move_cursor(row=target, column=0)
+            except Exception:
+                pass
+
+        def _refresh_jobs_widget_local(self) -> None:
+            if not self._use_project_widget:
+                return
+            jobs_view = self.jobs.list_for_view()
+            self._rebuild_jobs_table(jobs_view)
+            self._sync_jobs_cursor_mode()
+            self._set_jobs_cursor(self.selected_job)
+
+        def _get_jobs_cursor_row(self) -> int | None:
+            if not self._use_project_widget:
+                return None
+            table = self.query_one("#jobs-table")
+            row = getattr(table, "cursor_row", None)
+            if isinstance(row, int):
+                return row
+            coord = getattr(table, "cursor_coordinate", None)
+            if coord is not None:
+                r = getattr(coord, "row", None)
+                if isinstance(r, int):
+                    return r
+            return None
+
+        def _scroll_table_x(self, table_id: str, delta: int) -> bool:
+            """Pan a widget table horizontally by delta cells/chars."""
+            if not self._use_project_widget or delta == 0:
+                return False
+            table = self.query_one(table_id)
+            cur_x = int(getattr(table, "scroll_x", 0) or 0)
+            next_x = max(0, cur_x + int(delta))
+            if next_x == cur_x:
+                return False
+            cur_y = int(getattr(table, "scroll_y", 0) or 0)
+            try:
+                table.scroll_to(x=next_x, y=cur_y, animate=False, force=True)
+                if table_id == "#projects-table":
+                    self._project_table_scroll_x = next_x
+                elif table_id == "#jobs-table":
+                    self._jobs_table_scroll_x = next_x
                 return True
-            if self.task_mode == "job_input":
-                return action in {"run_selected", "task_cancel"}
-            if self.task_mode == "remove_confirm":
-                return action in {"run_selected", "task_cancel"}
-            if self.task_mode == "export_choice":
-                return action in {"run_selected", "task_cancel", "cursor_up", "cursor_down", "task_prev_option", "task_next_option"}
-            return action in {
-                "run_selected",
-                "cursor_up",
-                "cursor_down",
-                "task_prev_option",
-                "task_next_option",
-                "task_cancel",
-            }
+            except Exception:
+                return False
+
+        def _restore_table_x(self, table_id: str, x_value: int) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one(table_id)
+            cur_y = int(getattr(table, "scroll_y", 0) or 0)
+            target_x = max(0, int(x_value))
+            try:
+                table.scroll_to(x=target_x, y=cur_y, animate=False, force=True)
+            except Exception:
+                pass
+            try:
+                table.move_cursor(row=target, column=0)
+            except Exception:
+                pass
+
+        def _sync_project_cursor_mode(self) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#projects-table")
+            show_projects_cursor = (self.focus == "projects" and not self.task_mode and not self.show_job_output)
+            if self._project_cursor_visible is show_projects_cursor:
+                return
+            try:
+                table.cursor_type = "row" if show_projects_cursor else "none"
+                self._project_cursor_visible = show_projects_cursor
+            except Exception:
+                # Some Textual builds may not support "none"; degrade gracefully.
+                if not show_projects_cursor:
+                    try:
+                        table.show_cursor = False
+                        self._project_cursor_visible = False
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        table.show_cursor = True
+                        self._project_cursor_visible = True
+                    except Exception:
+                        pass
+
+        def _sync_jobs_cursor_mode(self) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#jobs-table")
+            show_jobs_cursor = (self.focus == "jobs" and not self.task_mode and not self.show_job_output)
+            if self._jobs_cursor_visible is show_jobs_cursor:
+                return
+            try:
+                table.cursor_type = "row" if show_jobs_cursor else "none"
+                self._jobs_cursor_visible = show_jobs_cursor
+            except Exception:
+                if not show_jobs_cursor:
+                    try:
+                        table.show_cursor = False
+                        self._jobs_cursor_visible = False
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        table.show_cursor = True
+                        self._jobs_cursor_visible = True
+                    except Exception:
+                        pass
+
+        def _rebuild_project_table(self) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#projects-table")
+            keep_scroll_x = int(self._project_table_scroll_x)
+            columns = self._fit_project_columns(self.snapshot.columns)
+            rows = self.snapshot.rows or []
+            try:
+                table.clear(columns=True)
+            except Exception:
+                try:
+                    table.clear()
+                except Exception:
+                    pass
+            if not columns:
+                try:
+                    table.add_column("PROJECTS")
+                    table.add_row("No projects configured.")
+                except Exception:
+                    pass
+                self._project_table_sig = ((), ())
+                self._set_project_cursor(0)
+                return
+            for col_name, _col_width in columns:
+                try:
+                    table.add_column(col_name)
+                except Exception:
+                    pass
+            for row in rows:
+                cells = row.get("cells", [])
+                values = []
+                for i, (col_name, _col_width) in enumerate(columns):
+                    raw_value = str(cells[i]) if i < len(cells) else ""
+                    values.append(Text(raw_value, style=self._cell_style(col_name, raw_value)))
+                try:
+                    table.add_row(*values)
+                except Exception:
+                    pass
+            sig_cols = tuple((name, width) for name, width in columns)
+            sig_rows = tuple(tuple(str(cell) for cell in row.get("cells", [])) for row in rows)
+            self._project_table_sig = (sig_cols, sig_rows)
+            self._restore_table_x("#projects-table", keep_scroll_x)
+            self._set_project_cursor(min(self.selected, max(0, len(rows) - 1)))
+
+        def _rebuild_jobs_table(self, jobs_view: list[DashboardJob]) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#jobs-table")
+            keep_scroll_x = int(self._jobs_table_scroll_x)
+            try:
+                table.clear(columns=True)
+            except Exception:
+                try:
+                    table.clear()
+                except Exception:
+                    pass
+            columns = [("JOBS", 6), ("ACTION", 8), ("PROJECT", 18), ("STATUS", 14), ("AGE", 6), ("EXIT", 6)]
+            for col_name, _col_width in columns:
+                try:
+                    table.add_column(col_name)
+                except Exception:
+                    pass
+            if not jobs_view:
+                try:
+                    table.add_row("-", "-", "-", Text("none", style="dim"), "-", "-")
+                except Exception:
+                    pass
+                self._jobs_table_sig = (tuple(c[0] for c in columns), ())
+                self._set_jobs_cursor(0)
+                return
+
+            visible = jobs_view[:10]
+            sig_rows = []
+            for job in visible:
+                rc_raw = "-" if job.return_code is None else str(job.return_code)
+                project_raw = job.project
+                status_raw = job.status
+                age_raw = _format_age(job.started_at)
+                action_raw = job.action
+                id_raw = str(job.job_id)
+                status_style = self._job_status_style(job.status)
+                sig_rows.append((id_raw, action_raw, project_raw, status_raw, age_raw, rc_raw))
+                try:
+                    table.add_row(
+                        id_raw,
+                        action_raw,
+                        project_raw,
+                        Text(status_raw, style=status_style),
+                        age_raw,
+                        rc_raw,
+                    )
+                except Exception:
+                    pass
+            self._jobs_table_sig = (tuple(c[0] for c in columns), tuple(sig_rows))
+            self._restore_table_x("#jobs-table", keep_scroll_x)
+            self._set_jobs_cursor(min(self.selected_job, max(0, len(visible) - 1)))
+
+        @staticmethod
+        def _apply_hscroll(value: str, offset: int) -> str:
+            if offset <= 0:
+                return value
+            if len(value) <= offset:
+                return "…"
+            return "…" + value[offset:]
+
+        def _max_project_hscroll(self) -> int:
+            max_len = 0
+            for row in self.snapshot.rows:
+                for cell in row.get("cells", []):
+                    max_len = max(max_len, len(str(cell)))
+            return max(0, max_len - 1)
+
+        def _max_jobs_hscroll(self, jobs_view: list[DashboardJob]) -> int:
+            max_len = 0
+            for job in jobs_view[:10]:
+                rc = "-" if job.return_code is None else str(job.return_code)
+                max_len = max(
+                    max_len,
+                    len(str(job.job_id)),
+                    len(job.action),
+                    len(job.project),
+                    len(job.status),
+                    len(_format_age(job.started_at)),
+                    len(rc),
+                )
+            return max(0, max_len - 1)
+
+        def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:  # pragma: no cover - runtime UI behavior
+            allowed = True
+            if not self.task_mode:
+                allowed = True
+            elif self.task_mode == "job_input":
+                allowed = action in {"run_selected", "task_cancel"}
+            elif self.task_mode == "remove_confirm":
+                allowed = action in {"run_selected", "task_cancel"}
+            elif self.task_mode == "export_choice":
+                allowed = action in {"run_selected", "task_cancel", "cursor_up", "cursor_down", "task_prev_option", "task_next_option"}
+            else:
+                allowed = action in {
+                    "run_selected",
+                    "cursor_up",
+                    "cursor_down",
+                    "task_prev_option",
+                    "task_next_option",
+                    "task_cancel",
+                }
+            self._log_ui_event("check_action", action=action, allowed=allowed, task_mode=self.task_mode)
+            return allowed
 
         def _request_refresh(self) -> None:
             jobs_changed = self.jobs.poll()
@@ -1178,7 +1652,7 @@ def cmd_dashboard(args):
         def _apply_snapshot(self, snapshot: DashboardSnapshot) -> None:
             with self._refresh_lock:
                 self._refresh_inflight = False
-            prev_name = self._selected_project_name()
+            prev_name = self.selected_project_name or self._selected_project_name()
             self.snapshot = snapshot
             if self.snapshot.rows:
                 if prev_name is not None:
@@ -1190,8 +1664,13 @@ def cmd_dashboard(args):
                         self.selected = min(self.selected, len(self.snapshot.rows) - 1)
                 else:
                     self.selected = min(self.selected, len(self.snapshot.rows) - 1)
+                self.selected_project_name = self.snapshot.rows[self.selected]["name"]
             else:
                 self.selected = 0
+                self.selected_project_name = None
+            if self._use_project_widget:
+                self._project_table_sig = None
+                self._jobs_table_sig = None
             self._refresh_view()
 
         def _selected_project_name(self) -> str | None:
@@ -1200,6 +1679,14 @@ def cmd_dashboard(args):
             if self.selected < 0 or self.selected >= len(self.snapshot.rows):
                 return None
             return self.snapshot.rows[self.selected]["name"]
+
+        def _set_selected_project_index(self, idx: int) -> None:
+            if not self.snapshot.rows:
+                self.selected = 0
+                self.selected_project_name = None
+                return
+            self.selected = max(0, min(int(idx), len(self.snapshot.rows) - 1))
+            self.selected_project_name = self.snapshot.rows[self.selected]["name"]
 
         def _build_new_project_catalog(self) -> dict:
             store = ConfigStore()
@@ -1374,7 +1861,7 @@ def cmd_dashboard(args):
 
         def _start_export_choice_task(self, job: DashboardJob) -> None:
             options = ["Save to file"]
-            if any(shutil.which(cmd) for cmd in ("wl-copy", "xclip", "xsel", "pbcopy")):
+            if _clipboard_copy_available():
                 options.extend(["Copy to clipboard", "Save + clipboard"])
             self.task_mode = "export_choice"
             self.task_job_id = job.job_id
@@ -1451,8 +1938,10 @@ def cmd_dashboard(args):
             self._request_refresh()
 
         def _task_submit_step(self) -> None:
+            self._log_ui_event("task_submit", task_mode=self.task_mode, step=self.task_step)
             if self.task_mode == "job_input":
                 ok, detail = self.jobs.send_input(self.task_job_id, self.task_input)
+                self._log_ui_event("job_input_send", job_id=self.task_job_id, ok=ok, detail=detail)
                 if ok:
                     self.message = f"job #{self.task_job_id}: input sent"
                     self.task_mode = ""
@@ -1499,15 +1988,18 @@ def cmd_dashboard(args):
                     self._refresh_view()
                     return
                 option = self.task_export_options[self.task_option_index] if self.task_export_options else "Save to file"
+                self._log_ui_event("export_choice", job_id=self.task_job_id, option=option)
                 path = self.jobs.export_output(job)
                 text = Path(path).read_text(errors="replace")
                 if option == "Save to file":
                     self.message = f"exported job #{job.job_id} output to {path}"
                 elif option == "Copy to clipboard":
                     ok, detail = _copy_text_to_clipboard(text)
+                    self._log_ui_event("clipboard_copy", job_id=job.job_id, ok=ok, detail=detail, bytes=len(text.encode('utf-8', errors='ignore')))
                     self.message = f"copied job #{job.job_id} output to clipboard" if ok else f"clipboard copy failed: {detail}"
                 else:
                     ok, detail = _copy_text_to_clipboard(text)
+                    self._log_ui_event("clipboard_copy", job_id=job.job_id, ok=ok, detail=detail, bytes=len(text.encode('utf-8', errors='ignore')))
                     if ok:
                         self.message = f"exported to {path} and copied to clipboard"
                     else:
@@ -1579,6 +2071,7 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def on_key(self, event) -> None:  # pragma: no cover - runtime UI behavior
+            self._log_ui_event("key", key=getattr(event, "key", ""), character=getattr(event, "character", None), task_mode=self.task_mode)
             if not self.task_mode:
                 return
             if getattr(event, "key", "") == "backspace":
@@ -1620,6 +2113,7 @@ def cmd_dashboard(args):
             event.stop()
 
         def on_paste(self, event: events.Paste) -> None:  # pragma: no cover - runtime UI behavior
+            self._log_ui_event("paste", length=len((event.text or "")), task_mode=self.task_mode)
             if not self.task_mode:
                 return
             pasted = (event.text or "").replace("\r", "")
@@ -1645,6 +2139,12 @@ def cmd_dashboard(args):
             event.stop()
 
         def _refresh_view(self) -> None:
+            if self.message != self._last_logged_message:
+                self._log_ui_event("message", value=self.message)
+                self._last_logged_message = self.message
+            if self._use_project_widget:
+                self._refresh_view_with_project_widget()
+                return
             view = self.query_one("#dashboard-view", Static)
             status_bar = self.query_one("#status-bar", Static)
             title = self._render_header_line("skua dashboard", "auto-refresh: 2s")
@@ -1656,9 +2156,11 @@ def cmd_dashboard(args):
                 self.selected_job = 0
                 if self.show_job_output:
                     self.show_job_output = False
+                    self.output_follow = False
             if self.focus == "jobs" and not jobs_view and self.snapshot.rows:
                 self.focus = "projects"
                 self.show_job_output = False
+                self.output_follow = False
             if self.focus == "projects" and not self.snapshot.rows and jobs_view:
                 self.focus = "jobs"
             if self.show_job_output and jobs_view:
@@ -1679,7 +2181,7 @@ def cmd_dashboard(args):
             if self.show_help:
                 help_text = Text(
                     "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
-                    "      tab focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
+                    "      tab/f focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
                     "      h toggle help | q quit"
                 )
                 view.update(
@@ -1699,9 +2201,7 @@ def cmd_dashboard(args):
                     style="bold",
                 )
                 lines = self.jobs.output_lines(selected)
-                available = max(5, (getattr(self, "size", None).height or 24) - 8)
-                max_scroll = max(0, len(lines) - available)
-                self.output_scroll = max(0, min(self.output_scroll, max_scroll))
+                available, _max_scroll = self._sync_output_window(lines)
                 window = lines[self.output_scroll:self.output_scroll + available]
                 scroll_hint = (
                     f"lines {self.output_scroll + 1}-{self.output_scroll + len(window)} of {len(lines)}"
@@ -1725,15 +2225,38 @@ def cmd_dashboard(args):
             if not self.snapshot.rows:
                 content.append(Text("No projects configured.", style="dim"))
             else:
+                # Keep the projects pane height bounded so terminal redraws do not
+                # force viewport jumps in hosts like Emacs term buffers.
+                viewport_h = (getattr(self, "size", None).height or 24)
+                summary_lines = max(1, len(self.snapshot.summary))
+                jobs_rows = min(len(jobs_view), 10) if jobs_view else 1
+                reserved_lines = 11 + summary_lines + jobs_rows
+                visible_projects = max(3, viewport_h - reserved_lines)
+                visible_projects = min(visible_projects, len(self.snapshot.rows))
+
+                max_scroll = max(0, len(self.snapshot.rows) - visible_projects)
+                self.project_scroll = max(0, min(self.project_scroll, max_scroll))
+                if self.selected < self.project_scroll:
+                    self.project_scroll = self.selected
+                elif self.selected >= self.project_scroll + visible_projects:
+                    self.project_scroll = self.selected - visible_projects + 1
+
+                start = self.project_scroll
+                end = min(len(self.snapshot.rows), start + visible_projects)
+                project_rows = self.snapshot.rows[start:end]
+
+                fitted_columns = self._fit_project_columns(self.snapshot.columns)
                 table = Table(box=None, show_edge=False, pad_edge=False)
-                for col_name, col_width in self.snapshot.columns:
+                for col_name, col_width in fitted_columns:
                     table.add_column(col_name, width=col_width, overflow="ellipsis", no_wrap=True)
-                for idx, row in enumerate(self.snapshot.rows):
-                    style = "reverse" if self.focus == "projects" and idx == self.selected else ""
+                for rel_idx, row in enumerate(project_rows):
+                    abs_idx = start + rel_idx
+                    style = "reverse" if self.focus == "projects" and abs_idx == self.selected else ""
                     rendered_cells = []
                     for col_index, cell in enumerate(row["cells"]):
-                        col_name = self.snapshot.columns[col_index][0] if col_index < len(self.snapshot.columns) else ""
-                        rendered_cells.append(Text(str(cell), style=self._cell_style(col_name, str(cell))))
+                        col_name = fitted_columns[col_index][0] if col_index < len(fitted_columns) else ""
+                        raw = str(cell)
+                        rendered_cells.append(Text(self._apply_hscroll(raw, self.project_hscroll), style=self._cell_style(col_name, raw)))
                     table.add_row(*rendered_cells, style=style)
                 content.append(table)
 
@@ -1754,6 +2277,192 @@ def cmd_dashboard(args):
                 ]
             )
             view.update(Group(*content))
+
+        def _refresh_view_with_project_widget(self) -> None:
+            header = self.query_one("#dashboard-header", Static)
+            projects_table = self.query_one("#projects-table")
+            project_summary = self.query_one("#project-summary", Static)
+            jobs_header = self.query_one("#jobs-header", Static)
+            jobs_table_view = self.query_one("#jobs-table")
+            footer = self.query_one("#dashboard-footer", Static)
+            status_bar = self.query_one("#status-bar", Static)
+            title = self._render_header_line("skua dashboard", "auto-refresh: 2s")
+            jobs_view = self.jobs.list_for_view()
+            visible_jobs = min(len(jobs_view), 10)
+            if jobs_view:
+                self.selected_job = min(max(0, self.selected_job), visible_jobs - 1)
+            else:
+                self.selected_job = 0
+                if self.show_job_output:
+                    self.show_job_output = False
+                    self.output_follow = False
+            if self.focus == "jobs" and not jobs_view and self.snapshot.rows:
+                self.focus = "projects"
+                self.show_job_output = False
+                self.output_follow = False
+            if self.focus == "projects" and not self.snapshot.rows and jobs_view:
+                self.focus = "jobs"
+            if self.show_job_output and jobs_view:
+                selected_job = jobs_view[self.selected_job]
+                if selected_job.status == "waiting_input" and self.task_mode != "job_input":
+                    self._start_job_input_task(selected_job)
+                if self.task_mode == "job_input" and selected_job.job_id != self.task_job_id:
+                    self.task_mode = ""
+                    self.task_job_id = 0
+
+            self._sync_project_cursor_mode()
+            self._sync_jobs_cursor_mode()
+            focus_line = Text(f"Focus: {self.focus} | {self.jobs.summary()}", style="cyan bold")
+            status_bar.update(
+                Group(
+                    self._render_task_panel(),
+                    self._render_command_bar(self._context_actions(jobs_view)),
+                )
+            )
+
+            if self.show_help:
+                help_text = Text(
+                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
+                    "      tab/f focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
+                    "      h toggle help | q quit"
+                )
+                header.update(Group(title, focus_line, self._section_header("Help"), help_text))
+                try:
+                    projects_table.styles.display = "block"
+                except Exception:
+                    pass
+                project_summary.update(Text(""))
+                try:
+                    project_summary.styles.display = "block"
+                except Exception:
+                    pass
+                jobs_header.update(Text(""))
+                try:
+                    jobs_header.styles.display = "block"
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.clear()
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.styles.display = "block"
+                except Exception:
+                    pass
+                try:
+                    footer.styles.display = "block"
+                except Exception:
+                    pass
+                footer.update(Text(""))
+                return
+
+            if self.show_job_output and jobs_view:
+                selected = jobs_view[self.selected_job]
+                log_title = Text(
+                    f"Job #{selected.job_id} {selected.action} {selected.project} [{selected.status}] (press o to close)",
+                    style="bold",
+                )
+                lines = self.jobs.output_lines(selected)
+                available, _max_scroll = self._sync_output_window(lines)
+                window = lines[self.output_scroll:self.output_scroll + available]
+                scroll_hint = (
+                    f"lines {self.output_scroll + 1}-{self.output_scroll + len(window)} of {len(lines)}"
+                    if lines else "no output"
+                )
+                log_text = Text("\n".join(window), style="white")
+                header.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Job Output"),
+                        log_title,
+                        Text(scroll_hint, style="dim"),
+                        Text(""),
+                        log_text,
+                    )
+                )
+                # Output mode should be single-pane: hide table regions entirely.
+                try:
+                    projects_table.styles.display = "none"
+                except Exception:
+                    pass
+                project_summary.update(Text(""))
+                try:
+                    project_summary.styles.display = "none"
+                except Exception:
+                    pass
+                jobs_header.update(Text(""))
+                try:
+                    jobs_header.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.clear()
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    footer.styles.display = "none"
+                except Exception:
+                    pass
+                footer.update(Text(""))
+                return
+
+            try:
+                projects_table.styles.display = "block"
+            except Exception:
+                pass
+            try:
+                project_summary.styles.display = "block"
+            except Exception:
+                pass
+            try:
+                jobs_header.styles.display = "block"
+            except Exception:
+                pass
+            try:
+                jobs_table_view.styles.display = "block"
+            except Exception:
+                pass
+            try:
+                footer.styles.display = "block"
+            except Exception:
+                pass
+            header.update(Group(title, focus_line, self._section_header("Projects")))
+            fitted_columns = self._fit_project_columns(self.snapshot.columns)
+            sig_cols = tuple((name, width) for name, width in fitted_columns)
+            sig_rows = tuple(tuple(str(cell) for cell in row.get("cells", [])) for row in self.snapshot.rows)
+            sig = (sig_cols, sig_rows)
+            if self._project_table_sig != sig:
+                self._rebuild_project_table()
+            self._set_project_cursor(self.selected)
+
+            summary = Text()
+            for idx, line in enumerate(self.snapshot.summary):
+                summary.append(line, style=self._summary_style(line))
+                if idx < len(self.snapshot.summary) - 1:
+                    summary.append("\n")
+            project_summary.update(Group(self._section_header("Project Summary"), summary))
+            jobs_header.update(self._section_header("Jobs"))
+
+            jobs_sig = tuple(
+                (
+                    str(job.job_id),
+                    job.action,
+                    job.project,
+                    job.status,
+                    _format_age(job.started_at),
+                    "-" if job.return_code is None else str(job.return_code),
+                )
+                for job in jobs_view[:10]
+            )
+            if self._jobs_table_sig != (("JOBS", "ACTION", "PROJECT", "STATUS", "AGE", "EXIT"), jobs_sig):
+                self._rebuild_jobs_table(jobs_view)
+            self._set_jobs_cursor(self.selected_job)
+            footer.update(Text(""))
 
         def _render_header_line(self, left: str, right: str) -> Text:
             width = max(20, (getattr(self, "size", None).width or 80))
@@ -1973,6 +2682,68 @@ def cmd_dashboard(args):
                 )
             return table
 
+        def _fit_project_columns(self, columns: list[tuple[str, int]]) -> list[tuple[str, int]]:
+            """Clamp project column widths to viewport width to avoid row wrapping."""
+            if not columns:
+                return []
+            width = max(20, (getattr(self, "size", None).width or 80))
+            budget = max(10, width - 1)  # keep one char clear to avoid edge wraps
+            budget -= max(0, len(columns) - 1)  # rough inter-column spacing
+            budget = max(6, budget)
+
+            fitted = [(name, max(1, int(col_w))) for name, col_w in columns]
+            total = sum(col_w for _, col_w in fitted)
+            if total <= budget:
+                return fitted
+
+            min_widths = {
+                "NAME": 8,
+                "ACTIVITY": 8,
+                "STATUS": 8,
+                "HOST": 8,
+                "SOURCE": 14,
+                "GIT": 6,
+                "IMAGE": 14,
+                "RUNNING-IMAGE": 14,
+                "AGENT": 6,
+                "CREDENTIAL": 10,
+                "SECURITY": 8,
+                "NETWORK": 6,
+            }
+            shrink_order = [
+                "SOURCE",
+                "RUNNING-IMAGE",
+                "IMAGE",
+                "CREDENTIAL",
+                "NAME",
+                "ACTIVITY",
+                "STATUS",
+                "HOST",
+                "AGENT",
+                "SECURITY",
+                "NETWORK",
+                "GIT",
+            ]
+            idx_by_name = {name: idx for idx, (name, _) in enumerate(fitted)}
+            while total > budget:
+                changed = False
+                for name in shrink_order:
+                    idx = idx_by_name.get(name)
+                    if idx is None:
+                        continue
+                    cur = fitted[idx][1]
+                    floor = min_widths.get(name, 4)
+                    if cur <= floor:
+                        continue
+                    fitted[idx] = (name, cur - 1)
+                    total -= 1
+                    changed = True
+                    if total <= budget:
+                        break
+                if not changed:
+                    break
+            return fitted
+
         @staticmethod
         def _job_status_style(status: str) -> str:
             if status in ("running", "queued"):
@@ -2076,10 +2847,12 @@ def cmd_dashboard(args):
             return "─" * max(20, min(120, width - 2))
 
         def action_toggle_help(self) -> None:
+            self._log_ui_event("action", name="toggle_help")
             self.show_help = not self.show_help
             self._refresh_view()
 
         def action_toggle_focus(self) -> None:
+            self._log_ui_event("action", name="toggle_focus")
             if self.task_mode:
                 self.focus = "task"
                 self._refresh_view()
@@ -2093,7 +2866,123 @@ def cmd_dashboard(args):
             self.show_job_output = False
             self._refresh_view()
 
+        def _nav_context(self) -> tuple[list[DashboardJob], int, int]:
+            jobs_view = self.jobs.list_for_view()
+            project_count = len(self.snapshot.rows)
+            visible_jobs = min(len(jobs_view), 10)
+            if visible_jobs > 0:
+                self.selected_job = max(0, min(self.selected_job, visible_jobs - 1))
+            else:
+                self.selected_job = 0
+            return jobs_view, project_count, visible_jobs
+
+        def _job_output_available_lines(self) -> int:
+            viewport_h = (getattr(self, "size", None).height or 24)
+            # Reserve non-output rows (header/focus/section/title/hint/spacer/status bar).
+            return max(5, viewport_h - 11)
+
+        def _jump_output_to_end(self) -> None:
+            # Use a large scroll sentinel; render-time clamping will pin to tail.
+            self.output_scroll = 10**9
+            self.output_follow = True
+
+        def _sync_output_window(self, lines: list[str]) -> tuple[int, int]:
+            available = self._job_output_available_lines()
+            max_scroll = max(0, len(lines) - available)
+            if self.output_follow:
+                self.output_scroll = max_scroll
+            else:
+                self.output_scroll = max(0, min(self.output_scroll, max_scroll))
+                if self.output_scroll >= max_scroll:
+                    self.output_follow = True
+            return available, max_scroll
+
+        def _move_jobs_focus(self, delta: int, jobs_view: list[DashboardJob], project_count: int, visible_jobs: int) -> str:
+            if not jobs_view and project_count:
+                self.focus = "projects"
+                self._set_selected_project_index(self.selected)
+                return "refresh"
+            if not jobs_view:
+                return "none"
+
+            if delta < 0:
+                if self.selected_job > 0:
+                    self.selected_job -= 1
+                    if self._use_project_widget and self.focus == "jobs":
+                        self._refresh_jobs_widget_local()
+                        return "local"
+                elif project_count:
+                    self.focus = "projects"
+                    self._set_selected_project_index(project_count - 1)
+                return "refresh"
+
+            if self.selected_job < visible_jobs - 1:
+                self.selected_job += 1
+                if self._use_project_widget and self.focus == "jobs":
+                    self._refresh_jobs_widget_local()
+                    return "local"
+            elif project_count:
+                self.focus = "projects"
+                self._set_selected_project_index(0)
+            return "refresh"
+
+        def _move_projects_focus(self, delta: int, jobs_view: list[DashboardJob], project_count: int, visible_jobs: int) -> str:
+            if not project_count and jobs_view:
+                self.focus = "jobs"
+                self.selected_job = max(0, visible_jobs - 1) if delta < 0 else 0
+                return "refresh"
+            if not project_count:
+                return "none"
+
+            if delta < 0:
+                if self.selected > 0:
+                    self._set_selected_project_index(self.selected - 1)
+                    if self._use_project_widget and self.focus == "projects":
+                        self._set_project_cursor(self.selected)
+                        return "local"
+                elif jobs_view:
+                    self.focus = "jobs"
+                    self.selected_job = max(0, visible_jobs - 1)
+                return "refresh"
+
+            if self.selected < project_count - 1:
+                self._set_selected_project_index(self.selected + 1)
+                if self._use_project_widget and self.focus == "projects":
+                    self._set_project_cursor(self.selected)
+                    return "local"
+            elif jobs_view:
+                self.focus = "jobs"
+                self.selected_job = 0
+            return "refresh"
+
+        def _move_cursor(self, delta: int) -> None:
+            jobs_view, project_count, visible_jobs = self._nav_context()
+            if self.show_job_output:
+                step = 5
+                if delta < 0:
+                    self.output_follow = False
+                    self.output_scroll = max(0, self.output_scroll - step)
+                elif jobs_view:
+                    selected = jobs_view[self.selected_job]
+                    lines = self.jobs.output_lines(selected)
+                    _available, max_scroll = self._sync_output_window(lines)
+                    self.output_scroll = min(max_scroll, self.output_scroll + step)
+                    if self.output_scroll >= max_scroll:
+                        self.output_follow = True
+                self.focus = "jobs"
+                self._refresh_view()
+                return
+
+            if self.focus == "jobs":
+                outcome = self._move_jobs_focus(delta, jobs_view, project_count, visible_jobs)
+            else:
+                outcome = self._move_projects_focus(delta, jobs_view, project_count, visible_jobs)
+
+            if outcome == "refresh":
+                self._refresh_view()
+
         def action_cursor_up(self) -> None:
+            self._log_ui_event("action", name="cursor_up")
             if self.task_mode:
                 if self.task_mode == "job_input":
                     return
@@ -2101,43 +2990,10 @@ def cmd_dashboard(args):
                 if step is not None and step["kind"] == "select":
                     self._task_shift_option(-1)
                 return
-            jobs_view = self.jobs.list_for_view()
-            project_count = len(self.snapshot.rows)
-            visible_jobs = min(len(jobs_view), 10)
-            if self.show_job_output:
-                if self.output_scroll > 0:
-                    self.output_scroll -= 1
-                self.focus = "jobs"
-                self._refresh_view()
-                return
-            if self.focus == "jobs":
-                if not jobs_view and project_count:
-                    self.focus = "projects"
-                    self.selected = max(0, min(self.selected, project_count - 1))
-                    self._refresh_view()
-                    return
-                if jobs_view:
-                    if self.selected_job > 0:
-                        self.selected_job -= 1
-                    elif project_count:
-                        self.focus = "projects"
-                        self.selected = project_count - 1
-                    self._refresh_view()
-                return
-            if not project_count and jobs_view:
-                self.focus = "jobs"
-                self.selected_job = max(0, visible_jobs - 1)
-                self._refresh_view()
-                return
-            if project_count:
-                if self.selected > 0:
-                    self.selected -= 1
-                elif jobs_view:
-                    self.focus = "jobs"
-                    self.selected_job = max(0, visible_jobs - 1)
-                self._refresh_view()
+            self._move_cursor(-1)
 
         def action_cursor_down(self) -> None:
+            self._log_ui_event("action", name="cursor_down")
             if self.task_mode:
                 if self.task_mode == "job_input":
                     return
@@ -2145,46 +3001,7 @@ def cmd_dashboard(args):
                 if step is not None and step["kind"] == "select":
                     self._task_shift_option(1)
                 return
-            jobs_view = self.jobs.list_for_view()
-            project_count = len(self.snapshot.rows)
-            visible_jobs = min(len(jobs_view), 10)
-            if self.show_job_output:
-                if jobs_view:
-                    selected = jobs_view[self.selected_job]
-                    lines = self.jobs.output_lines(selected)
-                    available = max(5, (getattr(self, "size", None).height or 24) - 8)
-                    max_scroll = max(0, len(lines) - available)
-                    if self.output_scroll < max_scroll:
-                        self.output_scroll += 1
-                self.focus = "jobs"
-                self._refresh_view()
-                return
-            if self.focus == "jobs":
-                if not jobs_view and project_count:
-                    self.focus = "projects"
-                    self.selected = max(0, min(self.selected, project_count - 1))
-                    self._refresh_view()
-                    return
-                if jobs_view:
-                    if self.selected_job < visible_jobs - 1:
-                        self.selected_job += 1
-                    elif project_count:
-                        self.focus = "projects"
-                        self.selected = 0
-                    self._refresh_view()
-                return
-            if not project_count and jobs_view:
-                self.focus = "jobs"
-                self.selected_job = 0
-                self._refresh_view()
-                return
-            if project_count:
-                if self.selected < project_count - 1:
-                    self.selected += 1
-                elif jobs_view:
-                    self.focus = "jobs"
-                    self.selected_job = 0
-                self._refresh_view()
+            self._move_cursor(1)
 
         def _run_selected(self, action_key: str) -> None:
             if self.task_mode:
@@ -2207,26 +3024,40 @@ def cmd_dashboard(args):
                 except Exception as exc:
                     self.message = f"failed to queue {action_key} {project_name}: {type(exc).__name__}: {exc}"
             else:
-                self.message = _run_action_interactive(action_key, project_name, suspend=self.suspend)
+                # In Emacs inline mode, keep dashboard and attached terminal from
+                # competing for input by handing off the process for interactive
+                # attach actions.
+                interactive_replace = bool(inside_emacs and not use_screen and action_key in {"run", "restart"})
+                self.message = _run_action_interactive(
+                    action_key,
+                    project_name,
+                    suspend=self.suspend,
+                    replace_process=interactive_replace,
+                )
             self._refresh_view()
             self._request_refresh()
 
         def action_run_selected(self) -> None:
+            self._log_ui_event("action", name="run_selected")
             if self.focus == "jobs":
                 self.action_open_job_output()
                 return
             self._run_selected("run")
 
         def action_build_selected(self) -> None:
+            self._log_ui_event("action", name="build_selected")
             self._run_selected("build")
 
         def action_stop_selected(self) -> None:
+            self._log_ui_event("action", name="stop_selected")
             self._run_selected("stop")
 
         def action_adapt_selected(self) -> None:
+            self._log_ui_event("action", name="adapt_selected")
             self._run_selected("adapt")
 
         def action_remove_selected(self) -> None:
+            self._log_ui_event("action", name="remove_selected")
             if self.focus == "jobs" or self.show_job_output:
                 self.action_remove_job()
                 return
@@ -2245,9 +3076,11 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_restart_selected(self) -> None:
+            self._log_ui_event("action", name="restart_selected")
             self._run_selected("restart")
 
         def action_new_project(self) -> None:
+            self._log_ui_event("action", name="new_project")
             if self.task_mode:
                 self._refresh_view()
                 return
@@ -2260,6 +3093,7 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_open_job_output(self) -> None:
+            self._log_ui_event("action", name="open_job_output")
             if self.task_mode == "new_project":
                 self._refresh_view()
                 return
@@ -2276,7 +3110,9 @@ def cmd_dashboard(args):
             self.focus = "jobs"
             self.show_job_output = not self.show_job_output
             if self.show_job_output:
-                self.output_scroll = 0
+                self._jump_output_to_end()
+            else:
+                self.output_follow = False
             job = jobs_view[self.selected_job]
             if self.show_job_output and job.status == "waiting_input":
                 self._start_job_input_task(job)
@@ -2286,6 +3122,7 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_cancel_job(self) -> None:
+            self._log_ui_event("action", name="cancel_job")
             if self.focus != "jobs" and not self.show_job_output:
                 self.message = "switch focus to jobs to cancel jobs"
                 self._refresh_view()
@@ -2304,6 +3141,7 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_clear_jobs(self) -> None:
+            self._log_ui_event("action", name="clear_jobs")
             if self.focus != "jobs" and not self.show_job_output:
                 self.message = "switch focus to jobs to clear jobs"
                 self._refresh_view()
@@ -2311,9 +3149,11 @@ def cmd_dashboard(args):
             removed = self.jobs.clear_completed()
             self.message = f"cleared {removed} completed job(s)"
             self.show_job_output = False
+            self.output_follow = False
             self._refresh_view()
 
         def action_export_job_output(self) -> None:
+            self._log_ui_event("action", name="export_job_output")
             if self.task_mode:
                 self._refresh_view()
                 return
@@ -2332,6 +3172,7 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_remove_job(self) -> None:
+            self._log_ui_event("action", name="remove_job")
             if self.task_mode:
                 self._refresh_view()
                 return
@@ -2353,6 +3194,7 @@ def cmd_dashboard(args):
                 if not remaining:
                     self.selected_job = 0
                     self.show_job_output = False
+                    self.output_follow = False
                     if self.snapshot.rows:
                         self.focus = "projects"
                 else:
@@ -2362,30 +3204,72 @@ def cmd_dashboard(args):
             self._refresh_view()
 
         def action_task_prev_option(self) -> None:
+            self._log_ui_event("action", name="task_prev_option")
             if self.show_job_output and not self.task_mode:
                 jobs_view = self.jobs.list_for_view()
                 if jobs_view:
                     self.selected_job = max(0, self.selected_job - 1)
-                    self.output_scroll = 0
+                    self._jump_output_to_end()
                     self._refresh_view()
                 return
             if not self.task_mode:
+                if self._use_project_widget and self.focus == "projects":
+                    self._scroll_table_x("#projects-table", -4)
+                elif self._use_project_widget and self.focus == "jobs":
+                    self._scroll_table_x("#jobs-table", -4)
+                elif self.focus == "projects":
+                    next_offset = max(0, self.project_hscroll - 4)
+                    if next_offset != self.project_hscroll:
+                        self.project_hscroll = next_offset
+                        if self._use_project_widget:
+                            self._project_table_sig = None
+                        self._refresh_view()
+                elif self.focus == "jobs":
+                    next_offset = max(0, self.jobs_hscroll - 4)
+                    if next_offset != self.jobs_hscroll:
+                        self.jobs_hscroll = next_offset
+                        if self._use_project_widget:
+                            self._jobs_table_sig = None
+                        self._refresh_view()
                 return
             self._task_shift_option(-1)
 
         def action_task_next_option(self) -> None:
+            self._log_ui_event("action", name="task_next_option")
             if self.show_job_output and not self.task_mode:
                 jobs_view = self.jobs.list_for_view()
                 if jobs_view:
                     self.selected_job = min(min(len(jobs_view), 10) - 1, self.selected_job + 1)
-                    self.output_scroll = 0
+                    self._jump_output_to_end()
                     self._refresh_view()
                 return
             if not self.task_mode:
+                if self._use_project_widget and self.focus == "projects":
+                    self._scroll_table_x("#projects-table", 4)
+                elif self._use_project_widget and self.focus == "jobs":
+                    self._scroll_table_x("#jobs-table", 4)
+                elif self.focus == "projects":
+                    limit = self._max_project_hscroll()
+                    next_offset = min(limit, self.project_hscroll + 4)
+                    if next_offset != self.project_hscroll:
+                        self.project_hscroll = next_offset
+                        if self._use_project_widget:
+                            self._project_table_sig = None
+                        self._refresh_view()
+                elif self.focus == "jobs":
+                    jobs_view = self.jobs.list_for_view()
+                    limit = self._max_jobs_hscroll(jobs_view)
+                    next_offset = min(limit, self.jobs_hscroll + 4)
+                    if next_offset != self.jobs_hscroll:
+                        self.jobs_hscroll = next_offset
+                        if self._use_project_widget:
+                            self._jobs_table_sig = None
+                        self._refresh_view()
                 return
             self._task_shift_option(1)
 
         def action_task_cancel(self) -> None:
+            self._log_ui_event("action", name="task_cancel")
             if not self.task_mode:
                 return
             if self.task_mode == "job_input":
@@ -2402,4 +3286,43 @@ def cmd_dashboard(args):
             self._task_cancel()
             self._refresh_view()
 
-    DashboardApp(args).run()
+    app = DashboardApp(args)
+    try:
+        params = set(inspect.signature(app.run).parameters.keys())
+    except (TypeError, ValueError):
+        params = set()
+    has_inline_mode = "inline" in params
+
+    if screen_override in {"1", "true", "yes", "on"}:
+        use_screen = True
+    elif screen_override in {"0", "false", "no", "off"}:
+        use_screen = False
+    else:
+        # Textual 8+ inline mode is incompatible with suspend() and tends to be
+        # unstable in Emacs terminal buffers. Prefer app/screen mode there.
+        if inside_emacs and has_inline_mode:
+            use_screen = True
+        else:
+            use_screen = not inside_emacs
+
+    if use_screen:
+        run_kwargs = {}
+        # Avoid terminal mouse tracking in Emacs terminals.
+        if inside_emacs and "mouse" in params:
+            run_kwargs["mouse"] = False
+        app.run(**run_kwargs)
+        return
+
+    # Textual has evolved its run kwargs across versions:
+    # - Older API: run(screen=False)
+    # - Newer API: run(inline=True, inline_no_clear=True)
+    if "screen" in params:
+        app.run(screen=False)
+        return
+    if "inline" in params:
+        kwargs = {"inline": True}
+        if "inline_no_clear" in params:
+            kwargs["inline_no_clear"] = True
+        app.run(**kwargs)
+        return
+    app.run()

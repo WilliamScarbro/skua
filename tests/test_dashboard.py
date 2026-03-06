@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -368,3 +369,35 @@ class TestDashboardAddFlow(unittest.TestCase):
         self.assertEqual("demo", args.name)
         self.assertEqual("/tmp", args.dir)
         self.assertEqual("", args.repo)
+
+
+class TestDashboardClipboard(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.Path.exists", return_value=True)
+    @mock.patch("skua.commands.dashboard._clipboard_commands", return_value=[])
+    def test_clipboard_available_with_tty_fallback(self, _mock_cmds, _mock_exists):
+        from skua.commands.dashboard import _clipboard_copy_available
+
+        self.assertTrue(_clipboard_copy_available())
+
+    @mock.patch("skua.commands.dashboard._copy_text_to_clipboard_osc52", return_value=(True, ""))
+    @mock.patch("skua.commands.dashboard._clipboard_commands", return_value=[])
+    def test_copy_text_uses_osc52_when_no_clipboard_tool(self, _mock_cmds, mock_osc52):
+        from skua.commands.dashboard import _copy_text_to_clipboard
+
+        ok, detail = _copy_text_to_clipboard("hello")
+
+        self.assertTrue(ok)
+        self.assertEqual("", detail)
+        mock_osc52.assert_called_once_with("hello")
+
+    @mock.patch("skua.commands.dashboard._copy_text_to_clipboard_osc52", return_value=(True, ""))
+    @mock.patch("skua.commands.dashboard.subprocess.run", side_effect=subprocess.TimeoutExpired("xclip", timeout=2))
+    @mock.patch("skua.commands.dashboard._clipboard_commands", return_value=[["xclip", "-selection", "clipboard"]])
+    def test_copy_text_timeout_falls_back_to_osc52(self, _mock_cmds, _mock_run, mock_osc52):
+        from skua.commands.dashboard import _copy_text_to_clipboard
+
+        ok, detail = _copy_text_to_clipboard("hello")
+
+        self.assertTrue(ok)
+        self.assertEqual("", detail)
+        mock_osc52.assert_called_once_with("hello")
