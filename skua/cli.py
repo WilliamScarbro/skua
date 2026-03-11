@@ -86,9 +86,9 @@ def main():
     # add
     p_add = sub.add_parser("add", help="Add a project configuration")
     p_add.add_argument("name", help="Project name (alphanumeric, hyphens, underscores)")
-    p_add.add_argument("--dir", help="Project directory path")
+    p_add.add_argument("--dir", help="Project directory path; with --host this path is interpreted on the Docker host")
     p_add.add_argument("--repo", help="Git repository URL to clone (mutually exclusive with --dir)")
-    p_add.add_argument("--host", help="SSH config host for remote execution (requires --repo)")
+    p_add.add_argument("--host", help="SSH config host for remote execution (use with --repo or a host-side --dir)")
     p_add.add_argument("--ssh-key", help="SSH private key path")
     p_add.add_argument("--env", help="Environment resource name (default: from global)")
     p_add.add_argument("--security", help="Security profile name (default: from global)")
@@ -109,6 +109,11 @@ def main():
     # run
     p_run = sub.add_parser("run", help="Run a container for a project")
     p_run.add_argument("name", help="Project name to run")
+    p_run.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="Start or reuse the container without attaching to its tmux session",
+    )
 
     # stop
     p_stop = sub.add_parser("stop", help="Stop a running project container")
@@ -255,6 +260,78 @@ def main():
     p_cred_rm = cred_sub.add_parser("remove", help="Remove a credential set")
     p_cred_rm.add_argument("name", help="Credential name to remove")
 
+    # task
+    p_task = sub.add_parser("task", help="Plan and dispatch multi-agent task batches")
+    task_sub = p_task.add_subparsers(dest="action")
+
+    p_task_plan = task_sub.add_parser("plan", help="Inspect a task plan directory")
+    p_task_plan.add_argument("plan_dir", help="Directory containing numbered task briefs")
+    p_task_plan.add_argument(
+        "--format",
+        choices=("text", "yaml", "json"),
+        default="text",
+        help="Output format",
+    )
+    p_task_plan.add_argument(
+        "--write",
+        help="Write the generated plan summary to a file instead of stdout",
+    )
+
+    p_task_prompt = task_sub.add_parser("prompt", help="Run a non-interactive agent prompt in a project container")
+    p_task_prompt.add_argument("project", help="Project name")
+    prompt_src = p_task_prompt.add_mutually_exclusive_group(required=True)
+    prompt_src.add_argument("--prompt", help="Prompt text to send")
+    prompt_src.add_argument("--prompt-file", help="Read prompt text from a file")
+    p_task_prompt.add_argument("--title", help="Label for this task run")
+    p_task_prompt.add_argument(
+        "--ensure-running",
+        action="store_true",
+        help="Start the project container in detached mode if needed",
+    )
+    p_task_prompt.add_argument(
+        "--background",
+        action="store_true",
+        help="Run detached in the container and write output to a log file",
+    )
+    p_task_prompt.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the resolved container command without running it",
+    )
+
+    p_task_dispatch = task_sub.add_parser("dispatch", help="Map a task plan onto projects and optionally launch prompts")
+    p_task_dispatch.add_argument("plan_dir", help="Directory containing numbered task briefs")
+    p_task_dispatch.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        help="Project name in task order (repeatable)",
+    )
+    p_task_dispatch.add_argument(
+        "--project-prefix",
+        help="Generate project names as <prefix><task-slug>",
+    )
+    p_task_dispatch.add_argument(
+        "--execute",
+        action="store_true",
+        help="Launch each mapped task instead of only printing the mapping",
+    )
+    p_task_dispatch.add_argument(
+        "--ensure-running",
+        action="store_true",
+        help="Start mapped project containers in detached mode before prompting",
+    )
+    p_task_dispatch.add_argument(
+        "--background",
+        action="store_true",
+        help="Run each task detached in the container and log output",
+    )
+    p_task_dispatch.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the per-project prompt commands that would run",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -265,7 +342,7 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe, cmd_credential, cmd_dashboard,
+        cmd_describe, cmd_credential, cmd_dashboard, cmd_task,
     )
 
     commands = {
@@ -285,6 +362,7 @@ def main():
         "validate": cmd_validate,
         "describe": cmd_describe,
         "credential": _handle_credential,
+        "task": _handle_task,
     }
     commands[args.command](args)
 
@@ -301,6 +379,20 @@ def _handle_credential(args):
         print("  remove <name>   Remove a credential set")
         sys.exit(1)
     cmd_credential(args)
+
+
+def _handle_task(args):
+    """Dispatch task subcommands, showing help if no action given."""
+    from skua.commands import cmd_task
+    if not args.action:
+        print("usage: skua task <action> [options]")
+        print()
+        print("actions:")
+        print("  plan <dir>       Inspect a task plan directory")
+        print("  prompt <proj>    Run a non-interactive prompt in a project container")
+        print("  dispatch <dir>   Map a plan onto projects and optionally launch it")
+        sys.exit(1)
+    cmd_task(args)
 
 
 if __name__ == "__main__":

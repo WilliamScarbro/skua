@@ -833,7 +833,7 @@ def build_run_command(
     # Project directory mount (local bind-mount or remote named volume)
     if repo_volume:
         docker_cmd.extend(["-v", f"{repo_volume}:{project_mount_path}"])
-    elif project.directory and Path(project.directory).is_dir():
+    elif project.directory and (is_remote_host or Path(project.directory).is_dir()):
         docker_cmd.extend(["-v", f"{project.directory}:{project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_NAME={project.name}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_DIR={project_mount_path}"])

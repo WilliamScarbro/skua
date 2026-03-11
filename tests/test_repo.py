@@ -438,6 +438,30 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn(f"{host_dir}:/home/dev/workbench", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/workbench", joined)
 
+    def test_build_run_command_mounts_remote_host_directory_without_local_stat(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            project = Project(
+                name="p1",
+                directory="/srv/projects/demo-app",
+                host="docker.example.com",
+                agent="codex",
+            )
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="codex",
+                runtime=AgentRuntimeSpec(command="codex"),
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
+            )
+
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            joined = " ".join(cmd)
+            self.assertIn("/srv/projects/demo-app:/home/dev/demo-app", joined)
+            self.assertIn("SKUA_PROJECT_DIR=/home/dev/demo-app", joined)
+
     def test_build_run_command_mounts_repo_name_for_repo_projects(self):
         from skua.docker import build_run_command
 
@@ -628,6 +652,29 @@ class TestBuildCommandImageDrift(unittest.TestCase):
             cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
             mock_build.assert_not_called()
             mock_rebuild_needed.assert_called_once()
+
+    @mock.patch("skua.commands.build.configure_project_docker_transport")
+    @mock.patch("skua.commands.build.build_image")
+    @mock.patch("skua.commands.build.image_rebuild_needed")
+    @mock.patch("skua.commands.build.image_exists")
+    @mock.patch("skua.commands.build.ConfigStore")
+    def test_build_configures_remote_transport_for_host_project(
+        self, MockStore, mock_exists, mock_rebuild_needed, mock_build, mock_transport
+    ):
+        from skua.commands.build import cmd_build
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, project = self._setup_store(tmpdir)
+            project.host = "docker.example.com"
+            MockStore.return_value = store
+            store.resolve_project.return_value = project
+            mock_exists.return_value = False
+            mock_rebuild_needed.return_value = (True, False, "")
+            mock_build.return_value = (True, "")
+
+            cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
+
+            mock_transport.assert_called_once_with(project)
 
 
 class TestAgentInstallRefresh(unittest.TestCase):
@@ -961,6 +1008,7 @@ class TestAddMutualExclusivity(unittest.TestCase):
             name="test-proj",
             dir=None,
             repo=None,
+            host="",
             ssh_key="",
             env=None,
             security=None,
@@ -1045,6 +1093,33 @@ class TestAddMutualExclusivity(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             cmd_add(args)
         self.assertEqual(ctx.exception.code, 1)
+
+    @mock.patch("skua.commands.add.parse_ssh_config_hosts", return_value=["docker-host"])
+    @mock.patch("skua.commands.add.subprocess.run")
+    @mock.patch("skua.commands.add.ConfigStore")
+    def test_host_directory_project_is_accepted_without_local_dir_check(self, MockStore, mock_run, _mock_hosts):
+        mock_store = MockStore.return_value
+        mock_store.is_initialized.return_value = True
+        mock_store.load_project.return_value = None
+        mock_store.load_global.return_value = {"defaults": {}}
+        mock_store.list_resources.side_effect = lambda kind: ["claude"] if kind == "AgentConfig" else []
+        mock_store.load_agent.return_value = AgentConfig(name="claude")
+        mock_store.load_credential.return_value = Credential(name="cred1", agent="claude")
+        mock_store.load_environment.return_value = None
+        mock_run.return_value = mock.Mock(returncode=0, stderr="")
+
+        from skua.commands.add import cmd_add
+
+        args = self._make_args(
+            dir="/srv/projects/demo-app",
+            host="docker-host",
+            credential="cred1",
+        )
+        cmd_add(args)
+
+        saved_project = mock_store.save_resource.call_args[0][0]
+        self.assertEqual(saved_project.host, "docker-host")
+        self.assertEqual(saved_project.directory, "/srv/projects/demo-app")
 
 
 class TestRunRepoClone(unittest.TestCase):

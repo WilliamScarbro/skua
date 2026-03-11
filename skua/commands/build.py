@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+from skua.commands.run import configure_project_docker_transport
 from skua.config import ConfigStore
 from skua.docker import (
     build_image,
@@ -65,6 +66,8 @@ def cmd_build(args, lock_project: bool = True):
         print(f"Error: Project '{project_name}' not found.")
         print(f"Add it with: skua add {project_name} --dir /path/to/project")
         sys.exit(1)
+
+    configure_project_docker_transport(project)
 
     agent = store.load_agent(project.agent)
     if agent is None:

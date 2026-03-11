@@ -252,6 +252,15 @@ def _configure_remote_docker_transport(host: str):
         sys.exit(1)
 
 
+def configure_project_docker_transport(project):
+    """Configure Docker transport for a project, including remote SSH mode."""
+    host = getattr(project, "host", "") or ""
+    if not host:
+        return
+    _ensure_local_ssh_client_for_remote_docker(host)
+    _configure_remote_docker_transport(host)
+
+
 def _clone_repo_into_remote_volume(project, vol_name: str):
     """Clone the project repo into a Docker named volume using alpine/git.
 
@@ -609,9 +618,7 @@ def cmd_run(args, lock_project: bool = True):
     host = getattr(project, "host", "") or ""
 
     # Route Docker operations to remote host when specified
-    if host:
-        _ensure_local_ssh_client_for_remote_docker(host)
-        _configure_remote_docker_transport(host)
+    configure_project_docker_transport(project)
 
     container_name = f"skua-{name}"
 
@@ -647,7 +654,8 @@ def cmd_run(args, lock_project: bool = True):
         print(f"Error: Agent '{project.agent}' not found.")
         sys.exit(1)
 
-    # Remote projects must use named volumes (bind mounts don't work across hosts)
+    # Remote projects use volume-backed auth persistence even when the project
+    # directory itself is a bind mount on the Docker host.
     if host:
         env = copy.deepcopy(env)
         env.persistence.mode = "volume"

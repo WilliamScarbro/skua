@@ -104,6 +104,7 @@ Use `skua adapt <name>` to have the agent generate/apply image updates in one co
 
 ```bash
 skua run myapp
+skua run myapp --no-attach
 ```
 
 Remote project behavior (`spec.host` set):
@@ -117,6 +118,87 @@ Remote project behavior (`spec.host` set):
 - Agent auth files are seeded into the remote auth volume on startup.
 
 Detach while keeping container/session alive with `Ctrl-b`, then `d`. Re-run `skua run myapp` to reattach.
+
+`--no-attach` is useful for automation flows that need the container running but will invoke the agent later with `skua task prompt` or similar commands.
+
+### `skua task`
+
+Plan and launch multi-agent work from a directory of markdown briefs. This is intended for workflows like `/home/dev/image_refactor_plan`, where each numbered file represents one workstream.
+
+```bash
+skua task plan /home/dev/image_refactor_plan
+skua task plan /home/dev/image_refactor_plan --format yaml --write /tmp/refactor-plan.yaml
+skua task prompt repo-agent --prompt-file /home/dev/image_refactor_plan/01-repo-worktree-agent.md --ensure-running
+skua task dispatch /home/dev/image_refactor_plan --project-prefix image-refactor-         # preview mapping only
+skua task dispatch /home/dev/image_refactor_plan --project-prefix image-refactor- --execute --ensure-running --background
+```
+
+Subcommands:
+- `plan`: reads numbered `*.md` briefs, uses `README.md` suggested execution order when present, and prints a normalized task summary.
+- `prompt`: runs the configured agent's non-interactive prompt command inside an existing project container. Use `--ensure-running` to start the container in detached mode first.
+- `dispatch`: maps each task brief to a project, either via repeated `--project` values or a generated `--project-prefix`, then optionally launches all prompts.
+
+Notes:
+- `prompt` prefers the agent resource's `runtime.prompt_command`, then falls back to `runtime.adapt_command`.
+- `dispatch --background` runs each task detached in the container and prints a per-task log path under `/tmp/`.
+- For Codex and Claude presets, Skua ships prompt-command defaults suitable for non-interactive execution.
+
+## Python Library
+
+The same task workflow is available as an importable library, so orchestration code does not need to shell out through the CLI.
+
+```python
+from skua import (
+    dispatch_task_plan,
+    load_task_brief,
+    make_task_plan,
+    run_task_prompt,
+)
+
+schema = load_task_brief("/home/dev/image_refactor_plan/03-schema-migration-agent.md")
+repo = load_task_brief(
+    "/home/dev/image_refactor_plan/01-repo-worktree-agent.md",
+    depends_on=[schema.brief_file],
+)
+cli = load_task_brief(
+    "/home/dev/image_refactor_plan/04-cli-ux-agent.md",
+    depends_on=[repo.brief_file],
+)
+
+plan = make_task_plan(
+    tasks=[schema, repo, cli],
+    suggested_order=[schema.brief_file, repo.brief_file, cli.brief_file],
+)
+
+# Preview project mapping
+mappings, _ = dispatch_task_plan(plan, project_prefix="image-refactor-")
+
+# Launch the full batch
+mappings, executions = dispatch_task_plan(
+    plan,
+    project_prefix="image-refactor-",
+    execute=True,
+    ensure_running=True,
+    background=True,
+)
+
+# Or run one prompt directly
+result = run_task_prompt(
+    project_name="image-refactor-schema-migration-agent",
+    prompt="Read the assigned brief and implement only that workstream.",
+    ensure_running=True,
+    background=True,
+)
+```
+
+Primary imports:
+- `load_task_brief(path, depends_on=...)` -> `TaskBrief`
+- `make_task_plan(tasks, ...)` -> `TaskPlan`
+- `dispatch_task_plan(plan, ...)` -> `(mappings, executions)`
+- `run_task_prompt(project_name, prompt, ...)` -> `PromptExecution`
+- `resolve_task_projects(plan, ...)` -> project mapping without execution
+
+`load_task_plan(path)` still exists for the CLI-oriented "directory of briefs" workflow, but the recommended Python integration is to encode the plan structure in Python and load each brief explicitly.
 
 ### `skua list`
 

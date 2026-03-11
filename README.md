@@ -128,6 +128,7 @@ skua build <name>
 | `skua add <name>` | Add a project (`--dir` or `--repo`) |
 | `skua adapt <name>` | Run agent-driven image adaptation and build updated project image |
 | `skua run <name>` | Start a container (or attach if already running) |
+| `skua task ...` | Inspect a task plan, map it onto projects, and dispatch prompts into containers |
 | `skua list` | List projects and running status |
 | `skua dashboard` | Live interactive project dashboard (auto-refresh + actions) |
 | `skua config` | Show or edit global configuration |
@@ -140,6 +141,40 @@ skua build <name>
 For advanced security/environment setup, go to:
 - `docs/security.md`
 - `docs/configuration.md`
+
+## Python API
+
+Skua can also be imported as a Python library for orchestration workflows that do not fit well in a bash script.
+
+```python
+from skua import load_task_brief, make_task_plan, dispatch_task_plan
+
+schema = load_task_brief("/home/dev/image_refactor_plan/03-schema-migration-agent.md")
+repo = load_task_brief(
+    "/home/dev/image_refactor_plan/01-repo-worktree-agent.md",
+    depends_on=[schema.brief_file],
+)
+image_gc = load_task_brief(
+    "/home/dev/image_refactor_plan/02-image-identity-gc-agent.md",
+    depends_on=[repo.brief_file],
+)
+
+plan = make_task_plan(
+    tasks=[schema, repo, image_gc],
+    suggested_order=[schema.brief_file, repo.brief_file, image_gc.brief_file],
+)
+
+mappings, executions = dispatch_task_plan(
+    plan,
+    project_prefix="image-refactor-",
+    execute=True,
+    ensure_running=True,
+    background=True,
+)
+
+for mapping, execution in zip(mappings, executions):
+    print(mapping.task.brief_file, "->", mapping.project, execution.log_path)
+```
   
 ## License
 

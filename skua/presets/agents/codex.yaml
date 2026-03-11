@@ -13,6 +13,7 @@ spec:
   runtime:
     command: codex
     adapt_command: "codex exec --skip-git-repo-check {prompt_shell}"
+    prompt_command: "codex exec --skip-git-repo-check {prompt_shell}"
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim

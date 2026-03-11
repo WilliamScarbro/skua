@@ -11,6 +11,7 @@ spec:
   runtime:
     command: claude
     adapt_command: "claude -p {prompt_shell}"
+    prompt_command: "claude -p {prompt_shell}"
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim

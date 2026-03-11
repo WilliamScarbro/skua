@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from skua.commands.credential import resolve_credential_sources
-from skua.commands.run import _credential_refresh_reason, _run_local_login
+from skua.commands.run import _credential_refresh_reason, _run_local_login, configure_project_docker_transport
 from skua.config import ConfigStore, validate_project
 from skua.docker import (
     build_run_command,
@@ -60,6 +60,8 @@ def cmd_adapt(args, lock_project: bool = True):
     if project is None:
         print(f"Error: Project '{name}' not found.")
         sys.exit(1)
+
+    configure_project_docker_transport(project)
 
     env = store.load_environment(project.environment)
     if env is None:
@@ -389,6 +391,17 @@ def _ensure_project_directory(store: ConfigStore, project) -> Path:
 
     if not project.directory:
         return None
+
+    if project.host and not project.repo:
+        p = Path(str(project.directory)).expanduser()
+        if p.is_dir():
+            return p.resolve()
+        print("Error: Project directory is only available on the Docker host.")
+        print("  `skua run` and `skua build` support host-backed bind mounts via --host --dir.")
+        print("  `skua adapt` still needs a locally accessible checkout or a configured repo URL.")
+        print(f"  Docker host: {project.host}")
+        print(f"  Remote directory: {project.directory}")
+        sys.exit(1)
 
     p = Path(project.directory).expanduser().resolve()
     if not p.is_dir():

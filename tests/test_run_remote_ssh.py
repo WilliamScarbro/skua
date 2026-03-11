@@ -80,6 +80,16 @@ class TestRemoteDockerSshPreflight(unittest.TestCase):
                                 cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                 mock_preflight.assert_called_once_with("docker.example.com")
 
+    def test_configure_project_docker_transport_uses_remote_host(self):
+        from skua.commands.run import configure_project_docker_transport
+
+        project = Project(name="qar", host="docker.example.com")
+        with mock.patch("skua.commands.run._ensure_local_ssh_client_for_remote_docker") as mock_preflight:
+            with mock.patch("skua.commands.run._configure_remote_docker_transport") as mock_transport:
+                configure_project_docker_transport(project)
+                mock_preflight.assert_called_once_with("docker.example.com")
+                mock_transport.assert_called_once_with("docker.example.com")
+
 
 class TestRemoteDockerTransportFallback(unittest.TestCase):
     """Validate remote transport fallback sequence for `skua run`."""

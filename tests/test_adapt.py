@@ -166,6 +166,18 @@ class TestProjectAdaptHelpers(unittest.TestCase):
         )
         self.assertFalse(refreshed)
 
+    def test_ensure_project_directory_errors_for_remote_only_host_path(self):
+        from skua.commands.adapt import _ensure_project_directory
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir) / "cfg")
+            project = Project(name="proj", directory="/srv/projects/demo-app", host="docker-host")
+
+            with self.assertRaises(SystemExit) as ctx:
+                _ensure_project_directory(store, project)
+
+            self.assertEqual(ctx.exception.code, 1)
+
 
 class TestAdaptCommand(unittest.TestCase):
     def _new_store(self, config_dir: Path) -> ConfigStore:

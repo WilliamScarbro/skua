@@ -38,12 +38,10 @@ def cmd_add(args):
         print("Error: --dir and --repo are mutually exclusive. Specify one or the other.")
         sys.exit(1)
 
-    # --host requires --repo and is incompatible with --dir
-    if host and args.dir:
-        print("Error: --host and --dir are mutually exclusive. Use --repo for remote projects.")
-        sys.exit(1)
-    if host and not repo_url:
-        print("Error: --host requires --repo. Remote projects must specify a git repository URL.")
+    # --host requires either a repo URL or a directory path on the Docker host
+    if host and not repo_url and not args.dir:
+        print("Error: --host requires --repo or --dir.")
+        print("  Use --dir with an absolute path on the Docker host for bind-mounted projects.")
         sys.exit(1)
 
     # Validate SSH config host
@@ -89,10 +87,16 @@ def cmd_add(args):
     if not project_dir and not repo_url and not quick:
         project_dir = input("Project directory path: ").strip()
     if project_dir:
-        project_dir = str(Path(project_dir).expanduser().resolve())
-        if not Path(project_dir).is_dir():
-            print(f"Error: Directory does not exist: {project_dir}")
-            sys.exit(1)
+        if host:
+            project_dir = str(project_dir).strip()
+            if not Path(project_dir).is_absolute():
+                print("Error: --host with --dir requires an absolute path on the Docker host.")
+                sys.exit(1)
+        else:
+            project_dir = str(Path(project_dir).expanduser().resolve())
+            if not Path(project_dir).is_dir():
+                print(f"Error: Directory does not exist: {project_dir}")
+                sys.exit(1)
 
     # SSH key
     ssh_key = args.ssh_key or ""
@@ -198,8 +202,8 @@ def cmd_add(args):
     if project_dir and Path(project_dir).is_dir():
         ensure_adapt_workspace(Path(project_dir), name, agent_name)
 
-    # Create Docker volume for repo on remote host
-    if host:
+    # Create Docker volume for remote repo clones only
+    if host and repo_url:
         vol_name = f"skua-{name}-repo"
         print(f"Creating Docker volume '{vol_name}' on {host}...")
         result = subprocess.run(
@@ -216,8 +220,7 @@ def cmd_add(args):
     if host:
         _print_summary_attr("Host", f"{host} (remote)")
     _print_summary_attr("Repo", repo_url)
-    if not host:
-        _print_summary_attr("Directory", project_dir)
+    _print_summary_attr("Directory", project_dir)
     _print_summary_attr("Environment", env_name)
     _print_summary_attr("Security", sec_name)
     _print_summary_attr("Agent", agent_name)
