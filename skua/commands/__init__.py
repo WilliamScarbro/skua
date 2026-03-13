@@ -18,9 +18,10 @@ from skua.commands.describe import cmd_describe
 from skua.commands.credential import cmd_credential
 from skua.commands.dashboard import cmd_dashboard
 from skua.commands.merge import cmd_merge
+from skua.commands.ssh_cmd import cmd_ssh
 __all__ = [
     "cmd_build", "cmd_init", "cmd_add", "cmd_remove", "cmd_run", "cmd_stop",
     "cmd_restart", "cmd_adapt", "cmd_list", "cmd_clean", "cmd_purge",
     "cmd_config", "cmd_validate", "cmd_describe", "cmd_credential", "cmd_dashboard",
-    "cmd_merge",
+    "cmd_merge", "cmd_ssh",
 ]

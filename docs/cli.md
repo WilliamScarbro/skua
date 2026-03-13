@@ -80,6 +80,18 @@ skua add myapp --dir ~/projects/myapp \
 | `--quick` | Use all defaults, skip all prompts |
 | `--no-prompt` | Skip prompts for missing values |
 
+To update the SSH key later for an existing project, use `skua ssh add <name>`.
+
+### `skua ssh add <name>`
+
+Set or clear the SSH private key for an existing project using the same key selection flow as `skua add`.
+
+```bash
+skua ssh add myapp
+skua ssh add myapp --ssh-key ~/.ssh/id_ed25519
+skua ssh add myapp --clear
+```
+
 ### `skua remove <name>`
 
 Remove a project configuration. Optionally removes persisted agent data.

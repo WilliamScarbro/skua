@@ -261,6 +261,20 @@ def main():
     p_cred_rm = cred_sub.add_parser("remove", help="Remove a credential set")
     p_cred_rm.add_argument("name", help="Credential name to remove")
 
+    # ssh
+    p_ssh = sub.add_parser("ssh", help="Manage project SSH key settings")
+    ssh_sub = p_ssh.add_subparsers(dest="action")
+
+    p_ssh_add = ssh_sub.add_parser("add", help="Set or clear the SSH private key for a project")
+    p_ssh_add.add_argument("name", help="Project name")
+    p_ssh_add.add_argument("--ssh-key", help="SSH private key path")
+    p_ssh_add.add_argument("--clear", action="store_true", help="Clear the project's SSH key")
+    p_ssh_add.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not prompt for key selection; requires --ssh-key or --clear",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -271,7 +285,7 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe, cmd_credential, cmd_dashboard, cmd_merge,
+        cmd_describe, cmd_credential, cmd_dashboard, cmd_merge, cmd_ssh,
     )
 
     commands = {
@@ -292,6 +306,7 @@ def main():
         "validate": cmd_validate,
         "describe": cmd_describe,
         "credential": _handle_credential,
+        "ssh": _handle_ssh,
     }
     commands[args.command](args)
 
@@ -308,6 +323,18 @@ def _handle_credential(args):
         print("  remove <name>   Remove a credential set")
         sys.exit(1)
     cmd_credential(args)
+
+
+def _handle_ssh(args):
+    """Dispatch ssh subcommands, showing help if no action given."""
+    from skua.commands import cmd_ssh
+    if not args.action:
+        print("usage: skua ssh <action> [options]")
+        print()
+        print("actions:")
+        print("  add <project>   Set or clear a project's SSH private key")
+        sys.exit(1)
+    cmd_ssh(args)
 
 
 if __name__ == "__main__":

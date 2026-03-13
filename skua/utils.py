@@ -61,6 +61,21 @@ def find_ssh_keys() -> list:
     )
 
 
+def choose_ssh_key(default_key: str = "", prompt: str = "Select SSH private key:") -> str:
+    """Prompt for an SSH private key using the standard skua selection flow."""
+    keys = [str(p) for p in find_ssh_keys()]
+    if default_key:
+        default_path = str(Path(default_key).expanduser().resolve())
+        if Path(default_path).is_file() and default_path not in keys:
+            keys.append(default_path)
+    if keys:
+        keys = sorted(keys)
+        options = keys + ["None"]
+        selected = select_option(prompt, options, default_index=len(options) - 1)
+        return "" if selected == "None" else selected
+    return input("SSH private key path (leave empty for none): ").strip()
+
+
 def parse_ssh_config_hosts() -> list:
     """Parse ~/.ssh/config and return defined Host names (excludes wildcards)."""
     config_file = Path.home() / ".ssh" / "config"

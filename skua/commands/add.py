@@ -10,7 +10,7 @@ from skua.commands.credential import agent_default_source_dir, resolve_credentia
 from skua.config import ConfigStore, Credential, Project
 from skua.config.resources import ProjectGitSpec, ProjectSshSpec, ProjectImageSpec
 from skua.project_adapt import ADAPT_GUIDE_NAME, ensure_adapt_workspace
-from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
+from skua.utils import choose_ssh_key, parse_ssh_config_hosts, select_option
 
 
 def cmd_add(args):
@@ -97,19 +97,7 @@ def cmd_add(args):
     # SSH key
     ssh_key = args.ssh_key or ""
     if not ssh_key and not quick and not args.no_prompt:
-        keys = [str(p) for p in find_ssh_keys()]
-        global_ssh = defaults.get("sshKey", "")
-        if global_ssh:
-            global_ssh_path = str(Path(global_ssh).expanduser().resolve())
-            if Path(global_ssh_path).is_file() and global_ssh_path not in keys:
-                keys.append(global_ssh_path)
-        if keys:
-            keys = sorted(keys)
-            options = keys + ["None"]
-            selected = select_option("Select SSH private key:", options, default_index=len(options) - 1)
-            ssh_key = "" if selected == "None" else selected
-        else:
-            ssh_key = input("SSH private key path (leave empty for none): ").strip()
+        ssh_key = choose_ssh_key(defaults.get("sshKey", ""))
 
     if ssh_key:
         ssh_key = str(Path(ssh_key).expanduser().resolve())

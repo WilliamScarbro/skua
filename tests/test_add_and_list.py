@@ -14,7 +14,14 @@ from unittest import mock
 # Ensure the skua package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from skua.config.resources import AgentAuthSpec, AgentConfig, Credential, Project, ProjectStateSpec
+from skua.config.resources import (
+    AgentAuthSpec,
+    AgentConfig,
+    Credential,
+    Project,
+    ProjectSshSpec,
+    ProjectStateSpec,
+)
 
 
 class TestAddCredentialSelection(unittest.TestCase):
@@ -118,12 +125,11 @@ class TestAddCredentialSelection(unittest.TestCase):
             self.assertEqual(saved[1].credential, "imported-cred")
 
     @mock.patch("skua.commands.add.select_option", return_value="Skip credential setup (log in inside the container)")
-    @mock.patch("skua.commands.add.find_ssh_keys", return_value=[])
     @mock.patch("builtins.input", return_value="")
     @mock.patch("skua.commands.add.resolve_credential_sources")
     @mock.patch("skua.commands.add.ConfigStore")
     def test_interactive_skip_when_no_credentials_and_no_local_found(
-        self, MockStore, mock_sources, _mock_input, _mock_keys, mock_select
+        self, MockStore, mock_sources, _mock_input, mock_select
     ):
         from skua.commands.add import cmd_add
 
@@ -196,10 +202,9 @@ class TestAddCredentialSelection(unittest.TestCase):
         self.assertEqual(saved[0].credential, "")
         self.assertIn("Skipping credential setup", buf.getvalue())
 
-    @mock.patch("skua.commands.add.select_option")
-    @mock.patch("skua.commands.add.find_ssh_keys")
+    @mock.patch("skua.commands.add.choose_ssh_key")
     @mock.patch("skua.commands.add.ConfigStore")
-    def test_ssh_selector_includes_none_option(self, MockStore, mock_find_ssh_keys, mock_select):
+    def test_add_uses_shared_ssh_key_selector(self, MockStore, mock_choose_key):
         from skua.commands.add import cmd_add
 
         store = MockStore.return_value
@@ -213,8 +218,7 @@ class TestAddCredentialSelection(unittest.TestCase):
         )
         store.load_credential.return_value = Credential(name="cred1", agent="claude")
 
-        mock_find_ssh_keys.return_value = [Path("/tmp/id_ed25519")]
-        mock_select.return_value = "None"
+        mock_choose_key.return_value = ""
 
         cmd_add(
             self._args(
@@ -229,7 +233,81 @@ class TestAddCredentialSelection(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         self.assertIsInstance(saved[0], Project)
         self.assertEqual(saved[0].ssh.private_key, "")
-        self.assertIn("None", mock_select.call_args.args[1])
+        mock_choose_key.assert_called_once_with("/tmp/default-key")
+
+
+class TestProjectSSHCommand(unittest.TestCase):
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_add_updates_existing_project_with_explicit_key(self, MockStore):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        project = Project(name="demo", ssh=ProjectSshSpec(private_key=""))
+        store.load_project.return_value = project
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = Path(tmpdir) / "id_ed25519"
+            key_path.write_text("secret")
+
+            cmd_ssh(
+                argparse.Namespace(
+                    action="add",
+                    name="demo",
+                    ssh_key=str(key_path),
+                    clear=False,
+                    no_prompt=True,
+                )
+            )
+
+        saved = store.save_resource.call_args.args[0]
+        self.assertEqual(saved.ssh.private_key, str(key_path.resolve()))
+
+    @mock.patch("skua.commands.ssh_cmd.choose_ssh_key", return_value="")
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_add_uses_selector_and_can_clear_key(self, MockStore, mock_choose_key):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.get_global_defaults.return_value = {"sshKey": "/tmp/default-key"}
+        project = Project(name="demo", ssh=ProjectSshSpec(private_key="/tmp/project-key"))
+        store.load_project.return_value = project
+
+        cmd_ssh(
+            argparse.Namespace(
+                action="add",
+                name="demo",
+                ssh_key="",
+                clear=False,
+                no_prompt=False,
+            )
+        )
+
+        mock_choose_key.assert_called_once_with("/tmp/project-key")
+        saved = store.save_resource.call_args.args[0]
+        self.assertEqual(saved.ssh.private_key, "")
+
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_add_requires_value_when_no_prompt(self, MockStore):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_project.return_value = Project(name="demo", ssh=ProjectSshSpec(private_key=""))
+
+        with self.assertRaises(SystemExit) as ctx:
+            cmd_ssh(
+                argparse.Namespace(
+                    action="add",
+                    name="demo",
+                    ssh_key="",
+                    clear=False,
+                    no_prompt=True,
+                )
+            )
+
+        self.assertEqual(ctx.exception.code, 1)
 
     @mock.patch("skua.commands.add.select_option", return_value="zcred")
     def test_interactive_credential_prompt_uses_selector(self, mock_select):
