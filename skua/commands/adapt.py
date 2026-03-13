@@ -16,10 +16,13 @@ from skua.config import ConfigStore, validate_project
 from skua.docker import (
     build_run_command,
     build_image,
+    ensure_agent_base_image,
     generate_dockerfile,
+    generate_project_overlay_dockerfile,
     image_exists,
     image_name_for_agent,
     image_name_for_project,
+    project_uses_agent_base_layer,
     resolve_project_image_inputs,
 )
 from skua.project_adapt import (
@@ -426,12 +429,6 @@ def _ensure_base_agent_image(store: ConfigStore, project, sec, agent) -> str:
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
     image_name = image_name_for_agent(image_name_base, agent.name)
-    if image_exists(image_name):
-        print(f"[adapt] Base agent image ready: {image_name}")
-        return image_name
-
-    print(f"[adapt] Base agent image missing: {image_name}")
-    print("[adapt] Building base agent image...")
     container_dir = store.get_container_dir()
     if container_dir is None:
         print("Error: Cannot find container build assets (entrypoint.sh).")
@@ -445,27 +442,29 @@ def _ensure_base_agent_image(store: ConfigStore, project, sec, agent) -> str:
     image_config = g.get("image", {})
     global_extra_packages = image_config.get("extraPackages", [])
     global_extra_commands = image_config.get("extraCommands", [])
-    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
-        default_base_image=base_image,
-        agent=agent,
-        project=None,
-        global_extra_packages=global_extra_packages,
-        global_extra_commands=global_extra_commands,
-    )
-    success, _ = build_image(
+    existed = image_exists(image_name)
+    _, success, changed, reason = ensure_agent_base_image(
         container_dir=container_dir,
-        image_name=image_name,
+        image_name_base=image_name_base,
+        default_base_image=base_image,
         security=build_security,
         agent=agent,
-        base_image=resolved_base_image,
-        extra_packages=extra_packages,
-        extra_commands=extra_commands,
+        global_extra_packages=global_extra_packages,
+        global_extra_commands=global_extra_commands,
         quiet=True,
     )
     if not success:
         print(f"Error: failed to build image '{image_name}'.")
+        if reason:
+            print(reason)
         sys.exit(1)
-    print(f"[adapt] Base agent image built: {image_name}")
+    if not changed:
+        print(f"[adapt] Base agent image ready: {image_name}")
+        return image_name
+    if existed:
+        print(f"[adapt] Base agent image refreshed: {image_name}")
+    else:
+        print(f"[adapt] Base agent image built: {image_name}")
     return image_name
 
 
@@ -930,14 +929,22 @@ def _print_project_dockerfile(store: ConfigStore, project, agent, sec):
         project=project,
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
+        image_name_base=g.get("imageName", "skua-base"),
     )
-    dockerfile = generate_dockerfile(
-        agent=agent,
-        security=sec,
-        base_image=resolved_base_image,
-        extra_packages=extra_packages,
-        extra_commands=extra_commands,
-    )
+    if project_uses_agent_base_layer(project):
+        dockerfile = generate_project_overlay_dockerfile(
+            base_image=resolved_base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        )
+    else:
+        dockerfile = generate_dockerfile(
+            agent=agent,
+            security=sec,
+            base_image=resolved_base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        )
     print(dockerfile, end="")
 
 
@@ -1045,7 +1052,9 @@ def _build_project_image(store: ConfigStore, project, agent) -> str:
         project=project,
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
+        image_name_base=image_name_base,
     )
+    layered_project = project_uses_agent_base_layer(project)
     defaults = g.get("defaults", {})
     build_security_name = defaults.get("security", "open")
     build_security = store.load_security(build_security_name)
@@ -1054,6 +1063,20 @@ def _build_project_image(store: ConfigStore, project, agent) -> str:
     print(f"  Base image: {resolved_base_image}")
     if extra_packages:
         print(f"  Packages:   {', '.join(extra_packages)}")
+    if layered_project:
+        _, success, _, reason = ensure_agent_base_image(
+            container_dir=container_dir,
+            image_name_base=image_name_base,
+            default_base_image=base_image,
+            security=build_security,
+            agent=agent,
+            global_extra_packages=global_packages,
+            global_extra_commands=global_commands,
+            quiet=True,
+        )
+        if not success:
+            print(f"[adapt] Failed to prepare shared agent image for '{project.agent}'.")
+            return reason or "Shared agent image build failed."
     success, error_output = build_image(
         container_dir=container_dir,
         image_name=image_name,
@@ -1063,6 +1086,7 @@ def _build_project_image(store: ConfigStore, project, agent) -> str:
         extra_packages=extra_packages,
         extra_commands=extra_commands,
         quiet=True,
+        layer_on_base=layered_project,
     )
     if not success:
         print(f"[adapt] Image build failed: {image_name}")

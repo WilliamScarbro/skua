@@ -6,6 +6,31 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKUA="$SCRIPT_DIR/bin/skua"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
 
+in_virtualenv() {
+    python3 - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.prefix != getattr(sys, "base_prefix", sys.prefix) else 1)
+PY
+}
+
+ensure_pip() {
+    if python3 -m pip --version >/dev/null 2>&1; then
+        return
+    fi
+    python3 -m ensurepip --upgrade >/dev/null 2>&1
+}
+
+pip_install_local() {
+    ensure_pip
+    if in_virtualenv; then
+        python3 -m pip install --upgrade "$SCRIPT_DIR"
+        return
+    fi
+
+    python3 -m pip install --user --break-system-packages --upgrade "$SCRIPT_DIR" 2>/dev/null \
+        || python3 -m pip install --user --upgrade "$SCRIPT_DIR"
+}
+
 echo "============================================"
 echo "  skua installer"
 echo "  Dockerized Claude Code Manager"
@@ -27,10 +52,21 @@ fi
 # Check/install Python runtime dependencies for skua.
 if ! python3 -c "import yaml, rich, textual" 2>/dev/null; then
     echo "Installing Python dependencies from requirements.txt..."
+    ensure_pip
     if [ -f "$REQ_FILE" ]; then
-        pip3 install --break-system-packages -r "$REQ_FILE" 2>/dev/null || pip3 install -r "$REQ_FILE"
+        if in_virtualenv; then
+            python3 -m pip install -r "$REQ_FILE"
+        else
+            python3 -m pip install --user --break-system-packages -r "$REQ_FILE" 2>/dev/null \
+                || python3 -m pip install --user -r "$REQ_FILE"
+        fi
     else
-        pip3 install --break-system-packages pyyaml rich textual 2>/dev/null || pip3 install pyyaml rich textual
+        if in_virtualenv; then
+            python3 -m pip install pyyaml rich textual
+        else
+            python3 -m pip install --user --break-system-packages pyyaml rich textual 2>/dev/null \
+                || python3 -m pip install --user pyyaml rich textual
+        fi
     fi
 fi
 
@@ -56,47 +92,33 @@ fi
 echo "[OK] Prerequisites: docker, python3, git, pyyaml, rich, textual"
 echo ""
 
-# ── Install skua to PATH ─────────────────────────────────────────────
-echo "Installing skua CLI..."
+# ── Install skua package + CLI ───────────────────────────────────────
+echo "Installing skua Python package and CLI..."
 
-chmod +x "$SKUA"
+pip_install_local
 
-# Find a suitable bin directory that's already in PATH
-INSTALL_DIR=""
-for candidate in "$HOME/.local/bin" "$HOME/bin" "/usr/local/bin"; do
-    if echo "$PATH" | tr ':' '\n' | grep -qx "$candidate"; then
-        if [ -w "$candidate" ] || [ ! -e "$candidate" -a -w "$(dirname "$candidate")" ]; then
-            INSTALL_DIR="$candidate"
-            break
-        fi
-    fi
-done
+INSTALL_DIR="$HOME/.local/bin"
+if in_virtualenv; then
+    INSTALL_DIR="$(python3 - <<'PY'
+import sys
+from pathlib import Path
+print(Path(sys.prefix) / "bin")
+PY
+)"
+fi
 
-if [ -n "$INSTALL_DIR" ]; then
-    mkdir -p "$INSTALL_DIR"
-    # Remove existing symlink/file first to avoid stale targets
-    rm -f "$INSTALL_DIR/skua"
-    ln -s "$SKUA" "$INSTALL_DIR/skua"
-    echo "[OK] Symlinked skua -> $INSTALL_DIR/skua"
-else
-    # None of the standard dirs are in PATH — use ~/.local/bin and warn
-    INSTALL_DIR="$HOME/.local/bin"
-    mkdir -p "$INSTALL_DIR"
-    rm -f "$INSTALL_DIR/skua"
-    ln -s "$SKUA" "$INSTALL_DIR/skua"
-    echo "[!!] Symlinked skua -> $INSTALL_DIR/skua"
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
     echo ""
     echo "  WARNING: $INSTALL_DIR is not in your PATH."
     echo "  Add it by appending this to your shell profile:"
     echo ""
-    # Detect shell
     SHELL_NAME="$(basename "$SHELL")"
     case "$SHELL_NAME" in
         zsh)  PROFILE="~/.zshrc" ;;
         bash) PROFILE="~/.bashrc" ;;
         *)    PROFILE="~/.profile" ;;
     esac
-    echo "    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $PROFILE"
+    echo "    echo 'export PATH=\"${INSTALL_DIR/#$HOME/\$HOME}:\$PATH\"' >> $PROFILE"
     echo ""
     echo "  Then restart your shell or run: source $PROFILE"
 fi
@@ -107,7 +129,7 @@ if command -v skua &>/dev/null && skua --version &>/dev/null; then
 else
     echo ""
     echo "  ERROR: 'skua' is not available on your PATH after install."
-    echo "  The symlink was created at: $INSTALL_DIR/skua"
+    echo "  The console script should be installed at: $INSTALL_DIR/skua"
     echo "  Make sure $INSTALL_DIR is in your PATH, then restart your shell."
     exit 1
 fi

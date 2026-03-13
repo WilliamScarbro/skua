@@ -46,10 +46,12 @@ from skua.commands.stop import cmd_stop
 from skua.config import ConfigStore
 from skua.docker import (
     build_image,
+    ensure_agent_base_image,
     get_running_skua_containers,
     image_exists,
     image_rebuild_needed,
     image_name_for_project,
+    project_uses_agent_base_layer,
     resolve_project_image_inputs,
 )
 from skua.project_lock import format_project_busy_error, project_busy_error_if_locked
@@ -822,7 +824,9 @@ def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck
         project=project,
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
+        image_name_base=image_name_base,
     )
+    layered_project = project_uses_agent_base_layer(project)
     needs_rebuild, force_refresh, reason = image_rebuild_needed(
         image_name=image_name,
         container_dir=store.get_container_dir(),
@@ -831,6 +835,7 @@ def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck
         base_image=resolved_base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layered_project,
     )
     return BuildPreflightCheck(
         project=project.name,
@@ -910,8 +915,26 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         project=project,
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
+        image_name_base=image_name_base,
     )
-
+    layered_project = project_uses_agent_base_layer(project)
+    if layered_project:
+        _, success, _, reason = ensure_agent_base_image(
+            container_dir=container_dir,
+            image_name_base=image_name_base,
+            default_base_image=base_image,
+            security=security,
+            agent=agent,
+            global_extra_packages=global_packages,
+            global_extra_commands=global_commands,
+            quiet=not verbose,
+            verbose=verbose,
+        )
+        if not success:
+            print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
+            if reason:
+                print(reason)
+            return False
     needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
         image_name=image_name,
         container_dir=container_dir,
@@ -920,6 +943,7 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         base_image=resolved_base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layered_project,
     )
 
     if not needs_rebuild:
@@ -944,6 +968,7 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
         verbose=verbose,
         pull=force_refresh,
         no_cache=force_refresh,
+        layer_on_base=layered_project,
     )
     if success:
         print(f"Build complete for '{image_name}'.")

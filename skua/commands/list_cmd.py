@@ -12,6 +12,7 @@ from skua.docker import (
     image_exists,
     image_matches_build_context,
     image_name_for_project,
+    project_uses_agent_base_layer,
     resolve_project_image_inputs,
 )
 from skua.project_adapt import image_request_path, load_image_request, request_changes_project
@@ -69,6 +70,8 @@ def _format_host(project) -> str:
 
 def _format_source(project) -> str:
     """Return the source label: DIR:... or GITHUB:... or REPO:... ."""
+    if getattr(project, "sources", None):
+        return f"MERGED:{len(project.sources)}"
     if project.directory:
         return f"DIR:{_shorten_home_path(project.directory)}"
     if project.repo:
@@ -79,6 +82,8 @@ def _format_source(project) -> str:
 
 def _format_project_source(project) -> str:
     """Backward-compatible source formatter used by older tests/callers."""
+    if getattr(project, "sources", None):
+        return f"MERGED:{len(project.sources)}"
     if project.directory:
         return f"LOCAL:{_shorten_home_path(project.directory)}"
     if project.repo:
@@ -285,6 +290,7 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
             project=project,
             global_extra_packages=global_packages,
             global_extra_commands=global_commands,
+            image_name_base=image_name_base,
         )
         if not image_matches_build_context(
             image_name=image_name,
@@ -294,6 +300,7 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
             base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
+            layer_on_base=project_uses_agent_base_layer(project),
         ):
             flags.add("(B)")
 

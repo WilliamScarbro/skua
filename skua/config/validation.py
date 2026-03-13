@@ -185,7 +185,7 @@ def validate_project(project, environment, security, agent) -> ValidationResult:
     result.warnings.extend(agent_result.warnings)
 
     # Step 5: Project-level checks
-    if not project.directory and not project.repo:
+    if not project.directory and not project.repo and not getattr(project, "sources", None):
         result.warn("project has no directory set")
 
     return result

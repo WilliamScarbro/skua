@@ -3,10 +3,12 @@
 
 import base64
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -123,6 +125,19 @@ def project_has_image_customizations(project: Project) -> bool:
     )
 
 
+def project_uses_agent_base_layer(project: Project) -> bool:
+    """Return True when a project should layer on top of the shared agent image."""
+    if not project_has_image_customizations(project):
+        return False
+    img = getattr(project, "image", None)
+    if not img:
+        return False
+    return not (
+        str(getattr(img, "base_image", "") or "").strip()
+        or str(getattr(img, "from_image", "") or "").strip()
+    )
+
+
 def image_name_for_project(base_image_name: str, project: Project) -> str:
     """Return the image tag to use for a specific project."""
     agent_name = (project.agent or "claude") if project else "claude"
@@ -156,6 +171,7 @@ def resolve_project_image_inputs(
     project: Project,
     global_extra_packages: list = None,
     global_extra_commands: list = None,
+    image_name_base: str = "skua-base",
 ) -> tuple:
     """Resolve base image and build extras for a project image build."""
     agent_default_base = base_image_for_agent(default_base_image, agent)
@@ -171,6 +187,8 @@ def resolve_project_image_inputs(
         project_commands = list(getattr(project.image, "extra_commands", []) or [])
 
     resolved_base_image = project_from_image or project_base_image or agent_default_base
+    if project_uses_agent_base_layer(project):
+        resolved_base_image = image_name_for_agent(image_name_base, agent.name if agent else "")
     extra_packages = _merge_unique(list(global_extra_packages or []) + project_packages)
     extra_commands = _merge_unique(list(global_extra_commands or []) + project_commands)
     return resolved_base_image, extra_packages, extra_commands
@@ -220,6 +238,32 @@ def _project_mount_path(project: Project) -> str:
     return f"/home/dev/{mount_name}"
 
 
+def _project_sources(project: Project) -> list:
+    """Return explicit project sources, or a single implicit primary source."""
+    sources = list(getattr(project, "sources", []) or [])
+    if sources:
+        return sources
+    return [project]
+
+
+def _source_mount_path(source, index: int = 0) -> str:
+    """Return the in-container mount path for a source."""
+    explicit = str(getattr(source, "mount_path", "") or "").strip()
+    if explicit:
+        return explicit
+    if getattr(source, "repo", ""):
+        mount_name = _repo_name_from_url(source.repo)
+    elif getattr(source, "directory", ""):
+        mount_name = _sanitize_mount_name(Path(source.directory).name)
+    elif getattr(source, "name", ""):
+        mount_name = _sanitize_mount_name(source.name)
+    elif getattr(source, "project", ""):
+        mount_name = _sanitize_mount_name(source.project)
+    else:
+        mount_name = f"project-{index + 1}"
+    return f"/home/dev/{mount_name}"
+
+
 # ── Dockerfile generation ────────────────────────────────────────────────
 
 # Core packages always included (required for container operation)
@@ -257,6 +301,60 @@ AGENT_VERSION_NPM_PACKAGES = {
     "claude": "@anthropic-ai/claude-code",
 }
 _AGENT_VERSION_CACHE = {}
+AGENT_VERSION_CACHE_TTL_SECONDS = 300
+
+
+def _agent_version_cache_path() -> Path:
+    """Return the shared on-disk cache path for latest agent versions."""
+    return Path.home() / ".config" / "skua" / "cache" / "agent-versions.json"
+
+
+def _read_agent_version_disk_cache() -> dict:
+    """Load the shared agent-version cache from disk."""
+    path = _agent_version_cache_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _cached_agent_client_version(agent_name: str, max_age_seconds: int | None = AGENT_VERSION_CACHE_TTL_SECONDS) -> str:
+    """Return a cached agent version from disk when present and sufficiently fresh."""
+    raw = _read_agent_version_disk_cache().get(str(agent_name or "").strip().lower())
+    if not isinstance(raw, dict):
+        return ""
+
+    version = str(raw.get("version") or "").strip()
+    checked_at = raw.get("checked_at")
+    if not version:
+        return ""
+    if max_age_seconds is None:
+        return version
+    if not isinstance(checked_at, (int, float)):
+        return ""
+    if (time.time() - float(checked_at)) > max_age_seconds:
+        return ""
+    return version
+
+
+def _write_agent_version_disk_cache(agent_name: str, version: str) -> None:
+    """Persist a resolved latest agent version for reuse across skua processes."""
+    normalized = str(agent_name or "").strip().lower()
+    value = str(version or "").strip()
+    if not normalized or not value:
+        return
+
+    path = _agent_version_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = _read_agent_version_disk_cache()
+        data[normalized] = {"version": value, "checked_at": time.time()}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+        tmp.replace(path)
+    except OSError:
+        return
 
 
 def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
@@ -335,8 +433,17 @@ def latest_agent_client_version(agent_name: str) -> str:
         return ""
     if normalized in _AGENT_VERSION_CACHE:
         return _AGENT_VERSION_CACHE[normalized]
+    cached_version = _cached_agent_client_version(normalized)
+    if cached_version:
+        _AGENT_VERSION_CACHE[normalized] = cached_version
+        return cached_version
     package_name = AGENT_VERSION_NPM_PACKAGES.get(normalized, "")
     version = _latest_npm_package_version(package_name)
+    if version:
+        _write_agent_version_disk_cache(normalized, version)
+    else:
+        # Reuse the last known version when the live lookup is temporarily unavailable.
+        version = _cached_agent_client_version(normalized, max_age_seconds=None)
     _AGENT_VERSION_CACHE[normalized] = version
     return version
 
@@ -394,6 +501,7 @@ def image_rebuild_needed(
     base_image: str = "debian:bookworm-slim",
     extra_packages: list = None,
     extra_commands: list = None,
+    layer_on_base: bool = False,
 ) -> tuple:
     """Return (needs_rebuild, force_refresh, reason) for an image preflight check."""
     if not image_exists(image_name):
@@ -415,10 +523,60 @@ def image_rebuild_needed(
         base_image=base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layer_on_base,
     ):
         return True, False, "build context changed"
 
     return False, False, ""
+
+
+def ensure_agent_base_image(
+    container_dir: Path,
+    image_name_base: str,
+    default_base_image: str,
+    security: SecurityProfile = None,
+    agent: AgentConfig = None,
+    global_extra_packages: list = None,
+    global_extra_commands: list = None,
+    quiet: bool = False,
+    verbose: bool = False,
+) -> tuple:
+    """Ensure the shared per-agent base image exists and is current."""
+    image_name = image_name_for_agent(image_name_base, agent.name if agent else "")
+    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+        default_base_image=default_base_image,
+        agent=agent,
+        project=None,
+        global_extra_packages=global_extra_packages,
+        global_extra_commands=global_extra_commands,
+        image_name_base=image_name_base,
+    )
+    needs_rebuild, force_refresh, reason = image_rebuild_needed(
+        image_name=image_name,
+        container_dir=container_dir,
+        security=security,
+        agent=agent,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+    )
+    if not needs_rebuild:
+        return image_name, True, False, ""
+
+    success, output = build_image(
+        container_dir=container_dir,
+        image_name=image_name,
+        security=security,
+        agent=agent,
+        base_image=resolved_base_image,
+        extra_packages=extra_packages,
+        extra_commands=extra_commands,
+        quiet=quiet,
+        verbose=verbose,
+        pull=force_refresh,
+        no_cache=force_refresh,
+    )
+    return image_name, success, True, reason or output
 
 
 def base_image_for_agent(default_base_image: str, agent: AgentConfig = None) -> str:
@@ -592,6 +750,38 @@ RUN chmod +x /home/dev/.entrypoint.d/*.sh 2>/dev/null || true
     return dockerfile
 
 
+def generate_project_overlay_dockerfile(
+    base_image: str,
+    extra_packages: list = None,
+    extra_commands: list = None,
+) -> str:
+    """Generate a thin project-layer Dockerfile on top of an existing agent image."""
+    package_lines = ""
+    packages = [str(pkg).strip() for pkg in (extra_packages or []) if str(pkg).strip()]
+    if packages:
+        pkg_line = " \\\n    ".join(packages)
+        package_lines = f"""
+# ── Project packages ────────────────────────────────────────────────
+USER root
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    {pkg_line} \\
+    && rm -rf /var/lib/apt/lists/*
+"""
+
+    extra_lines = ""
+    commands = [str(cmd).strip() for cmd in (extra_commands or []) if str(cmd).strip()]
+    if commands:
+        extra_lines = "\n" + "\n".join(f"RUN {cmd}" for cmd in commands)
+
+    return f"""FROM {base_image}
+{package_lines}
+USER dev
+WORKDIR /home/dev
+{extra_lines}
+"""
+
+
 # ── Build ────────────────────────────────────────────────────────────────
 
 def build_image(
@@ -607,6 +797,7 @@ def build_image(
     verbose: bool = False,
     pull: bool = False,
     no_cache: bool = False,
+    layer_on_base: bool = False,
 ):
     """Build a Docker image, generating the Dockerfile from config.
 
@@ -622,58 +813,59 @@ def build_image(
         extra_commands=extra_commands,
     )
 
-    build_path = container_dir / ".build-context"
+    build_path = Path(tempfile.mkdtemp(prefix=".build-context-", dir=container_dir))
     try:
-        if build_path.exists():
-            shutil.rmtree(build_path)
-        build_path.mkdir()
-
         # Generate Dockerfile
-        dockerfile_content = generate_dockerfile(
-            agent=agent,
-            agents=agents,
-            security=security,
-            base_image=base_image,
-            extra_packages=extra_packages,
-            extra_commands=extra_commands,
-        )
+        if layer_on_base:
+            dockerfile_content = generate_project_overlay_dockerfile(
+                base_image=base_image,
+                extra_packages=extra_packages,
+                extra_commands=extra_commands,
+            )
+        else:
+            dockerfile_content = generate_dockerfile(
+                agent=agent,
+                agents=agents,
+                security=security,
+                base_image=base_image,
+                extra_packages=extra_packages,
+                extra_commands=extra_commands,
+            )
         (build_path / "Dockerfile").write_text(dockerfile_content)
 
-        # Copy entrypoint
-        shutil.copy2(container_dir / "entrypoint.sh", build_path / "entrypoint.sh")
-        check_monitoring_src = container_dir / "check_monitoring.sh"
-        if check_monitoring_src.is_file():
-            shutil.copy2(check_monitoring_src, build_path / "check_monitoring.sh")
-        tmux_attach_banner_src = container_dir / "tmux-attach-banner.sh"
-        if tmux_attach_banner_src.is_file():
-            shutil.copy2(tmux_attach_banner_src, build_path / "tmux-attach-banner.sh")
+        if not layer_on_base:
+            # Copy entrypoint and baked-in defaults for full agent/base image builds.
+            shutil.copy2(container_dir / "entrypoint.sh", build_path / "entrypoint.sh")
+            check_monitoring_src = container_dir / "check_monitoring.sh"
+            if check_monitoring_src.is_file():
+                shutil.copy2(check_monitoring_src, build_path / "check_monitoring.sh")
+            tmux_attach_banner_src = container_dir / "tmux-attach-banner.sh"
+            if tmux_attach_banner_src.is_file():
+                shutil.copy2(tmux_attach_banner_src, build_path / "tmux-attach-banner.sh")
 
-        # Copy agent monitoring hook scripts (baked into image; always present)
-        hooks_dst = build_path / "hooks"
-        hooks_dst.mkdir()
-        hooks_src = container_dir / "hooks"
-        if hooks_src.is_dir():
-            for f in sorted(hooks_src.iterdir()):
-                if f.is_file():
-                    shutil.copy2(f, hooks_dst / f.name)
+            hooks_dst = build_path / "hooks"
+            hooks_dst.mkdir()
+            hooks_src = container_dir / "hooks"
+            if hooks_src.is_dir():
+                for f in sorted(hooks_src.iterdir()):
+                    if f.is_file():
+                        shutil.copy2(f, hooks_dst / f.name)
 
-        # Copy hidden entrypoint helper scripts
-        epd_dst = build_path / ".entrypoint.d"
-        epd_dst.mkdir()
-        epd_src = container_dir / ".entrypoint.d"
-        if epd_src.is_dir():
-            for f in sorted(epd_src.iterdir()):
-                if f.is_file():
-                    shutil.copy2(f, epd_dst / f.name)
+            epd_dst = build_path / ".entrypoint.d"
+            epd_dst.mkdir()
+            epd_src = container_dir / ".entrypoint.d"
+            if epd_src.is_dir():
+                for f in sorted(epd_src.iterdir()):
+                    if f.is_file():
+                        shutil.copy2(f, epd_dst / f.name)
 
-        # Copy Claude settings (no credentials)
-        settings_dir = build_path / "claude-settings"
-        settings_dir.mkdir()
-        claude_home = Path.home() / ".claude"
-        for fname in ("settings.json", "settings.local.json"):
-            src = claude_home / fname
-            if src.exists():
-                shutil.copy2(src, settings_dir / fname)
+            settings_dir = build_path / "claude-settings"
+            settings_dir.mkdir()
+            claude_home = Path.home() / ".claude"
+            for fname in ("settings.json", "settings.local.json"):
+                src = claude_home / fname
+                if src.exists():
+                    shutil.copy2(src, settings_dir / fname)
 
         uid = os.getuid()
         gid = os.getgid()
@@ -779,6 +971,7 @@ def build_run_command(
     image_name: str,
     data_dir: Path,
     repo_volume: str = "",
+    source_mounts: list = None,
 ) -> list:
     """Build the docker run command list from resolved configuration."""
     container_name = f"skua-{project.name}"
@@ -830,15 +1023,31 @@ def build_run_command(
             else:
                 docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
 
-    # Project directory mount (local bind-mount or remote named volume)
-    if repo_volume:
-        docker_cmd.extend(["-v", f"{repo_volume}:{project_mount_path}"])
-    elif project.directory and Path(project.directory).is_dir():
-        docker_cmd.extend(["-v", f"{project.directory}:{project_mount_path}"])
+    # Project directory mounts (local bind-mounts or remote named volumes)
+    mount_specs = list(source_mounts or [])
+    if mount_specs:
+        primary_mount = next((m for m in mount_specs if m.get("primary")), mount_specs[0])
+        project_mount_path = primary_mount["target"]
+        for mount in mount_specs:
+            docker_cmd.extend(["-v", f"{mount['source']}:{mount['target']}"])
+    else:
+        if repo_volume:
+            docker_cmd.extend(["-v", f"{repo_volume}:{project_mount_path}"])
+        elif project.directory and Path(project.directory).is_dir():
+            docker_cmd.extend(["-v", f"{project.directory}:{project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_NAME={project.name}"])
     docker_cmd.extend(["-e", f"SKUA_PROJECT_DIR={project_mount_path}"])
     docker_cmd.extend(["-e", f"SKUA_IMAGE_REQUEST_FILE={project_mount_path}/.skua/image-request.yaml"])
     docker_cmd.extend(["-e", f"SKUA_ADAPT_GUIDE_FILE={project_mount_path}/.skua/ADAPT.md"])
+    source_manifest = [
+        {
+            "name": mount.get("name", ""),
+            "path": mount["target"],
+            "primary": bool(mount.get("primary")),
+        }
+        for mount in (mount_specs or [{"name": project.name, "target": project_mount_path, "primary": True}])
+    ]
+    docker_cmd.extend(["-e", f"SKUA_PROJECT_SOURCES={json.dumps(source_manifest, separators=(',', ':'))}"])
 
     # Persistence mount
     auth_dir = ".claude"
@@ -956,50 +1165,61 @@ def compute_build_context_hash(
     base_image: str = "debian:bookworm-slim",
     extra_packages: list = None,
     extra_commands: list = None,
+    layer_on_base: bool = False,
 ) -> str:
     """Compute deterministic hash for skua-managed Docker build context."""
-    dockerfile_content = generate_dockerfile(
-        agent=agent,
-        agents=agents,
-        security=security,
-        base_image=base_image,
-        extra_packages=extra_packages,
-        extra_commands=extra_commands,
-    )
+    if layer_on_base:
+        dockerfile_content = generate_project_overlay_dockerfile(
+            base_image=base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        )
+    else:
+        dockerfile_content = generate_dockerfile(
+            agent=agent,
+            agents=agents,
+            security=security,
+            base_image=base_image,
+            extra_packages=extra_packages,
+            extra_commands=extra_commands,
+        )
     entrypoint_path = container_dir / "entrypoint.sh"
 
     hasher = hashlib.sha256()
-    _hash_with_marker(hasher, "version", "v1")
+    _hash_with_marker(hasher, "version", "v2")
     _hash_with_marker(hasher, "dockerfile", dockerfile_content)
-    _hash_with_marker(hasher, "entrypoint", entrypoint_path.read_bytes() if entrypoint_path.exists() else None)
+    _hash_with_marker(hasher, "base_image_ref", base_image)
+    _hash_with_marker(hasher, "base_image_id", _local_image_id(base_image))
+    if not layer_on_base:
+        _hash_with_marker(hasher, "entrypoint", entrypoint_path.read_bytes() if entrypoint_path.exists() else None)
     _hash_with_marker(hasher, "uid", str(os.getuid()))
     _hash_with_marker(hasher, "gid", str(os.getgid()))
 
-    claude_home = Path.home() / ".claude"
-    for fname in ("settings.json", "settings.local.json"):
-        src = claude_home / fname
-        _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
+    if not layer_on_base:
+        claude_home = Path.home() / ".claude"
+        for fname in ("settings.json", "settings.local.json"):
+            src = claude_home / fname
+            _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
 
-    check_monitoring_path = container_dir / "check_monitoring.sh"
-    _hash_with_marker(
-        hasher,
-        "check_monitoring",
-        check_monitoring_path.read_bytes() if check_monitoring_path.exists() else None,
-    )
-    tmux_attach_banner_path = container_dir / "tmux-attach-banner.sh"
-    _hash_with_marker(
-        hasher,
-        "tmux_attach_banner",
-        tmux_attach_banner_path.read_bytes() if tmux_attach_banner_path.exists() else None,
-    )
+        check_monitoring_path = container_dir / "check_monitoring.sh"
+        _hash_with_marker(
+            hasher,
+            "check_monitoring",
+            check_monitoring_path.read_bytes() if check_monitoring_path.exists() else None,
+        )
+        tmux_attach_banner_path = container_dir / "tmux-attach-banner.sh"
+        _hash_with_marker(
+            hasher,
+            "tmux_attach_banner",
+            tmux_attach_banner_path.read_bytes() if tmux_attach_banner_path.exists() else None,
+        )
 
-    # Hash agent monitoring scripts so changes to hooks trigger a rebuild
-    for subdir in ("hooks", ".entrypoint.d"):
-        script_dir = container_dir / subdir
-        if script_dir.is_dir():
-            for script_file in sorted(script_dir.iterdir()):
-                if script_file.is_file():
-                    _hash_with_marker(hasher, f"{subdir}:{script_file.name}", script_file.read_bytes())
+        for subdir in ("hooks", ".entrypoint.d"):
+            script_dir = container_dir / subdir
+            if script_dir.is_dir():
+                for script_file in sorted(script_dir.iterdir()):
+                    if script_file.is_file():
+                        _hash_with_marker(hasher, f"{subdir}:{script_file.name}", script_file.read_bytes())
 
     return hasher.hexdigest()
 
@@ -1030,6 +1250,24 @@ def _image_label(image_name: str, label_key: str) -> str:
     return value
 
 
+def _local_image_id(image_name: str) -> str:
+    """Return a local Docker image ID for a ref, or empty string when unavailable."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image_name],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+    if result.returncode != 0:
+        return ""
+    value = result.stdout.strip()
+    if value in ("", "<no value>", "<nil>"):
+        return ""
+    return value
+
+
 def image_matches_build_context(
     image_name: str,
     container_dir: Path,
@@ -1039,6 +1277,7 @@ def image_matches_build_context(
     base_image: str = "debian:bookworm-slim",
     extra_packages: list = None,
     extra_commands: list = None,
+    layer_on_base: bool = False,
 ) -> bool:
     """Return True when image label hash matches current generated build context."""
     expected_hash = compute_build_context_hash(
@@ -1049,6 +1288,7 @@ def image_matches_build_context(
         base_image=base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layer_on_base,
     )
     actual_hash = _image_label(image_name, BUILD_CONTEXT_HASH_LABEL)
     return bool(actual_hash) and actual_hash == expected_hash

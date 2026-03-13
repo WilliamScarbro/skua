@@ -12,6 +12,7 @@ import base64
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
@@ -20,12 +21,16 @@ from skua.docker import (
     exec_into_container,
     build_run_command,
     build_image,
+    ensure_agent_base_image,
     image_exists,
     image_name_for_project,
+    project_uses_agent_base_layer,
     resolve_project_image_inputs,
     start_container,
     wait_for_running_container,
     _project_mount_path,
+    _source_mount_path,
+    _sanitize_mount_name,
     image_rebuild_needed,
 )
 from skua.project_adapt import ensure_adapt_workspace
@@ -331,6 +336,121 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
         sys.exit(1)
 
 
+def _project_sources(project) -> list:
+    """Return explicit sources or a single implicit primary source."""
+    sources = list(getattr(project, "sources", []) or [])
+    if sources:
+        return sources
+    return [SimpleNamespace(
+        project=project.name,
+        name=project.name,
+        directory=project.directory,
+        repo=project.repo,
+        host=getattr(project, "host", "") or "",
+        ssh_private_key=getattr(project.ssh, "private_key", "") or "",
+        mount_path=_project_mount_path(project),
+        primary=True,
+    )]
+
+
+def _source_volume_name(project_name: str, source, index: int) -> str:
+    """Return a stable Docker volume name for a remote repo source."""
+    label = (
+        getattr(source, "name", "")
+        or getattr(source, "project", "")
+        or f"src-{index + 1}"
+    )
+    return f"skua-{project_name}-{_sanitize_mount_name(label).lower()}-repo"
+
+
+def _clone_local_repo(source, clone_dir: Path):
+    """Clone a git repo to a local directory when missing."""
+    if clone_dir.exists():
+        return
+    print(f"Cloning {source.repo} into {clone_dir}...")
+    clone_cmd = ["git", "clone"]
+    ssh_key = str(getattr(source, "ssh_private_key", "") or "").strip()
+    if ssh_key:
+        ssh_cmd = f"ssh -i {ssh_key} -o StrictHostKeyChecking=no"
+        clone_cmd = ["git", "-c", f"core.sshCommand={ssh_cmd}", "clone"]
+    clone_cmd += [source.repo, str(clone_dir)]
+    try:
+        subprocess.run(clone_cmd, check=True)
+    except subprocess.CalledProcessError:
+        print(f"Error: Failed to clone {source.repo}")
+        sys.exit(1)
+
+
+def _resolve_source_mounts(store: ConfigStore, project) -> list:
+    """Resolve all project sources into Docker mount specs."""
+    mounts = []
+    host = getattr(project, "host", "") or ""
+    explicit_sources = bool(getattr(project, "sources", None))
+    for index, source in enumerate(_project_sources(project)):
+        source_host = str(getattr(source, "host", "") or "").strip()
+        if source_host and source_host != host:
+            print(
+                f"Error: source '{getattr(source, 'name', '') or index + 1}' uses host "
+                f"'{source_host}', but merged project host is '{host or 'LOCAL'}'."
+            )
+            sys.exit(1)
+
+        mount_path = _source_mount_path(source, index)
+        mount_name = (
+            getattr(source, "name", "")
+            or getattr(source, "project", "")
+            or Path(str(getattr(source, "directory", "") or "")).name
+            or f"src-{index + 1}"
+        )
+        primary = bool(getattr(source, "primary", False))
+
+        if host and getattr(source, "repo", ""):
+            volume_name = _source_volume_name(project.name, source, index)
+            clone_project = SimpleNamespace(
+                repo=source.repo,
+                ssh=SimpleNamespace(private_key=getattr(source, "ssh_private_key", "") or ""),
+            )
+            _clone_repo_into_remote_volume(clone_project, volume_name)
+            mounts.append({
+                "name": mount_name,
+                "source": volume_name,
+                "target": mount_path,
+                "primary": primary,
+            })
+            continue
+        if host and explicit_sources:
+            print(
+                f"Error: remote merged project sources must be git repos; "
+                f"source '{mount_name}' is a local directory."
+            )
+            sys.exit(1)
+
+        if getattr(source, "repo", ""):
+            clone_key = getattr(source, "project", "") or getattr(source, "name", "") or f"src-{index + 1}"
+            clone_dir = store.repo_dir(f"{project.name}-{_sanitize_mount_name(clone_key)}")
+            _clone_local_repo(source, clone_dir)
+            source_dir = clone_dir
+        else:
+            source_dir = Path(str(getattr(source, "directory", "") or "")).expanduser().resolve()
+            if not source_dir.is_dir():
+                if explicit_sources:
+                    print(f"Error: Source directory does not exist: {source_dir}")
+                    sys.exit(1)
+                continue
+
+        ensure_adapt_workspace(source_dir, project.name, project.agent)
+        mounts.append({
+            "name": mount_name,
+            "source": str(source_dir),
+            "target": mount_path,
+            "primary": primary,
+        })
+
+    if mounts and not any(m["primary"] for m in mounts):
+        mounts[0]["primary"] = True
+    return mounts
+
+
 def _seed_auth_from_host(data_dir: Path, cred, agent, overwrite: bool = False) -> int:
     """Seed missing auth files from the host into the container persistence directory.
 
@@ -593,14 +713,6 @@ def cmd_run(args, lock_project: bool = True):
     no_attach = bool(getattr(args, "no_attach", False))
     replace_process = bool(getattr(args, "replace_process", True))
 
-    if lock_project:
-        try:
-            with project_operation_lock(store, name, "starting"):
-                return cmd_run(args, lock_project=False)
-        except ProjectBusyError as exc:
-            print(format_project_busy_error(exc, "start this project"))
-            sys.exit(1)
-
     project = store.resolve_project(name)
     if project is None:
         print(f"Error: Project '{name}' not found. Add it with: skua add {name}")
@@ -620,6 +732,24 @@ def cmd_run(args, lock_project: bool = True):
         print(f"Container '{container_name}' is already running.")
         if no_attach:
             print("Leaving container running (detached mode).")
+            return
+        print("Attaching to container tmux session (detach: Ctrl-b then d)...")
+        attached_ok = exec_into_container(container_name, replace_process=replace_process)
+        if not replace_process and not attached_ok:
+            print(f"Error: failed to attach to '{container_name}'.")
+            sys.exit(1)
+        return
+
+    if lock_project:
+        try:
+            locked_args = SimpleNamespace(**vars(args))
+            locked_args.no_attach = True
+            with project_operation_lock(store, name, "starting"):
+                cmd_run(locked_args, lock_project=False)
+        except ProjectBusyError as exc:
+            print(format_project_busy_error(exc, "start this project"))
+            sys.exit(1)
+        if no_attach:
             return
         print("Attaching to container tmux session (detach: Ctrl-b then d)...")
         attached_ok = exec_into_container(container_name, replace_process=replace_process)
@@ -664,31 +794,13 @@ def cmd_run(args, lock_project: bool = True):
         print("\nRun 'skua validate' for details, or fix the configuration.")
         sys.exit(1)
 
-    # Handle repo — remote projects clone into a Docker volume, local projects clone to disk
+    source_mounts = _resolve_source_mounts(store, project)
+    primary_mount = next((m for m in source_mounts if m.get("primary")), source_mounts[0] if source_mounts else None)
     repo_volume = ""
-    if host and project.repo:
-        repo_volume = f"skua-{name}-repo"
-        _clone_repo_into_remote_volume(project, repo_volume)
-    elif project.repo:
-        clone_dir = store.repo_dir(name)
-        if not clone_dir.exists():
-            print(f"Cloning {project.repo} into {clone_dir}...")
-            clone_cmd = ["git", "clone"]
-            if project.ssh.private_key:
-                ssh_cmd = f"ssh -i {project.ssh.private_key} -o StrictHostKeyChecking=no"
-                clone_cmd = ["git", "-c", f"core.sshCommand={ssh_cmd}", "clone"]
-            clone_cmd += [project.repo, str(clone_dir)]
-            try:
-                subprocess.run(clone_cmd, check=True)
-            except subprocess.CalledProcessError:
-                print(f"Error: Failed to clone {project.repo}")
-                sys.exit(1)
-        else:
-            print(f"Using existing clone at {clone_dir}")
-        project.directory = str(clone_dir)
-
-    if not host and project.directory and Path(project.directory).is_dir():
-        ensure_adapt_workspace(Path(project.directory), project.name, project.agent)
+    if primary_mount and host and project.repo and primary_mount["source"].startswith("skua-"):
+        repo_volume = primary_mount["source"]
+    if primary_mount:
+        project.directory = primary_mount["source"] if not host else project.directory
 
     # Determine image name
     g = store.load_global()
@@ -707,9 +819,31 @@ def cmd_run(args, lock_project: bool = True):
         project=project,
         global_extra_packages=global_extra_packages,
         global_extra_commands=global_extra_commands,
+        image_name_base=image_name_base,
     )
-
     container_dir = store.get_container_dir()
+    layered_project = project_uses_agent_base_layer(project)
+    if layered_project:
+        if container_dir is None:
+            print("Error: Cannot find container build assets (entrypoint.sh).")
+            print("Set toolDir in global.yaml or reinstall skua.")
+            sys.exit(1)
+        _, success, _, reason = ensure_agent_base_image(
+            container_dir=container_dir,
+            image_name_base=image_name_base,
+            default_base_image=base_image,
+            security=build_security,
+            agent=agent,
+            global_extra_packages=global_extra_packages,
+            global_extra_commands=global_extra_commands,
+            quiet=True,
+        )
+        if not success:
+            print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
+            if reason:
+                print(reason)
+            sys.exit(1)
+
     needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
         image_name=image_name,
         container_dir=container_dir,
@@ -718,6 +852,7 @@ def cmd_run(args, lock_project: bool = True):
         base_image=resolved_base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layered_project,
     )
     if not image_exists(image_name):
         print(f"Image '{image_name}' not found for agent '{project.agent}'.")
@@ -748,6 +883,7 @@ def cmd_run(args, lock_project: bool = True):
             extra_commands=extra_commands,
             pull=force_refresh,
             no_cache=force_refresh,
+            layer_on_base=layered_project,
         )
         if not success:
             print(f"Error: failed to build image '{image_name}'.")
@@ -798,13 +934,19 @@ def cmd_run(args, lock_project: bool = True):
         image_name=image_name,
         data_dir=data_dir,
         repo_volume=repo_volume,
+        source_mounts=source_mounts,
     )
 
     # Print summary
     print(f"Starting skua-{name}...")
     if host:
         print(f"  Host:        {host} (remote)")
-    if repo_volume:
+    if len(source_mounts) > 1:
+        print(f"  Sources:     {len(source_mounts)} mounted")
+        for mount in source_mounts:
+            prefix = "*" if mount.get("primary") else "-"
+            print(f"    {prefix} {mount['source']} -> {mount['target']}")
+    elif repo_volume:
         print(f"  Repo vol:    {repo_volume} -> {_project_mount_path(project)}")
     else:
         print(f"  Project:     {project.directory or '(none)'}")

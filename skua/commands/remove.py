@@ -69,21 +69,28 @@ def cmd_remove(args, lock_project: bool = True):
 
     if host:
         auth_vol = f"skua-{name}-{project.agent}"
-        repo_vol = f"skua-{name}-repo" if project.repo else ""
+        repo_vols = []
+        if getattr(project, "sources", None):
+            from skua.commands.run import _project_sources, _source_volume_name
+            for index, source in enumerate(_project_sources(project)):
+                if getattr(source, "repo", ""):
+                    repo_vols.append(_source_volume_name(name, source, index))
+        elif project.repo:
+            repo_vols.append(f"skua-{name}-repo")
         image_base = store.load_global().get("imageName", "skua-base")
         image_name = image_name_for_project(image_base, project)
 
         print("Remote cleanup targets:")
         print(f"  Container: {container_name}")
         print(f"  Auth vol:  {auth_vol}")
-        if repo_vol:
+        for repo_vol in repo_vols:
             print(f"  Repo vol:  {repo_vol}")
         print(f"  Image:     {image_name}")
 
         if confirm("Also remove remote Docker resources now?", default=True):
             _run_docker_remove(["docker", "rm", "-f", container_name], f"remote container '{container_name}'")
             _run_docker_remove(["docker", "volume", "rm", auth_vol], f"remote volume '{auth_vol}'")
-            if repo_vol:
+            for repo_vol in repo_vols:
                 _run_docker_remove(["docker", "volume", "rm", repo_vol], f"remote volume '{repo_vol}'")
             _run_docker_remove(["docker", "image", "rm", "-f", image_name], f"remote image '{image_name}'")
     else:

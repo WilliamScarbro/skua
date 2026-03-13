@@ -258,6 +258,18 @@ class ProjectStateSpec:
 
 
 @dataclass
+class ProjectSourceSpec:
+    project: str = ""               # originating project name (informational)
+    name: str = ""                  # stable source label
+    directory: str = ""
+    repo: str = ""
+    host: str = ""
+    ssh_private_key: str = ""
+    mount_path: str = ""
+    primary: bool = False
+
+
+@dataclass
 class Project:
     """Ties Environment, SecurityProfile, and AgentConfig together for a codebase."""
     name: str = ""
@@ -271,6 +283,8 @@ class Project:
     git: ProjectGitSpec = field(default_factory=ProjectGitSpec)
     ssh: ProjectSshSpec = field(default_factory=ProjectSshSpec)
     image: ProjectImageSpec = field(default_factory=ProjectImageSpec)
+    sources: list[ProjectSourceSpec] = field(default_factory=list)
+    master_project: str = ""
     state: ProjectStateSpec = field(default_factory=ProjectStateSpec)
 
 
@@ -364,10 +378,20 @@ def _dict_to_dataclass(cls, data: dict):
         if isinstance(field_type, str):
             field_type = eval(field_type)
 
-        # Handle Optional types
+        # Handle Optional/list types
         origin = getattr(field_type, "__origin__", None)
-        if origin is not None:
-            # For list, dict, etc. just pass through
+        if origin is list and isinstance(val, list):
+            inner = getattr(field_type, "__args__", [None])[0]
+            if inner is not None and isinstance(inner, str):
+                inner = eval(inner)
+            if inner is not None and is_dataclass(inner):
+                kwargs[field_name] = [
+                    _dict_to_dataclass(inner, item) if isinstance(item, dict) else item
+                    for item in val
+                ]
+            else:
+                kwargs[field_name] = val
+        elif origin is not None:
             kwargs[field_name] = val
         elif is_dataclass(field_type):
             kwargs[field_name] = _dict_to_dataclass(field_type, val) if isinstance(val, dict) else val

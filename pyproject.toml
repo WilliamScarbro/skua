@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skua"
+version = "0.2.0"
+description = "Dockerized coding agent manager"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML",
+  "rich",
+  "textual",
+]
+
+[project.scripts]
+skua = "skua.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["skua*"]
+
+[tool.setuptools.package-data]
+skua = [
+  "container/**",
+  "scripts/**",
+  "presets/**/*.yaml",
+]

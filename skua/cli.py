@@ -102,6 +102,12 @@ def main():
     p_add.add_argument("--no-prompt", action="store_true",
                         help="Skip interactive prompts for missing values")
 
+    # merge
+    p_merge = sub.add_parser("merge", help="Create a composite project from existing projects")
+    p_merge.add_argument("name", help="New merged project name")
+    p_merge.add_argument("projects", nargs="+", help="Existing project names to combine")
+    p_merge.add_argument("--master", help="Project whose defaults win")
+
     # remove
     p_rm = sub.add_parser("remove", help="Remove a project configuration")
     p_rm.add_argument("name", help="Project name to remove")
@@ -265,13 +271,14 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe, cmd_credential, cmd_dashboard,
+        cmd_describe, cmd_credential, cmd_dashboard, cmd_merge,
     )
 
     commands = {
         "init": cmd_init,
         "build": cmd_build,
         "add": cmd_add,
+        "merge": cmd_merge,
         "remove": cmd_remove,
         "run": cmd_run,
         "stop": cmd_stop,

@@ -6,9 +6,11 @@ from pathlib import Path
 from skua.config import ConfigStore
 from skua.docker import (
     build_image,
+    ensure_agent_base_image,
     image_name_for_project,
     image_exists,
     image_rebuild_needed,
+    project_uses_agent_base_layer,
     resolve_project_image_inputs,
 )
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
@@ -98,7 +100,26 @@ def cmd_build(args, lock_project: bool = True):
         project=project,
         global_extra_packages=global_packages,
         global_extra_commands=global_commands,
+        image_name_base=image_name_base,
     )
+    layered_project = project_uses_agent_base_layer(project)
+    if layered_project:
+        _, success, _, reason = ensure_agent_base_image(
+            container_dir=container_dir,
+            image_name_base=image_name_base,
+            default_base_image=base_image,
+            security=security,
+            agent=agent,
+            global_extra_packages=global_packages,
+            global_extra_commands=global_commands,
+            quiet=not getattr(args, "verbose", False),
+            verbose=getattr(args, "verbose", False),
+        )
+        if not success:
+            print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
+            if reason:
+                print(reason)
+            sys.exit(1)
     needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
         image_name=image_name,
         container_dir=container_dir,
@@ -107,6 +128,7 @@ def cmd_build(args, lock_project: bool = True):
         base_image=resolved_base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layered_project,
     )
     if image_exists(image_name):
         if force_refresh:
@@ -134,6 +156,7 @@ def cmd_build(args, lock_project: bool = True):
             verbose=getattr(args, "verbose", False),
             pull=force_refresh,
             no_cache=force_refresh,
+            layer_on_base=layered_project,
         )
         if success:
             if needs_rebuild:
