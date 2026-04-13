@@ -239,6 +239,7 @@ class ProjectGitSpec:
 @dataclass
 class ProjectSshSpec:
     private_key: str = ""
+    private_keys: list = field(default_factory=list)
 
 
 @dataclass
@@ -255,6 +256,11 @@ class ProjectStateSpec:
     status: str = ""                # idle when empty; adapting | building | stopping | ...
     lock_owner: str = ""            # host:pid that currently holds the project lock
     lock_acquired_at: str = ""      # ISO-8601 UTC timestamp
+
+
+@dataclass
+class ProjectResourcesSpec:
+    images: list = field(default_factory=list)  # Docker image names built for this project (all versions)
 
 
 @dataclass
@@ -286,6 +292,27 @@ class Project:
     sources: list[ProjectSourceSpec] = field(default_factory=list)
     master_project: str = ""
     state: ProjectStateSpec = field(default_factory=ProjectStateSpec)
+    resources: ProjectResourcesSpec = field(default_factory=ProjectResourcesSpec)
+
+
+# ── DefaultImage ─────────────────────────────────────────────────────────
+
+@dataclass
+class DefaultImage:
+    """A named, prebuilt image that can be selected when adding a new project.
+
+    A DefaultImage captures a fully-built Docker image (agent + skua tooling +
+    any extra packages) so it can be reused across projects without rebuilding
+    from scratch each time.  Projects that use a default image layer on top of
+    it via ``image.from_image``.
+    """
+    name: str = ""
+    image: str = ""              # Docker image reference used as from_image
+    description: str = ""        # Human-readable summary shown during skua add
+    agent: str = ""              # Agent this image is built for (optional filter)
+    base_image: str = ""         # Base OS image (for rebuilding via default-image build)
+    extra_packages: list = field(default_factory=list)
+    extra_commands: list = field(default_factory=list)
 
 
 # ── Serialization helpers ────────────────────────────────────────────────
@@ -298,6 +325,7 @@ KIND_MAP = {
     "AgentConfig": AgentConfig,
     "Credential": Credential,
     "Project": Project,
+    "DefaultImage": DefaultImage,
 }
 
 
@@ -398,4 +426,38 @@ def _dict_to_dataclass(cls, data: dict):
         else:
             kwargs[field_name] = val
 
-    return cls(**kwargs)
+    instance = cls(**kwargs)
+    if isinstance(instance, ProjectSshSpec):
+        instance = normalize_project_ssh(instance)
+    return instance
+
+
+def normalize_project_ssh(ssh: ProjectSshSpec | None) -> ProjectSshSpec:
+    """Normalize SSH key fields so legacy and new configs stay in sync."""
+    ssh = ssh or ProjectSshSpec()
+    keys = []
+    seen = set()
+    for value in list(getattr(ssh, "private_keys", []) or []):
+        key = str(value or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    primary = str(getattr(ssh, "private_key", "") or "").strip()
+    if primary:
+        if primary in seen:
+            keys = [primary] + [key for key in keys if key != primary]
+        else:
+            keys.insert(0, primary)
+    elif keys:
+        primary = keys[0]
+
+    ssh.private_key = primary
+    ssh.private_keys = keys
+    return ssh
+
+
+def ssh_private_keys(ssh: ProjectSshSpec | None) -> list[str]:
+    """Return normalized SSH private keys in priority order."""
+    normalized = normalize_project_ssh(ssh)
+    return list(normalized.private_keys)

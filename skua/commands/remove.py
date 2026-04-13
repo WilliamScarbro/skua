@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from skua.config import ConfigStore
-from skua.docker import is_container_running, image_name_for_project
+from skua.docker import image_name_for_agent, is_container_running
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 from skua.utils import confirm
 
@@ -55,6 +55,11 @@ def cmd_remove(args, lock_project: bool = True):
         _configure_remote_docker_transport(host)
 
     env = store.load_environment(project.environment)
+    g = store.load_global()
+    image_name_base = g.get("imageName", "skua-base")
+    base_agent_image = image_name_for_agent(image_name_base, project.agent)
+    other_projects = [p for p in store.load_all_resources("Project") if p.name != name]
+    images_in_use_elsewhere = {img for p in other_projects for img in (p.resources.images or [])}
     container_name = f"skua-{name}"
     if is_container_running(container_name):
         if host:
@@ -77,22 +82,26 @@ def cmd_remove(args, lock_project: bool = True):
                     repo_vols.append(_source_volume_name(name, source, index))
         elif project.repo:
             repo_vols.append(f"skua-{name}-repo")
-        image_base = store.load_global().get("imageName", "skua-base")
-        image_name = image_name_for_project(image_base, project)
+        project_images = [
+            img for img in (project.resources.images or [])
+            if img != base_agent_image and img not in images_in_use_elsewhere
+        ]
 
         print("Remote cleanup targets:")
         print(f"  Container: {container_name}")
         print(f"  Auth vol:  {auth_vol}")
         for repo_vol in repo_vols:
             print(f"  Repo vol:  {repo_vol}")
-        print(f"  Image:     {image_name}")
+        for img in project_images:
+            print(f"  Image:     {img}")
 
         if confirm("Also remove remote Docker resources now?", default=True):
             _run_docker_remove(["docker", "rm", "-f", container_name], f"remote container '{container_name}'")
             _run_docker_remove(["docker", "volume", "rm", auth_vol], f"remote volume '{auth_vol}'")
             for repo_vol in repo_vols:
                 _run_docker_remove(["docker", "volume", "rm", repo_vol], f"remote volume '{repo_vol}'")
-            _run_docker_remove(["docker", "image", "rm", "-f", image_name], f"remote image '{image_name}'")
+            for img in project_images:
+                _run_docker_remove(["docker", "rmi", img], f"remote image '{img}'")
     else:
         # Offer to clean local data
         persist_mode = env.persistence.mode if env else "bind"
@@ -107,6 +116,28 @@ def cmd_remove(args, lock_project: bool = True):
             if confirm(f"Also remove Docker volume '{vol_name}'?"):
                 _run_docker_remove(["docker", "volume", "rm", vol_name], f"volume '{vol_name}'")
                 print("  Docker volume removed.")
+
+        project_images = [
+            img for img in (project.resources.images or [])
+            if img != base_agent_image and img not in images_in_use_elsewhere
+        ]
+        if project_images:
+            img_list = ", ".join(project_images)
+            if confirm(f"Also remove project image(s) ({img_list})?"):
+                for img in project_images:
+                    if _run_docker_remove(["docker", "rmi", img], f"image '{img}'"):
+                        print(f"  Image removed: {img}")
+
+        if getattr(project, "sources", None):
+            from skua.commands.run import _project_sources, _sanitize_mount_name
+            for source in _project_sources(project):
+                if getattr(source, "repo", "") and not getattr(source, "host", ""):
+                    clone_key = (getattr(source, "project", "") or getattr(source, "name", "") or "repo")
+                    clone_dir = store.repo_dir(f"{name}-{_sanitize_mount_name(clone_key)}")
+                    if clone_dir.exists():
+                        if confirm(f"Also remove local repo clone at {clone_dir}?"):
+                            shutil.rmtree(clone_dir)
+                            print(f"  Repo clone removed: {clone_dir}")
 
     # Remove project resource file
     store.delete_resource("Project", name)

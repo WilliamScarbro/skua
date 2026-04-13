@@ -14,7 +14,9 @@ from skua.config.resources import (
     AgentConfig,
     Credential,
     Project,
+    DefaultImage,
     ProjectGitSpec,
+    normalize_project_ssh,
     resource_from_dict,
     resource_to_dict,
 )
@@ -29,6 +31,7 @@ KIND_DIRS = {
     "AgentConfig": "agents",
     "Credential": "credentials",
     "Project": "projects",
+    "DefaultImage": "default-images",
 }
 
 
@@ -154,6 +157,9 @@ class ConfigStore:
     def load_project(self, name: str) -> Optional[Project]:
         return self.load_resource("Project", name)
 
+    def load_default_image(self, name: str) -> Optional[DefaultImage]:
+        return self.load_resource("DefaultImage", name)
+
     # ── Resolve project with global defaults ─────────────────────────
 
     def resolve_project(self, name: str) -> Optional[Project]:
@@ -172,8 +178,12 @@ class ConfigStore:
             project.git.email = git.get("email", "")
 
         # Fill in SSH key from global if not set
+        project.ssh = normalize_project_ssh(project.ssh)
         if not project.ssh.private_key:
-            project.ssh.private_key = defaults.get("sshKey", "")
+            default_key = str(defaults.get("sshKey", "") or "").strip()
+            if default_key:
+                project.ssh.private_key = default_key
+                project.ssh.private_keys = [default_key]
 
         # Fill in references from global defaults if not set
         if not project.environment:

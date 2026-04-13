@@ -162,6 +162,38 @@ def cmd_add(args):
         cred_name = _auto_add_local_credential(store, agent_name, agent, quick, args.no_prompt)
 
     base_image = getattr(args, "image", None) or ""
+    from_image = ""
+
+    # Default image selection
+    default_image_name = getattr(args, "default_image", None) or ""
+    if not default_image_name and not quick and not args.no_prompt:
+        available_defaults = [
+            d for d in store.load_all_resources("DefaultImage")
+            if not d.agent or d.agent == agent_name
+        ]
+        if available_defaults:
+            options = ["(none - build from scratch)"] + [
+                f"{d.name}" + (f"  [{d.description}]" if d.description else "")
+                for d in available_defaults
+            ]
+            choice = select_option("Select default image (or none):", options, default_index=0)
+            if not choice.startswith("(none"):
+                default_image_name = choice.split()[0]
+
+    if default_image_name:
+        di = store.load_default_image(default_image_name)
+        if di is None:
+            print(f"Error: Default image '{default_image_name}' not found.")
+            print("Run 'skua default-image list' to see available default images.")
+            sys.exit(1)
+        if di.agent and di.agent != agent_name:
+            print(
+                f"Error: Default image '{default_image_name}' is for agent '{di.agent}', "
+                f"not '{agent_name}'."
+            )
+            sys.exit(1)
+        from_image = di.image
+
     project = Project(
         name=name,
         directory=project_dir or "",
@@ -172,8 +204,11 @@ def cmd_add(args):
         agent=agent_name,
         credential=cred_name,
         git=ProjectGitSpec(),
-        ssh=ProjectSshSpec(private_key=ssh_key),
-        image=ProjectImageSpec(base_image=base_image),
+        ssh=ProjectSshSpec(
+            private_key=ssh_key,
+            private_keys=[ssh_key] if ssh_key else [],
+        ),
+        image=ProjectImageSpec(base_image=base_image, from_image=from_image),
     )
 
     store.save_resource(project)
@@ -210,6 +245,7 @@ def cmd_add(args):
     _print_summary_attr("Security", sec_name)
     _print_summary_attr("Agent", agent_name)
     _print_summary_attr("Credential", cred_name)
+    _print_summary_attr("Default image", default_image_name)
     _print_summary_attr("Image", base_image)
     if project_dir and Path(project_dir).is_dir():
         print(f"  {'Adapt guide:':<14} {Path(project_dir) / '.skua' / ADAPT_GUIDE_NAME}")

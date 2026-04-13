@@ -97,16 +97,38 @@ def main():
     p_add.add_argument("--no-credential", action="store_true",
                         help="Skip credential setup (use when the agent will authenticate inside the container)")
     p_add.add_argument("--image", help="Docker base image for the project container")
+    p_add.add_argument("--default-image", dest="default_image",
+                        help="Start from a named default image (skua default-image list)")
     p_add.add_argument("--quick", action="store_true",
                         help="Use all defaults, skip interactive prompts")
     p_add.add_argument("--no-prompt", action="store_true",
                         help="Skip interactive prompts for missing values")
 
-    # merge
-    p_merge = sub.add_parser("merge", help="Create a composite project from existing projects")
-    p_merge.add_argument("name", help="New merged project name")
-    p_merge.add_argument("projects", nargs="+", help="Existing project names to combine")
-    p_merge.add_argument("--master", help="Project whose defaults win")
+    # source
+    p_src = sub.add_parser("source", help="Manage project sources (directories and repositories)")
+    src_sub = p_src.add_subparsers(dest="action")
+
+    p_src_list = src_sub.add_parser("list", help="List sources for a project")
+    p_src_list.add_argument("name", help="Project name")
+
+    p_src_add = src_sub.add_parser("add", help="Add a source to a project")
+    p_src_add.add_argument("name", help="Project name")
+    src_loc = p_src_add.add_mutually_exclusive_group(required=True)
+    src_loc.add_argument("--dir", help="Local directory to add as a source")
+    src_loc.add_argument("--repo", help="Git repository URL to add as a source")
+    p_src_add.add_argument("--source-name", dest="source_name", help="Label for the source (default: derived from path/URL)")
+    p_src_add.add_argument("--mount-path", dest="mount_path", help="Container mount path (default: /home/dev/<name>)")
+    p_src_add.add_argument("--primary", action="store_true", help="Make this the primary source")
+    p_src_add.add_argument("--ssh-key", dest="ssh_key", help="SSH private key for this source")
+    p_src_add.add_argument("--host", help="SSH config host for remote source")
+
+    p_src_rm = src_sub.add_parser("remove", help="Remove a source from a project")
+    p_src_rm.add_argument("name", help="Project name")
+    p_src_rm.add_argument("source", help="Source name or 1-based index")
+
+    p_src_pri = src_sub.add_parser("set-primary", help="Set a source as primary")
+    p_src_pri.add_argument("name", help="Project name")
+    p_src_pri.add_argument("source", help="Source name or 1-based index")
 
     # remove
     p_rm = sub.add_parser("remove", help="Remove a project configuration")
@@ -261,18 +283,64 @@ def main():
     p_cred_rm = cred_sub.add_parser("remove", help="Remove a credential set")
     p_cred_rm.add_argument("name", help="Credential name to remove")
 
+    # default-image
+    p_di = sub.add_parser("default-image", help="Manage named, prebuilt default images")
+    di_sub = p_di.add_subparsers(dest="action")
+
+    di_sub.add_parser("list", help="List configured default images")
+
+    p_di_build = di_sub.add_parser("build", help="Build a default image")
+    p_di_build.add_argument("name", help="Default image name")
+    p_di_build.add_argument("--agent", help="Agent to install (default: from global)")
+    p_di_build.add_argument("--base-image", dest="base_image", help="Base OS Docker image")
+    p_di_build.add_argument("--image", help="Target Docker image name (default: skua-default-<name>)")
+    p_di_build.add_argument(
+        "--package", action="append", default=[],
+        metavar="PKG", help="Apt package to include (repeatable)",
+    )
+    p_di_build.add_argument(
+        "--command", dest="extra_command", action="append", default=[],
+        metavar="CMD", help="Extra setup command (repeatable)",
+    )
+    p_di_build.add_argument("--description", help="Human-readable description")
+    p_di_build.add_argument("-v", "--verbose", action="store_true", help="Show full Docker build output")
+
+    p_di_save = di_sub.add_parser(
+        "save",
+        help="Save an existing image as a default (source: project name or Docker image)",
+    )
+    p_di_save.add_argument("source", help="Project name or Docker image to save")
+    p_di_save.add_argument("name", help="Name for the new default image")
+    p_di_save.add_argument("--description", help="Human-readable description")
+    p_di_save.add_argument("--agent", help="Agent this image is built for")
+
+    p_di_rm = di_sub.add_parser("remove", help="Remove a default image entry")
+    p_di_rm.add_argument("name", help="Default image name to remove")
+
     # ssh
     p_ssh = sub.add_parser("ssh", help="Manage project SSH key settings")
     ssh_sub = p_ssh.add_subparsers(dest="action")
 
-    p_ssh_add = ssh_sub.add_parser("add", help="Set or clear the SSH private key for a project")
+    p_ssh_list = ssh_sub.add_parser("list", help="List SSH private keys for a project")
+    p_ssh_list.add_argument("name", help="Project name")
+
+    p_ssh_add = ssh_sub.add_parser("add", help="Add an SSH private key for a project")
     p_ssh_add.add_argument("name", help="Project name")
     p_ssh_add.add_argument("--ssh-key", help="SSH private key path")
-    p_ssh_add.add_argument("--clear", action="store_true", help="Clear the project's SSH key")
     p_ssh_add.add_argument(
         "--no-prompt",
         action="store_true",
-        help="Do not prompt for key selection; requires --ssh-key or --clear",
+        help="Do not prompt for key selection; requires --ssh-key",
+    )
+
+    p_ssh_rm = ssh_sub.add_parser("remove", help="Remove one or all SSH private keys for a project")
+    p_ssh_rm.add_argument("name", help="Project name")
+    p_ssh_rm.add_argument("--ssh-key", help="SSH private key path to remove")
+    p_ssh_rm.add_argument("--all", action="store_true", help="Remove all SSH private keys from the project")
+    p_ssh_rm.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Do not prompt for key selection; requires --ssh-key or --all",
     )
 
     args = parser.parse_args()
@@ -285,14 +353,15 @@ def main():
     from skua.commands import (
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
-        cmd_describe, cmd_credential, cmd_dashboard, cmd_merge, cmd_ssh,
+        cmd_describe, cmd_credential, cmd_dashboard, cmd_source, cmd_ssh,
+        cmd_default_image,
     )
 
     commands = {
         "init": cmd_init,
         "build": cmd_build,
         "add": cmd_add,
-        "merge": cmd_merge,
+        "source": _handle_source,
         "remove": cmd_remove,
         "run": cmd_run,
         "stop": cmd_stop,
@@ -307,8 +376,15 @@ def main():
         "describe": cmd_describe,
         "credential": _handle_credential,
         "ssh": _handle_ssh,
+        "default-image": _handle_default_image,
     }
     commands[args.command](args)
+
+
+def _handle_source(args):
+    """Dispatch source subcommands, showing help if no action given."""
+    from skua.commands import cmd_source
+    cmd_source(args)
 
 
 def _handle_credential(args):
@@ -332,9 +408,26 @@ def _handle_ssh(args):
         print("usage: skua ssh <action> [options]")
         print()
         print("actions:")
-        print("  add <project>   Set or clear a project's SSH private key")
+        print("  list <project>     List a project's SSH private keys")
+        print("  add <project>      Add an SSH private key to a project")
+        print("  remove <project>   Remove one or all SSH private keys from a project")
         sys.exit(1)
     cmd_ssh(args)
+
+
+def _handle_default_image(args):
+    """Dispatch default-image subcommands, showing help if no action given."""
+    from skua.commands import cmd_default_image
+    if not args.action:
+        print("usage: skua default-image <action> [options]")
+        print()
+        print("actions:")
+        print("  list                      List configured default images")
+        print("  build <name>              Build a default image from spec")
+        print("  save <source> <name>      Save a project or Docker image as a default")
+        print("  remove <name>             Remove a default image entry")
+        sys.exit(1)
+    cmd_default_image(args)
 
 
 if __name__ == "__main__":
