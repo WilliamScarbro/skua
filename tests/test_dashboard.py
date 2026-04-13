@@ -15,7 +15,32 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from skua.config.loader import ConfigStore
+from skua.config.resources import Project, ProjectSourceSpec
+
 class TestDashboardSnapshot(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.get_running_skua_containers", return_value=[])
+    @mock.patch("skua.commands.list_cmd.image_exists", return_value=True)
+    def test_collect_snapshot_clears_stale_operation_state(self, _mock_image_exists, _mock_running):
+        from skua.commands.dashboard import _collect_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            project = Project(name="demo", directory="/tmp/demo")
+            project.state.status = "building"
+            project.state.lock_owner = "host:1234"
+            project.state.lock_acquired_at = "2026-03-06T00:00:00+00:00"
+            store.save_resource(project)
+
+            with mock.patch("skua.commands.dashboard.ConfigStore", return_value=store):
+                snap = _collect_snapshot(argparse.Namespace())
+
+            status_idx = [c[0] for c in snap.columns].index("STATUS")
+            self.assertEqual("built", snap.rows[0]["cells"][status_idx])
+            refreshed = store.load_project("demo")
+            self.assertEqual("", refreshed.state.status)
+
     @mock.patch("skua.commands.dashboard.image_exists", return_value=True)
     @mock.patch("skua.commands.dashboard.get_running_skua_containers")
     @mock.patch("skua.commands.dashboard.ConfigStore")
@@ -211,30 +236,39 @@ class TestDashboardRunPreflight(unittest.TestCase):
 
     @mock.patch("skua.commands.dashboard._project_build_preflight")
     @mock.patch("skua.commands.dashboard.ConfigStore")
-    def test_run_preflight_checks_other_projects_on_force_refresh(self, MockStore, mock_preflight):
+    def test_run_preflight_returns_target_only_on_force_refresh(self, MockStore, mock_preflight):
         from skua.commands.dashboard import BuildPreflightCheck, _run_preflight_checks
 
         store = MockStore.return_value
-        projects = {
-            "demo": SimpleNamespace(name="demo"),
-            "api": SimpleNamespace(name="api"),
-            "web": SimpleNamespace(name="web"),
-        }
-        store.resolve_project.side_effect = lambda name: projects.get(name)
-        store.list_resources.return_value = ["demo", "api", "web"]
-
-        mock_preflight.side_effect = [
-            BuildPreflightCheck("demo", True, True, "codex client update available", ""),
-            BuildPreflightCheck("api", True, False, "build context changed", ""),
-            BuildPreflightCheck("web", False, False, "", ""),
-        ]
+        store.resolve_project.return_value = SimpleNamespace(name="demo")
+        mock_preflight.return_value = BuildPreflightCheck(
+            project="demo",
+            needs_rebuild=True,
+            force_refresh=True,
+            reason="codex client update available",
+            error="",
+        )
 
         checks, errors = _run_preflight_checks("demo")
         self.assertEqual([], errors)
-        self.assertEqual(["demo", "api"], [c.project for c in checks])
+        self.assertEqual(["demo"], [c.project for c in checks])
+        self.assertEqual(1, mock_preflight.call_count)
 
 
 class TestDashboardJobs(unittest.TestCase):
+    def test_active_jobs_for_quit_filters_orphaning_statuses(self):
+        from skua.commands.dashboard import DashboardJob, _active_jobs_for_quit
+
+        jobs = [
+            DashboardJob(1, "build", "a", [], "queued", "", "", "", None, None, "", "", ""),
+            DashboardJob(2, "adapt", "b", [], "running", "", "", "", None, None, "", "", ""),
+            DashboardJob(3, "build", "c", [], "waiting_input", "", "", "", None, None, "", "", ""),
+            DashboardJob(4, "build", "d", [], "success", "", "", "", 0, None, "", "", ""),
+        ]
+
+        active = _active_jobs_for_quit(jobs)
+        self.assertEqual([1, 2, 3], [job.job_id for job in active])
+
     @mock.patch("skua.commands.dashboard.project_busy_error_if_locked")
     def test_lock_block_message_when_busy(self, mock_busy):
         from skua.commands.dashboard import _lock_block_message
@@ -293,6 +327,44 @@ class TestDashboardJobs(unittest.TestCase):
         prefix = _resolve_skua_cli_prefix()
         self.assertEqual(sys.executable, prefix[0])
         self.assertTrue(prefix[1].endswith("/skua/cli.py"))
+
+    @mock.patch("skua.commands.dashboard._background_command", return_value=["/usr/bin/skua", "remove", "demo"])
+    def test_enqueue_remove_job_success(self, _mock_background):
+        from skua.commands.dashboard import _enqueue_remove_job
+
+        jobs = mock.Mock()
+        queued = SimpleNamespace(job_id=7)
+        jobs.enqueue.return_value = queued
+
+        job, error = _enqueue_remove_job(jobs, "demo")
+
+        self.assertIs(job, queued)
+        self.assertEqual("", error)
+        jobs.enqueue.assert_called_once_with("remove", "demo", command=["/usr/bin/skua", "remove", "demo"])
+
+    @mock.patch("skua.commands.dashboard._background_command", return_value=None)
+    def test_enqueue_remove_job_reports_unavailable_action(self, _mock_background):
+        from skua.commands.dashboard import _enqueue_remove_job
+
+        jobs = mock.Mock()
+
+        job, error = _enqueue_remove_job(jobs, "demo")
+
+        self.assertIsNone(job)
+        self.assertEqual("remove action is unavailable", error)
+        jobs.enqueue.assert_not_called()
+
+    @mock.patch("skua.commands.dashboard._background_command", return_value=["/usr/bin/skua", "remove", "demo"])
+    def test_enqueue_remove_job_reports_enqueue_failure(self, _mock_background):
+        from skua.commands.dashboard import _enqueue_remove_job
+
+        jobs = mock.Mock()
+        jobs.enqueue.side_effect = RuntimeError("boom")
+
+        job, error = _enqueue_remove_job(jobs, "demo")
+
+        self.assertIsNone(job)
+        self.assertEqual("failed to queue remove demo: RuntimeError: boom", error)
 
     def test_job_manager_enqueue_poll_and_persist(self):
         from skua.commands.dashboard import DashboardJobManager
@@ -459,6 +531,7 @@ class TestDashboardAddFlow(unittest.TestCase):
             "AgentConfig": ["claude", "codex"],
             "Credential": [],
         }.get(kind, [])
+        store.load_all_resources.return_value = []  # no default images
 
         mock_select.side_effect = [
             "Git repository",      # source
@@ -467,8 +540,9 @@ class TestDashboardAddFlow(unittest.TestCase):
             "local-docker",        # env
             "open",                # security
             "claude",              # agent
+            "Build new",           # image source (step 10)
         ]
-        mock_input.side_effect = ["demo", "git@github.com:org/repo.git", "", ""]
+        mock_input.side_effect = ["demo", "git@github.com:org/repo.git", ""]
 
         with mock.patch("skua.commands.dashboard.parse_ssh_config_hosts", return_value=["qar"]):
             with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
@@ -497,6 +571,7 @@ class TestDashboardAddFlow(unittest.TestCase):
             "AgentConfig": ["claude"],
             "Credential": [],
         }.get(kind, [])
+        store.load_all_resources.return_value = []  # no default images
 
         # First attempt: cancel immediately from first text prompt.
         mock_input.side_effect = [":q"]
@@ -511,16 +586,13 @@ class TestDashboardAddFlow(unittest.TestCase):
             "local-docker",      # env
             "open",              # security
             "claude",            # agent
+            "Build new",         # image source (step 10)
         ]
         mock_input.side_effect = [
             "demo",      # name
             ":b",        # back from repo prompt to source selector
             "/tmp",      # directory
             "",          # ssh key
-            "",          # env
-            "",          # security
-            "",          # agent
-            "",          # base image
         ]
         with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
             args = _prompt_new_project_args()
@@ -528,6 +600,113 @@ class TestDashboardAddFlow(unittest.TestCase):
         self.assertEqual("demo", args.name)
         self.assertEqual("/tmp", args.dir)
         self.assertEqual("", args.repo)
+
+    @mock.patch("skua.commands.dashboard._cred_matches_agent", return_value=True)
+    @mock.patch("skua.commands.dashboard.select_option")
+    @mock.patch("skua.commands.dashboard.input")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_prompt_new_project_args_defaults_to_existing_credential(self, MockStore, mock_input, mock_select, _mock_match):
+        from skua.commands.dashboard import _prompt_new_project_args
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_global.return_value = {"defaults": {"environment": "local-docker", "security": "open", "agent": "claude"}}
+        store.list_resources.side_effect = lambda kind: {
+            "Environment": ["local-docker"],
+            "SecurityProfile": ["open"],
+            "AgentConfig": ["claude"],
+            "Credential": ["cred-z", "cred-a"],
+        }.get(kind, [])
+        store.load_all_resources.return_value = []
+
+        mock_select.side_effect = [
+            "Local directory",
+            "local-docker",
+            "open",
+            "claude",
+            "cred-a",
+            "Build new",
+        ]
+        mock_input.side_effect = ["demo", "/tmp/demo", ""]
+
+        with mock.patch("skua.commands.dashboard.find_ssh_keys", return_value=[]):
+            with mock.patch("pathlib.Path.exists", return_value=True):
+                args = _prompt_new_project_args()
+
+        self.assertEqual("cred-a", args.credential)
+        credential_call = mock_select.call_args_list[4]
+        self.assertEqual("Credential:", credential_call.args[0])
+        self.assertEqual(2, credential_call.kwargs["default_index"])
+
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_dashboard_new_project_blocks_missing_directory(self, MockStore):
+        import skua.commands.dashboard as dashboard
+
+        store = MockStore.return_value
+        store.list_resources.return_value = []
+        store.load_all_resources.return_value = []
+        store.load_project.return_value = None
+
+        captured = {}
+
+        def fake_run(self, **_kwargs):
+            captured["app"] = self
+
+        args = argparse.Namespace(refresh_seconds=0)
+        with mock.patch("textual.app.App.run", new=fake_run):
+            dashboard.cmd_dashboard(args)
+
+        app = captured["app"]
+        app.task_catalog = {"keys": [], "envs": [], "secs": [], "agents": [], "hosts": []}
+        app._start_new_project_task()
+        app.task_values["name"] = "demo"
+        app.task_step = 2
+        original_dir = app.task_values["dir"]
+        app.task_input = "/q"
+        if Path(app.task_input).exists():
+            self.fail(f"expected missing path for test: {app.task_input}")
+        app._refresh_view = mock.Mock()
+
+        app._task_submit_step()
+
+        self.assertEqual(2, app.task_step)
+        self.assertEqual(original_dir, app.task_values["dir"])
+        self.assertEqual("directory does not exist", app.task_error)
+        self.assertEqual("directory does not exist", app.message)
+
+        panel = app._render_task_panel()
+        self.assertIn("(directory does not exist)", panel.plain)
+        self.assertTrue(any("red" in str(span.style) for span in panel.spans))
+
+    @mock.patch("skua.commands.dashboard._cred_matches_agent", return_value=True)
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_dashboard_new_project_defaults_to_existing_credential(self, MockStore, _mock_match):
+        import skua.commands.dashboard as dashboard
+
+        store = MockStore.return_value
+        store.list_resources.side_effect = lambda kind: {
+            "Credential": ["cred-b", "cred-a"],
+            "Environment": ["local-docker"],
+            "SecurityProfile": ["open"],
+            "AgentConfig": ["claude"],
+        }.get(kind, [])
+        store.load_all_resources.return_value = []
+        store.load_global.return_value = {"defaults": {"environment": "local-docker", "security": "open", "agent": "claude"}}
+        store.load_project.return_value = None
+
+        captured = {}
+
+        def fake_run(self, **_kwargs):
+            captured["app"] = self
+
+        args = argparse.Namespace(refresh_seconds=0)
+        with mock.patch("textual.app.App.run", new=fake_run):
+            dashboard.cmd_dashboard(args)
+
+        app = captured["app"]
+        app._start_new_project_task()
+
+        self.assertEqual("cred-a", app.task_values["credential_choice"])
 
 
 class TestDashboardClipboard(unittest.TestCase):
@@ -560,3 +739,81 @@ class TestDashboardClipboard(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual("", detail)
         mock_osc52.assert_called_once_with("hello")
+
+
+class TestDashboardProjectDetail(unittest.TestCase):
+    def test_project_detail_fields_include_sources_and_ssh_keys(self):
+        from skua.commands.dashboard import _project_detail_fields
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            project = Project(
+                name="myproj",
+                directory="/tmp/primary",
+                environment="local-docker",
+                security="open",
+                agent="codex",
+                credential="cred-main",
+            )
+            project.ssh.private_key = "/home/dev/.ssh/id_ed25519"
+            project.ssh.private_keys = [
+                "/home/dev/.ssh/id_ed25519",
+                "/home/dev/.ssh/id_rsa_work",
+            ]
+            project.image.base_image = "ubuntu:24.04"
+            project.image.extra_packages = ["git", "ripgrep"]
+            project.image.extra_commands = ["apt-get update", "apt-get install -y jq"]
+            project.image.version = 3
+            project.resources.images = ["skua-myproj:3"]
+            project.sources = [
+                ProjectSourceSpec(
+                    project="myproj",
+                    name="base-a",
+                    directory="/src/a",
+                    mount_path="/worktrees/base-a",
+                    primary=True,
+                ),
+                ProjectSourceSpec(
+                    project="myproj",
+                    name="base-b",
+                    repo="git@github.com:org/base-b.git",
+                    mount_path="/worktrees/base-b",
+                    host="qar",
+                    primary=False,
+                ),
+            ]
+            store.save_resource(project)
+
+            fields = _project_detail_fields(project, store)
+
+        detail = "\n".join(f["display"] for f in fields)
+        self.assertIn("Project: myproj", detail)
+        self.assertIn("base-a (primary)", detail)
+        self.assertIn("base-b:", detail)
+        self.assertIn("/home/dev/.ssh/id_ed25519 (primary)", detail)
+        self.assertIn("/home/dev/.ssh/id_rsa_work", detail)
+        self.assertIn("base_image: ubuntu:24.04", detail)
+        self.assertIn("extra_packages: git, ripgrep", detail)
+        self.assertIn("images: skua-myproj:3", detail)
+        # All major sections present
+        self.assertTrue(any(f["section"] and "References" in f["display"] for f in fields))
+        self.assertTrue(any(f["section"] and "Sources" in f["display"] for f in fields))
+        self.assertTrue(any(f["section"] and "SSH keys" in f["display"] for f in fields))
+        self.assertTrue(any(f["section"] and "Image" in f["display"] for f in fields))
+        # Editable fields exist
+        editable = [f for f in fields if f.get("editable")]
+        self.assertGreater(len(editable), 5)
+
+    def test_project_detail_fields_report_no_fields_for_missing_project(self):
+        from skua.commands.dashboard import _project_detail_fields
+        from skua.config.resources import Project as _Project
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            # An empty/default project still produces fields (no crash)
+            project = _Project(name="orphan")
+            fields = _project_detail_fields(project, store)
+            self.assertIsInstance(fields, list)
+            self.assertGreater(len(fields), 0)

@@ -42,10 +42,13 @@ from skua.commands.list_cmd import (
 from skua.commands.remove import cmd_remove
 from skua.commands.restart import cmd_restart
 from skua.commands.run import cmd_run
+from skua.commands.ssh_cmd import cmd_ssh
 from skua.commands.stop import cmd_stop
 from skua.config import ConfigStore
+from skua.config.resources import ssh_private_keys
 from skua.docker import (
     build_image,
+    effective_project_image,
     ensure_agent_base_image,
     get_running_skua_containers,
     image_exists,
@@ -61,6 +64,12 @@ _OSC52_MAX_BYTES = 100_000
 _CLIPBOARD_FAST_TIMEOUT_SEC = 0.35
 _DASHBOARD_UI_LOG_MAX_BYTES = 2_000_000
 _CLIPBOARD_BACKEND_CACHE: str | None = None
+_PROJECT_DETAIL_TASKS = {
+    "project_ssh_add", "project_ssh_add_manual", "project_ssh_remove",
+    "detail_edit_text", "detail_edit_select",
+    "detail_source_action", "detail_source_add",
+    "detail_ssh_action", "detail_revert",
+}
 
 
 @dataclass
@@ -160,6 +169,153 @@ def _shell_join(parts: list[str]) -> str:
     return " ".join(shlex.quote(p) for p in parts)
 
 
+def _active_jobs_for_quit(jobs: list[DashboardJob]) -> list[DashboardJob]:
+    """Return jobs that would be orphaned if the dashboard quits now."""
+    return [job for job in jobs if job.status in ("queued", "running", "waiting_input")]
+
+
+def _ssh_key_catalog() -> list[str]:
+    keys = [str(p) for p in find_ssh_keys()]
+    defaults = ConfigStore().load_global().get("defaults", {})
+    global_ssh = str(defaults.get("sshKey", "") or "").strip()
+    if global_ssh:
+        global_ssh_path = str(Path(global_ssh).expanduser().resolve())
+        if Path(global_ssh_path).is_file() and global_ssh_path not in keys:
+            keys.append(global_ssh_path)
+    return sorted(set(keys))
+
+
+def _project_detail_fields(project, store: ConfigStore) -> list[dict]:
+    """Return structured field descriptors for the editable project detail view.
+
+    Each entry is a dict with at minimum:
+      display   - the text to show
+      editable  - whether the cursor can land here and Enter activates it
+      section   - True for section headers (bold, no cursor)
+      action    - task mode to start when activated (for editable fields)
+    """
+    from skua.commands.source_cmd import explicit_sources
+
+    fields: list[dict] = []
+
+    def _f(display, *, editable=False, section=False, action="", **kw):
+        entry = {"display": display, "editable": editable, "section": section, "action": action}
+        entry.update(kw)
+        return entry
+
+    env = store.load_environment(project.environment)
+    network_mode = getattr(getattr(env, "network", None), "mode", "") or "-"
+    sources = explicit_sources(project)
+    ssh_keys = ssh_private_keys(getattr(project, "ssh", None))
+    image = getattr(project, "image", None)
+    state = getattr(project, "state", None)
+    resource_images = list(getattr(getattr(project, "resources", None), "images", []) or [])
+
+    # ── Header ──
+    fields.append(_f(f"Project: {project.name}", section=True))
+    fields.append(_f(""))
+
+    # ── References ──
+    fields.append(_f("References", section=True))
+    fields.append(_f(f"  environment: {project.environment}", editable=True,
+                     action="detail_edit_select", field="environment", label="environment",
+                     options_kind="Environment"))
+    fields.append(_f(f"  security: {project.security}", editable=True,
+                     action="detail_edit_select", field="security", label="security profile",
+                     options_kind="SecurityProfile"))
+    fields.append(_f(f"  agent: {project.agent}", editable=True,
+                     action="detail_edit_select", field="agent", label="agent",
+                     options_kind="AgentConfig"))
+    cred_display = getattr(project, "credential", "") or "(none)"
+    fields.append(_f(f"  credential: {cred_display}", editable=True,
+                     action="detail_edit_select", field="credential", label="credential",
+                     options_kind="Credential", allow_none=True))
+    fields.append(_f(f"  network: {network_mode}"))
+    fields.append(_f(""))
+
+    # ── Sources ──
+    fields.append(_f("Sources", section=True))
+    for idx, src in enumerate(sources):
+        label = getattr(src, "name", "") or getattr(src, "project", "") or f"source-{idx + 1}"
+        loc = getattr(src, "directory", "") or getattr(src, "repo", "") or "-"
+        mount = getattr(src, "mount_path", "") or f"/home/dev/{label}"
+        host = getattr(src, "host", "") or "local"
+        primary = " (primary)" if getattr(src, "primary", False) else ""
+        display = f"  [{idx + 1}] {label}{primary}: {loc}  ->  {mount} @ {host}"
+        fields.append(_f(display, editable=True, action="detail_source_action", source_idx=idx))
+    fields.append(_f("  [+] Add source", editable=True, action="detail_source_add"))
+    fields.append(_f(""))
+
+    # ── SSH keys ──
+    fields.append(_f("SSH keys", section=True))
+    if ssh_keys:
+        for idx, key in enumerate(ssh_keys):
+            marker = " (primary)" if idx == 0 else ""
+            fields.append(_f(f"  {idx + 1}. {key}{marker}", editable=True,
+                             action="detail_ssh_action", key_idx=idx, key_path=key))
+    else:
+        fields.append(_f("  (none)"))
+    fields.append(_f("  [+] Add SSH key", editable=True, action="detail_ssh_add"))
+    fields.append(_f(""))
+
+    # ── Image ──
+    fields.append(_f("Image", section=True))
+    fields.append(_f(f"  base_image: {getattr(image, 'base_image', '') or '-'}", editable=True,
+                     action="detail_edit_text", field="image.base_image", label="base image"))
+    fields.append(_f(f"  from_image: {getattr(image, 'from_image', '') or '-'}", editable=True,
+                     action="detail_edit_text", field="image.from_image", label="from image"))
+    pkgs = ", ".join(list(getattr(image, "extra_packages", []) or [])) or "-"
+    fields.append(_f(f"  extra_packages: {pkgs}", editable=True,
+                     action="detail_edit_text", field="image.extra_packages", label="extra packages"))
+    fields.append(_f(f"  extra_commands: {len(list(getattr(image, 'extra_commands', []) or []))}"))
+    fields.append(_f(f"  version: {int(getattr(image, 'version', 0) or 0)}"))
+    fields.append(_f(""))
+
+    # ── Git identity ──
+    fields.append(_f("Git", section=True))
+    fields.append(_f(f"  name: {getattr(getattr(project, 'git', None), 'name', '') or '-'}", editable=True,
+                     action="detail_edit_text", field="git.name", label="git name"))
+    fields.append(_f(f"  email: {getattr(getattr(project, 'git', None), 'email', '') or '-'}", editable=True,
+                     action="detail_edit_text", field="git.email", label="git email"))
+    fields.append(_f(""))
+
+    # ── State (read-only) ──
+    fields.append(_f("State", section=True))
+    fields.append(_f(f"  status: {getattr(state, 'status', '') or 'idle'}"))
+    fields.append(_f(f"  lock_owner: {getattr(state, 'lock_owner', '') or '-'}"))
+    fields.append(_f(f"  lock_acquired_at: {getattr(state, 'lock_acquired_at', '') or '-'}"))
+    fields.append(_f(""))
+
+    # ── Resources (read-only) ──
+    fields.append(_f("Resources", section=True))
+    fields.append(_f(f"  images: {', '.join(resource_images) if resource_images else '-'}"))
+    fields.append(_f(""))
+
+    # ── Save / Revert actions ──
+    fields.append(_f("  [w] Save changes", editable=True, action="detail_save"))
+    fields.append(_f("  [u] Revert to checkpoint", editable=True, action="detail_revert"))
+
+    return fields
+
+
+def _get_nested_field(obj, path: str):
+    """Get a field from a dataclass by dotted path."""
+    for part in path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _set_nested_field(obj, path: str, value) -> None:
+    """Set a field on a dataclass by dotted path, with list coercion for extra_packages."""
+    parts = path.split(".")
+    for part in parts[:-1]:
+        obj = getattr(obj, part)
+    field = parts[-1]
+    if field == "extra_packages" and isinstance(value, str):
+        value = [v.strip() for v in value.replace(",", " ").split() if v.strip()]
+    setattr(obj, field, value)
+
+
 def _resolve_skua_cli_prefix() -> list[str]:
     """Return the best command prefix to invoke skua from background jobs."""
     cli_bin = shutil.which("skua")
@@ -167,6 +323,24 @@ def _resolve_skua_cli_prefix() -> list[str]:
         return [cli_bin]
     cli_py = Path(__file__).resolve().parents[1] / "cli.py"
     return [sys.executable, str(cli_py)]
+
+
+def _set_terminal_title(title: str) -> None:
+    seq = f"\033]0;{title}\007"
+    if os.environ.get("TMUX"):
+        seq = f"\033Ptmux;\033{seq}\033\\"
+    sys.stdout.write(seq)
+    sys.stdout.flush()
+    if os.environ.get("INSIDE_EMACS"):
+        escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            subprocess.run(
+                ["emacsclient", "--eval", f'(rename-buffer "{escaped}" t)'],
+                check=False,
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            pass
 
 
 def _background_command(action_key: str, project_name: str, discover: bool = False) -> list[str] | None:
@@ -313,6 +487,17 @@ def _lock_block_message(project_name: str, action_key: str) -> str:
     if busy is None:
         return ""
     return format_project_busy_error(busy, label)
+
+
+def _enqueue_remove_job(jobs: "DashboardJobManager", project_name: str) -> tuple[object | None, str]:
+    """Queue a remove job for a project, returning the job or an error message."""
+    background = _background_command("remove", project_name)
+    if not background:
+        return None, "remove action is unavailable"
+    try:
+        return jobs.enqueue("remove", project_name, command=background), ""
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        return None, f"failed to queue remove {project_name}: {type(exc).__name__}: {exc}"
 
 
 class DashboardJobManager:
@@ -649,6 +834,9 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     show_image = bool(getattr(args, "image", False))
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
+    _snap_image_config = g.get("image", {})
+    _snap_global_packages = _snap_image_config.get("extraPackages", [])
+    _snap_global_commands = _snap_image_config.get("extraCommands", [])
 
     if not project_names:
         return DashboardSnapshot(
@@ -683,7 +871,7 @@ def _collect_snapshot(args) -> DashboardSnapshot:
             if container_name not in _running_for_host(host):
                 running_image_values[name] = "-"
                 continue
-            img_name = image_name_for_project(image_name_base, project)
+            img_name = effective_project_image(image_name_base, project, _snap_global_packages, _snap_global_commands)
             project_id = _image_id(img_name, host=host)
             container_id = _container_image_id(container_name, host=host)
             if project_id and container_id and project_id == container_id:
@@ -731,8 +919,8 @@ def _collect_snapshot(args) -> DashboardSnapshot:
         host = getattr(project, "host", "") or ""
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
-        img_name = image_name_for_project(image_name_base, project)
-        status = _base_project_status(project, running, unreachable_hosts, img_name)
+        img_name = effective_project_image(image_name_base, project, _snap_global_packages, _snap_global_commands)
+        status = _base_project_status(store, project, running, unreachable_hosts, img_name)
         if status.startswith("running"):
             running_count += 1
         if pending_adapt:
@@ -817,7 +1005,20 @@ def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck
     image_config = g.get("image", {})
     global_packages = image_config.get("extraPackages", [])
     global_commands = image_config.get("extraCommands", [])
-    image_name = image_name_for_project(image_name_base, project)
+    image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
+
+    # Prebuilt default image — no build step needed, just check existence.
+    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == project_from_image:
+        needs_rebuild = not image_exists(image_name)
+        return BuildPreflightCheck(
+            project=project.name,
+            needs_rebuild=needs_rebuild,
+            force_refresh=False,
+            reason="default image missing" if needs_rebuild else "",
+            error="",
+        )
+
     resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
         default_base_image=base_image,
         agent=agent,
@@ -858,26 +1059,7 @@ def _run_preflight_checks(project_name: str) -> tuple[list[BuildPreflightCheck],
     if not target_check.needs_rebuild:
         return [], []
 
-    checks = [target_check]
-    errors = []
-    if not target_check.force_refresh:
-        return checks, errors
-
-    # Floating client updates can impact multiple projects; validate all of them.
-    for name in store.list_resources("Project"):
-        name = str(name or "").strip()
-        if not name or name == project_name:
-            continue
-        project = store.resolve_project(name)
-        if project is None:
-            continue
-        check = _project_build_preflight(store, project)
-        if check.error:
-            errors.append(check.error)
-            continue
-        if check.needs_rebuild:
-            checks.append(check)
-    return checks, errors
+    return [target_check], []
 
 
 def _build_selected_project(name: str, verbose: bool = False) -> bool:
@@ -908,7 +1090,18 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
     image_config = g.get("image", {})
     global_packages = image_config.get("extraPackages", [])
     global_commands = image_config.get("extraCommands", [])
-    image_name = image_name_for_project(image_name_base, project)
+    image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
+
+    # Prebuilt default image — no build step needed.
+    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == project_from_image:
+        if image_exists(image_name):
+            print(f"Image '{image_name}' is already up-to-date (prebuilt default).")
+            return True
+        print(f"Error: default image '{image_name}' not found locally.")
+        print("Rebuild it with: skua default-image build <name>")
+        return False
+
     resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
         default_base_image=base_image,
         agent=agent,
@@ -934,6 +1127,12 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
             print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
             if reason:
                 print(reason)
+            return False
+        if not image_exists(resolved_base_image):
+            print(
+                f"Error: shared agent image '{resolved_base_image}' is still missing "
+                f"after prepare step for project '{project.name}'."
+            )
             return False
     needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
         image_name=image_name,
@@ -979,7 +1178,18 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
 
 def _run_action(action_key: str, project_name: str, replace_process: bool = False) -> bool:
     if action_key == "run":
-        cmd_run(SimpleNamespace(name=project_name, replace_process=replace_process))
+        try:
+            project = ConfigStore().resolve_project(project_name)
+            agent_name = project.agent if project else None
+        except Exception:
+            agent_name = None
+        #title = f"skua | {project_name} | {agent_name}" if agent_name else f"skua | {project_name}"
+        title = f"<<< skua: {project_name} >>>"
+        _set_terminal_title(title)
+        try:
+            cmd_run(SimpleNamespace(name=project_name, replace_process=replace_process))
+        finally:
+            _set_terminal_title("<<< skua >>>")
         return True
     if action_key == "build":
         return _build_selected_project(project_name, verbose=False)
@@ -1047,17 +1257,35 @@ def _prompt_select(prompt: str, options: list, default_index: int = 0) -> tuple:
     return "ok", selected
 
 
+def _matching_credentials(store: ConfigStore, agent_name: str) -> list[str]:
+    if not agent_name:
+        return []
+    return sorted(
+        c for c in store.list_resources("Credential")
+        if _cred_matches_agent(store, c, agent_name)
+    )
+
+
+def _default_credential_choice(store: ConfigStore, agent_name: str) -> str:
+    creds = _matching_credentials(store, agent_name)
+    if creds:
+        return creds[0]
+    return "None (log in in container)"
+
+
 def _step_enabled(step: int, values: dict) -> bool:
     if step == 3:
         return values.get("source_mode") == "Git repository"
     if step == 4:
         return values.get("source_mode") == "Git repository" and values.get("run_mode") == "Remote SSH host"
+    if step == 11:
+        return values.get("image_mode") in ("Default image", "Base image")
     return True
 
 
 def _advance_step(step: int, values: dict) -> int:
     nxt = step + 1
-    while nxt <= 10 and not _step_enabled(nxt, values):
+    while nxt <= 11 and not _step_enabled(nxt, values):
         nxt += 1
     return nxt
 
@@ -1092,10 +1320,12 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
         "agent": defaults.get("agent", "claude"),
         "credential": "",
         "no_credential": False,
+        "image_mode": "Build new",   # "Build new" | "Default image" | "Base image"
+        "default_image": "",
         "image": "",
     }
     step = 0
-    while step <= 10:
+    while step <= 11:
         status = "ok"
         result = ""
         if step == 0:
@@ -1225,12 +1455,11 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
                 values["credential"] = ""
                 values["no_credential"] = False
         elif step == 9:
-            available_creds = sorted(
-                c for c in store.list_resources("Credential") if _cred_matches_agent(store, c, values["agent"])
-            )
+            available_creds = _matching_credentials(store, values["agent"])
             if available_creds:
                 options = ["Auto-detect/add local credential", "None (log in in container)"] + available_creds
-                status, result = _prompt_select("Credential:", options, 0)
+                default_idx = options.index(available_creds[0])
+                status, result = _prompt_select("Credential:", options, default_idx)
                 if status == "ok":
                     values["credential"] = ""
                     values["no_credential"] = False
@@ -1244,9 +1473,47 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
                 step = _advance_step(step, values)
                 continue
         elif step == 10:
-            status, result = _prompt_text("Project base image override (optional)", values["image"], required=False)
+            agent_defaults = [
+                d for d in store.load_all_resources("DefaultImage")
+                if not d.agent or d.agent == values["agent"]
+            ]
+            options = ["Build new"]
+            if agent_defaults:
+                options.append("Default image")
+            options.append("Base image")
+            default_idx = options.index(values["image_mode"]) if values["image_mode"] in options else 0
+            status, result = _prompt_select("Image source:", options, default_idx)
             if status == "ok":
-                values["image"] = result
+                values["image_mode"] = result
+                if result == "Build new":
+                    values["default_image"] = ""
+                    values["image"] = ""
+        elif step == 11:
+            if values["image_mode"] == "Default image":
+                agent_defaults = [
+                    d for d in store.load_all_resources("DefaultImage")
+                    if not d.agent or d.agent == values["agent"]
+                ]
+                opts = [
+                    d.name + (f"  [{d.description}]" if d.description else "")
+                    for d in agent_defaults
+                ]
+                default_idx = 0
+                if values["default_image"]:
+                    matching = [i for i, o in enumerate(opts) if o.split()[0] == values["default_image"]]
+                    if matching:
+                        default_idx = matching[0]
+                status, result = _prompt_select("Select default image:", opts, default_idx)
+                if status == "ok":
+                    values["default_image"] = result.split()[0]
+                    values["image"] = ""
+            elif values["image_mode"] == "Base image":
+                status, result = _prompt_text(
+                    "Base image override (e.g. ubuntu:24.04)", values["image"], required=False
+                )
+                if status == "ok":
+                    values["image"] = result
+                    values["default_image"] = ""
 
         if status == "cancel":
             print("Cancelled.")
@@ -1270,8 +1537,9 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
         security=values["security"],
         agent=values["agent"],
         image=values["image"],
+        default_image=values["default_image"],
         quick=False,
-        no_prompt=False,
+        no_prompt=True,   # all prompts already handled in wizard steps above
         no_credential=values["no_credential"],
         credential=values["credential"],
     )
@@ -1402,11 +1670,15 @@ def cmd_dashboard(args):
             Binding("h", "toggle_help", "Help"),
             Binding("tab", "toggle_focus", "Focus"),
             Binding("f", "toggle_focus", "Focus"),
+            Binding("v", "toggle_project_detail", "Detail"),
+            Binding("k", "add_project_ssh", "Add SSH", show=False),
+            Binding("w", "detail_save", "Save", show=False),
+            Binding("u", "detail_revert", "Revert", show=False),
             Binding("left", "task_prev_option", show=False),
             Binding("right", "task_next_option", show=False),
             Binding("escape", "task_cancel", show=False),
-            Binding("up,k", "cursor_up", "Up"),
-            Binding("down,j", "cursor_down", "Down"),
+            Binding("up", "cursor_up", "Up"),
+            Binding("down", "cursor_down", "Down"),
             Binding("enter", "run_selected", "Run"),
             Binding("b", "build_selected", "Build"),
             Binding("s", "stop_selected", "Stop"),
@@ -1430,6 +1702,7 @@ def cmd_dashboard(args):
             self.focus = "projects"
             self.show_job_output = False
             self.show_help = False
+            self.show_project_detail = False
             self.message = ""
             self.jobs = DashboardJobManager()
             self.task_mode = ""
@@ -1439,13 +1712,20 @@ def cmd_dashboard(args):
             self.task_option_index = 0
             self.task_catalog = {}
             self.task_job_id = 0
-            self.task_remove_project = ""
             self.task_error = ""
             self.task_export_options: list[str] = []
             self.task_adapt_project = ""
             self.task_adapt_options: list[str] = []
+            self.task_project_name = ""
+            self.task_project_options: list[str] = []
+            self.task_project_action = ""
             self.output_scroll = 0
             self.output_follow = False
+            self.detail_cursor = 0          # index into _project_detail_fields list
+            self.detail_draft = None        # Project copy being edited (None = not editing)
+            self.detail_original = None     # Project state when detail was opened
+            self.detail_checkpoints = []    # list of (iso_timestamp, Project) saved states
+            self._detail_close_pending = False  # waiting for second v to discard unsaved changes
             self.project_scroll = 0
             self.project_hscroll = 0
             self.jobs_hscroll = 0
@@ -1458,10 +1738,12 @@ def cmd_dashboard(args):
             self._jobs_cursor_visible = None
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
+            self._refresh_pending = False
             self._last_logged_message = ""
             self._job_status_seen = {job.job_id: job.status for job in self.jobs.jobs}
             self._ui_log_path = self.jobs.jobs_dir / "dashboard-ui.log"
             self._resume_mask_until = 0.0
+            self._quit_armed_until = 0.0
 
         def _log_ui_event(self, event: str, **fields) -> None:
             try:
@@ -1634,7 +1916,12 @@ def cmd_dashboard(args):
             if not self._use_project_widget:
                 return
             table = self.query_one("#projects-table")
-            show_projects_cursor = (self.focus == "projects" and not self.task_mode and not self.show_job_output)
+            show_projects_cursor = (
+                self.focus == "projects"
+                and not self.task_mode
+                and not self.show_job_output
+                and not self.show_project_detail
+            )
             if self._project_cursor_visible is show_projects_cursor:
                 return
             try:
@@ -1659,7 +1946,12 @@ def cmd_dashboard(args):
             if not self._use_project_widget:
                 return
             table = self.query_one("#jobs-table")
-            show_jobs_cursor = (self.focus == "jobs" and not self.task_mode and not self.show_job_output)
+            show_jobs_cursor = (
+                self.focus == "jobs"
+                and not self.task_mode
+                and not self.show_job_output
+                and not self.show_project_detail
+            )
             if self._jobs_cursor_visible is show_jobs_cursor:
                 return
             try:
@@ -1812,10 +2104,17 @@ def cmd_dashboard(args):
                 allowed = True
             elif self.task_mode == "job_input":
                 allowed = action in {"run_selected", "task_cancel"}
-            elif self.task_mode == "remove_confirm":
-                allowed = action in {"run_selected", "task_cancel"}
             elif self.task_mode == "export_choice":
                 allowed = action in {"run_selected", "task_cancel", "cursor_up", "cursor_down", "task_prev_option", "task_next_option"}
+            elif self.task_mode in _PROJECT_DETAIL_TASKS:
+                allowed = action in {
+                    "run_selected",
+                    "cursor_up",
+                    "cursor_down",
+                    "task_prev_option",
+                    "task_next_option",
+                    "task_cancel",
+                }
             else:
                 allowed = action in {
                     "run_selected",
@@ -1834,6 +2133,7 @@ def cmd_dashboard(args):
                 self._update_job_messages()
             with self._refresh_lock:
                 if self._refresh_inflight:
+                    self._refresh_pending = True
                     if jobs_changed:
                         self._refresh_view()
                     return
@@ -1866,12 +2166,18 @@ def cmd_dashboard(args):
         def _apply_refresh_error(self, detail: str) -> None:
             with self._refresh_lock:
                 self._refresh_inflight = False
+                rerun = self._refresh_pending
+                self._refresh_pending = False
             self.message = f"refresh failed: {detail}"
             self._refresh_view()
+            if rerun:
+                self._request_refresh()
 
         def _apply_snapshot(self, snapshot: DashboardSnapshot) -> None:
             with self._refresh_lock:
                 self._refresh_inflight = False
+                rerun = self._refresh_pending
+                self._refresh_pending = False
             prev_name = self.selected_project_name or self._selected_project_name()
             self.snapshot = snapshot
             if self.snapshot.rows:
@@ -1888,12 +2194,19 @@ def cmd_dashboard(args):
             else:
                 self.selected = 0
                 self.selected_project_name = None
+            if self.show_project_detail and self.selected_project_name != prev_name:
+                self.show_project_detail = False
+                self.message = f"project detail closed: '{prev_name}' is no longer available"
             if self._use_project_widget:
                 self._project_table_sig = None
                 self._jobs_table_sig = None
             self._refresh_view()
+            if rerun:
+                self._request_refresh()
 
         def _selected_project_name(self) -> str | None:
+            if self.show_project_detail and self.selected_project_name:
+                return self.selected_project_name
             if not self.snapshot.rows:
                 return None
             if self.selected < 0 or self.selected >= len(self.snapshot.rows):
@@ -1907,6 +2220,333 @@ def cmd_dashboard(args):
                 return
             self.selected = max(0, min(int(idx), len(self.snapshot.rows) - 1))
             self.selected_project_name = self.snapshot.rows[self.selected]["name"]
+
+        def _project_detail_name(self) -> str | None:
+            if not self.show_project_detail:
+                return None
+            return self.selected_project_name or self._selected_project_name()
+
+        def _toggle_project_detail(self) -> None:
+            if self.task_mode:
+                self._refresh_view()
+                return
+            if self.show_project_detail:
+                # Closing: warn about unsaved changes
+                if self.detail_draft is not None and self.detail_original is not None:
+                    import copy, dataclasses
+                    draft_d = dataclasses.asdict(self.detail_draft) if dataclasses.is_dataclass(self.detail_draft) else {}
+                    orig_d = dataclasses.asdict(self.detail_original) if dataclasses.is_dataclass(self.detail_original) else {}
+                    # Strip read-only state/resources from comparison
+                    for d in (draft_d, orig_d):
+                        d.pop("state", None)
+                        d.pop("resources", None)
+                    if draft_d != orig_d:
+                        self.message = "unsaved changes — press w to save or press v again to discard"
+                        self._detail_close_pending = True
+                        self._refresh_view()
+                        return
+                self._close_project_detail()
+                return
+            if self.show_job_output or self.focus != "projects":
+                self.message = "project detail is available only in projects view"
+                self._refresh_view()
+                return
+            project_name = self._selected_project_name()
+            if not project_name:
+                self.message = "no project selected"
+                self._refresh_view()
+                return
+            self._open_project_detail(project_name)
+
+        def _open_project_detail(self, project_name: str) -> None:
+            import copy
+            store = ConfigStore()
+            project = store.resolve_project(project_name)
+            if project is None:
+                self.message = f"project '{project_name}' not found"
+                self._refresh_view()
+                return
+            self.detail_draft = copy.deepcopy(project)
+            self.detail_original = copy.deepcopy(project)
+            self.detail_checkpoints = []
+            self.detail_cursor = 0
+            self._detail_close_pending = False
+            self.show_project_detail = True
+            self.selected_project_name = project_name
+            # Advance cursor to first editable field
+            fields = _project_detail_fields(self.detail_draft, store)
+            editable = [i for i, f in enumerate(fields) if f.get("editable")]
+            self.detail_cursor = editable[0] if editable else 0
+            self.message = f"project detail: {project_name}  (↑/↓ navigate · ⏎ edit · w save · u revert · v back)"
+            self._refresh_view()
+
+        def _close_project_detail(self) -> None:
+            self.show_project_detail = False
+            self.detail_draft = None
+            self.detail_original = None
+            self.detail_checkpoints = []
+            self._detail_close_pending = False
+            name = self.selected_project_name or self._selected_project_name() or "-"
+            self.message = f"project list: {name}"
+            self._refresh_view()
+
+        def _activate_detail_field(self) -> None:
+            """Activate the field at the current detail cursor position."""
+            if self.detail_draft is None:
+                return
+            store = ConfigStore()
+            fields = _project_detail_fields(self.detail_draft, store)
+            if self.detail_cursor >= len(fields):
+                return
+            field = fields[self.detail_cursor]
+            if not field.get("editable"):
+                return
+            action = field.get("action", "")
+            project_name = self._project_detail_name() or ""
+
+            if action == "detail_edit_select":
+                options = store.list_resources(field["options_kind"])
+                if field.get("allow_none"):
+                    options = ["(none)"] + options
+                current = _get_nested_field(self.detail_draft, field["field"])
+                self.task_mode = "detail_edit_select"
+                self.task_input = ""
+                self.task_values = {"field": field["field"], "field_label": field.get("label", field["field"])}
+                self.task_project_options = options
+                self.task_option_index = options.index(str(current)) if str(current) in options else 0
+                self.focus = "task"
+                self.message = f"edit {field.get('label', field['field'])}"
+
+            elif action == "detail_edit_text":
+                current = _get_nested_field(self.detail_draft, field["field"])
+                if isinstance(current, list):
+                    current = ", ".join(str(x) for x in current)
+                self.task_mode = "detail_edit_text"
+                self.task_input = str(current or "")
+                self.task_values = {"field": field["field"], "field_label": field.get("label", field["field"])}
+                self.focus = "task"
+                self.message = f"edit {field.get('label', field['field'])}"
+
+            elif action == "detail_source_action":
+                sources = list(getattr(self.detail_draft, "sources", []) or [])
+                idx = field.get("source_idx", 0)
+                if idx < 0 or idx >= len(sources):
+                    self.message = "source not found"
+                    self._refresh_view()
+                    return
+                src = sources[idx]
+                options = []
+                if not getattr(src, "primary", False):
+                    options.append("Set as primary")
+                if len(sources) > 1:
+                    options.append("Remove")
+                options.append("Cancel")
+                self.task_mode = "detail_source_action"
+                self.task_project_options = options
+                self.task_option_index = 0
+                self.task_values = {"source_idx": idx}
+                self.focus = "task"
+                label = getattr(src, "name", "") or getattr(src, "project", "") or f"source-{idx + 1}"
+                self.message = f"source '{label}': choose action"
+
+            elif action == "detail_source_add":
+                self._start_detail_source_add()
+
+            elif action == "detail_ssh_action":
+                key_idx = field.get("key_idx", 0)
+                key_path = field.get("key_path", "")
+                ssh_keys_list = ssh_private_keys(getattr(self.detail_draft, "ssh", None))
+                options = []
+                if key_idx > 0:
+                    options.append("Set as primary")
+                options.extend(["Remove", "Cancel"])
+                self.task_mode = "detail_ssh_action"
+                self.task_project_options = options
+                self.task_option_index = 0
+                self.task_values = {"key_idx": key_idx, "key_path": key_path}
+                self.focus = "task"
+                short = ("…" + key_path[-24:]) if len(key_path) > 26 else key_path
+                self.message = f"SSH key {short}: choose action"
+
+            elif action == "detail_ssh_add":
+                self._start_project_ssh_add_task(project_name)
+
+            elif action == "detail_save":
+                self._do_detail_save()
+                return
+
+            elif action == "detail_revert":
+                self._start_detail_revert()
+                return
+
+            self._refresh_view()
+
+        def _do_detail_save(self) -> None:
+            """Persist the in-memory draft to disk, pushing a checkpoint."""
+            import copy
+            if self.detail_draft is None:
+                self.message = "no draft to save"
+                self._refresh_view()
+                return
+            project_name = self._project_detail_name()
+            if not project_name:
+                self.message = "no project selected"
+                self._refresh_view()
+                return
+            store = ConfigStore()
+            # Load current disk version for the checkpoint
+            current_disk = store.load_project(project_name)
+            if current_disk is not None:
+                ts = _utc_now_iso()
+                self.detail_checkpoints.append((ts, copy.deepcopy(current_disk)))
+                if len(self.detail_checkpoints) > 10:
+                    self.detail_checkpoints = self.detail_checkpoints[-10:]
+            try:
+                store.save_resource(self.detail_draft)
+                self.detail_original = copy.deepcopy(self.detail_draft)
+                self.message = f"saved '{project_name}'"
+            except Exception as exc:
+                self.message = f"save failed: {exc}"
+            self._refresh_view()
+            self._request_refresh()
+
+        def action_detail_save(self) -> None:
+            self._log_ui_event("action", name="detail_save")
+            if self.task_mode:
+                return
+            if not self.show_project_detail:
+                return
+            self._do_detail_save()
+
+        def _start_detail_revert(self) -> None:
+            """Show revert options: each saved checkpoint or the original opening state."""
+            import dataclasses
+            if not self.detail_checkpoints:
+                # Just revert to original (no saved checkpoints)
+                import copy
+                self.detail_draft = copy.deepcopy(self.detail_original)
+                self.message = "reverted to original (no checkpoints — save to create one)"
+                self._refresh_view()
+                return
+            options = []
+            for ts, _ in reversed(self.detail_checkpoints):
+                options.append(f"Checkpoint: {ts}")
+            options.append("Cancel")
+            self.task_mode = "detail_revert"
+            self.task_project_options = options
+            self.task_option_index = 0
+            self.focus = "task"
+            self.message = "revert to checkpoint"
+            self._refresh_view()
+
+        def action_detail_revert(self) -> None:
+            self._log_ui_event("action", name="detail_revert")
+            if self.task_mode:
+                return
+            if not self.show_project_detail:
+                return
+            self._start_detail_revert()
+
+        def _start_detail_source_add(self) -> None:
+            self.task_mode = "detail_source_add"
+            self.task_step = 0
+            self.task_values = {
+                "source_mode": "Local directory",
+                "dir": "",
+                "repo": "",
+                "name": "",
+                "mount_path": "",
+            }
+            self.task_input = ""
+            self.task_error = ""
+            self.task_option_index = 0
+            self.focus = "task"
+            self.message = "add source: choose source type"
+            self._sync_detail_source_add_editor()
+
+        def _detail_source_add_steps(self) -> list[dict]:
+            steps = [
+                {"key": "source_mode", "kind": "select", "label": "Source type",
+                 "options": ["Local directory", "Git repository"]},
+            ]
+            if self.task_values.get("source_mode") == "Local directory":
+                steps.append({"key": "dir", "kind": "text", "label": "Directory path", "required": True})
+            else:
+                steps.append({"key": "repo", "kind": "text", "label": "Repository URL", "required": True})
+            steps.append({"key": "name", "kind": "text", "label": "Source name (optional, auto-derived if blank)"})
+            steps.append({"key": "mount_path", "kind": "text", "label": "Mount path (optional, e.g. /home/dev/src)"})
+            steps.append({"key": "make_primary", "kind": "select", "label": "Make primary?", "options": ["No", "Yes"]})
+            steps.append({"key": "confirm", "kind": "select", "label": "Add source",
+                          "options": ["Add source", "Cancel"]})
+            return steps
+
+        def _detail_source_add_current_step(self) -> dict | None:
+            steps = self._detail_source_add_steps()
+            if not steps:
+                return None
+            self.task_step = max(0, min(self.task_step, len(steps) - 1))
+            return steps[self.task_step]
+
+        def _sync_detail_source_add_editor(self) -> None:
+            step = self._detail_source_add_current_step()
+            if step is None:
+                return
+            key = step["key"]
+            if step["kind"] == "text":
+                self.task_input = str(self.task_values.get(key, ""))
+            else:
+                options = step.get("options", [])
+                current = self.task_values.get(key, "")
+                if options and current in options:
+                    self.task_option_index = options.index(current)
+                elif options:
+                    self.task_option_index = 0
+                    self.task_values[key] = options[0]
+
+        def _finish_detail_source_add(self) -> None:
+            from pathlib import Path as _Path
+            from skua.commands.source_cmd import explicit_sources, sync_project_primary
+            from skua.config.resources import ProjectSourceSpec
+            tv = self.task_values
+            directory = tv.get("dir", "").strip()
+            repo = tv.get("repo", "").strip()
+            source_name = tv.get("name", "").strip()
+            mount_path = tv.get("mount_path", "").strip()
+            make_primary = tv.get("make_primary", "No") == "Yes"
+
+            if not source_name:
+                if repo:
+                    source_name = repo.rstrip("/").split("/")[-1]
+                    if source_name.endswith(".git"):
+                        source_name = source_name[:-4]
+                elif directory:
+                    source_name = _Path(directory).name
+                else:
+                    source_name = "source"
+            if not mount_path:
+                mount_path = f"/home/dev/{source_name}"
+
+            sources = explicit_sources(self.detail_draft)
+            new_source = ProjectSourceSpec(
+                project=self.detail_draft.name,
+                name=source_name,
+                directory=directory,
+                repo=repo,
+                host="",
+                ssh_private_key="",
+                mount_path=mount_path,
+                primary=make_primary,
+            )
+            if make_primary:
+                for s in sources:
+                    s.primary = False
+            elif not any(getattr(s, "primary", False) for s in sources):
+                new_source.primary = True
+            sources.append(new_source)
+            self.detail_draft.sources = sources
+            sync_project_primary(self.detail_draft, sources)
+            self.message = f"added source '{source_name}' (unsaved — press w to save)"
+            self._task_cancel(self.message)
 
         def _build_new_project_catalog(self) -> dict:
             store = ConfigStore()
@@ -1992,10 +2632,7 @@ def cmd_dashboard(args):
                 else self.task_values.get("agent", "").strip()
             )
             store = ConfigStore()
-            creds = sorted(
-                c for c in store.list_resources("Credential")
-                if agent_name and _cred_matches_agent(store, c, agent_name)
-            )
+            creds = _matching_credentials(store, agent_name)
             steps.append(
                 {
                     "key": "credential_choice",
@@ -2004,7 +2641,25 @@ def cmd_dashboard(args):
                     "options": ["None (log in in container)"] + creds,
                 }
             )
-            steps.append({"key": "image", "kind": "text", "label": "Project base image override"})
+            # Image source: filter default images to those compatible with the selected agent
+            agent_defaults = [
+                d for d in store.load_all_resources("DefaultImage")
+                if not d.agent or d.agent == agent_name
+            ]
+            image_mode_options = ["Build new"]
+            if agent_defaults:
+                image_mode_options.append("Default image")
+            image_mode_options.append("Base image")
+            steps.append({"key": "image_mode", "kind": "select", "label": "Image source", "options": image_mode_options})
+            image_mode = self.task_values.get("image_mode", "Build new")
+            if image_mode == "Default image":
+                default_opts = [
+                    d.name + (f"  [{d.description}]" if d.description else "")
+                    for d in agent_defaults
+                ]
+                steps.append({"key": "default_image", "kind": "select", "label": "Default image", "options": default_opts})
+            elif image_mode == "Base image":
+                steps.append({"key": "image", "kind": "text", "label": "Base image (e.g. ubuntu:24.04)"})
             steps.append({"key": "confirm", "kind": "select", "label": "Create project", "options": ["Create project", "Cancel"]})
             return steps
 
@@ -2028,12 +2683,18 @@ def cmd_dashboard(args):
             if options and current in options:
                 self.task_option_index = options.index(current)
             else:
-                self.task_option_index = 0
                 if options:
-                    self.task_values[key] = options[0]
+                    if key == "credential_choice" and len(options) > 1:
+                        self.task_option_index = 1
+                    else:
+                        self.task_option_index = 0
+                    self.task_values[key] = options[self.task_option_index]
+                else:
+                    self.task_option_index = 0
 
         def _start_new_project_task(self) -> None:
             defaults = self.task_catalog.get("defaults", {})
+            store = ConfigStore()
             self.task_mode = "new_project"
             self.task_step = 0
             self.task_values = {
@@ -2052,7 +2713,9 @@ def cmd_dashboard(args):
                 "security_manual": "",
                 "agent": defaults.get("agent", "claude"),
                 "agent_manual": "",
-                "credential_choice": "None (log in in container)",
+                "credential_choice": _default_credential_choice(store, defaults.get("agent", "claude")),
+                "image_mode": "Build new",
+                "default_image": "",
                 "image": "",
                 "confirm": "Create project",
             }
@@ -2070,14 +2733,6 @@ def cmd_dashboard(args):
             self.focus = "task"
             self.show_job_output = True
             self.message = f"job #{job.job_id}: waiting for input"
-
-        def _start_remove_confirm_task(self, project_name: str) -> None:
-            self.task_mode = "remove_confirm"
-            self.task_remove_project = project_name
-            self.task_input = ""
-            self.focus = "task"
-            self.show_job_output = False
-            self.message = f"remove confirm: type '{project_name}'"
 
         def _start_export_choice_task(self, job: DashboardJob) -> None:
             options = ["Save to file"]
@@ -2102,6 +2757,37 @@ def cmd_dashboard(args):
                 "discover adaptations with --discover?"
             )
 
+        def _start_project_ssh_add_task(self, project_name: str) -> None:
+            keys = _ssh_key_catalog()
+            self.task_mode = "project_ssh_add"
+            self.task_project_name = project_name
+            self.task_project_options = keys + ["Manual entry...", "Cancel"]
+            self.task_option_index = 0
+            self.focus = "task"
+            self.message = f"project '{project_name}': add SSH key"
+
+        def _start_project_ssh_add_manual_task(self, project_name: str) -> None:
+            self.task_mode = "project_ssh_add_manual"
+            self.task_project_name = project_name
+            self.task_input = ""
+            self.focus = "task"
+            self.message = f"project '{project_name}': enter SSH key path"
+
+        def _start_project_ssh_remove_task(self, project_name: str) -> None:
+            store = ConfigStore()
+            project = store.resolve_project(project_name)
+            keys = ssh_private_keys(getattr(project, "ssh", None)) if project is not None else []
+            if not keys:
+                self.message = f"project '{project_name}' has no SSH keys configured"
+                self._refresh_view()
+                return
+            self.task_mode = "project_ssh_remove"
+            self.task_project_name = project_name
+            self.task_project_options = list(keys) + ["All keys", "Cancel"]
+            self.task_option_index = 0
+            self.focus = "task"
+            self.message = f"project '{project_name}': remove SSH key"
+
         def _project_has_pending_adapt(self, project_name: str) -> bool:
             store = ConfigStore()
             project = store.resolve_project(project_name)
@@ -2118,16 +2804,77 @@ def cmd_dashboard(args):
             running = get_running_skua_containers(host=host)
             return f"skua-{project_name}" in set(running or [])
 
+        def _apply_project_ssh_command(self, args: SimpleNamespace, success_message: str) -> None:
+            # If detail view is open with a draft, apply the SSH change to the draft
+            # rather than writing to disk, keeping it consistent with save/revert workflow.
+            if self.show_project_detail and self.detail_draft is not None:
+                from skua.config.resources import normalize_project_ssh, ProjectSshSpec
+                ssh_keys_list = ssh_private_keys(getattr(self.detail_draft, "ssh", None))
+                action = getattr(args, "action", "")
+                key = str(getattr(args, "ssh_key", "") or "").strip()
+                remove_all = getattr(args, "all", False)
+                if action == "add" and key:
+                    if key not in ssh_keys_list:
+                        ssh_keys_list.append(key)
+                    first = ssh_keys_list[0]
+                    self.detail_draft.ssh = normalize_project_ssh(
+                        ProjectSshSpec(private_key=first, private_keys=ssh_keys_list))
+                    self.message = f"{success_message} (unsaved)"
+                elif action == "remove":
+                    if remove_all:
+                        ssh_keys_list = []
+                    elif key:
+                        ssh_keys_list = [k for k in ssh_keys_list if k != key]
+                    first = ssh_keys_list[0] if ssh_keys_list else ""
+                    self.detail_draft.ssh = normalize_project_ssh(
+                        ProjectSshSpec(private_key=first, private_keys=ssh_keys_list))
+                    self.message = f"{success_message} (unsaved)"
+                else:
+                    self.message = success_message
+                self.task_mode = ""
+                self.task_project_name = ""
+                self.task_project_options = []
+                self.task_project_action = ""
+                self.focus = "projects"
+                self._refresh_view()
+                return
+            output = StringIO()
+            try:
+                with redirect_stdout(output), redirect_stderr(output):
+                    cmd_ssh(args)
+                self.message = success_message
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 1
+                detail_lines = [ln for ln in output.getvalue().splitlines() if ln.strip()]
+                detail = detail_lines[-1] if detail_lines else f"status {code}"
+                self.message = f"{success_message}: failed ({detail})"
+            except Exception as exc:  # pragma: no cover - defensive runtime guard
+                self.message = f"SSH update failed ({type(exc).__name__}: {exc})"
+            self.task_mode = ""
+            self.task_project_name = ""
+            self.task_project_options = []
+            self.task_project_action = ""
+            self.focus = "projects"
+            self._refresh_view()
+            self._request_refresh()
+
         def _task_cancel(self, reason: str = "new project: cancelled") -> None:
+            was_detail_task = self.task_mode in _PROJECT_DETAIL_TASKS
             self.task_mode = ""
             self.task_job_id = 0
-            self.task_remove_project = ""
             self.task_error = ""
             self.task_export_options = []
             self.task_adapt_project = ""
             self.task_adapt_options = []
+            self.task_project_name = ""
+            self.task_project_options = []
+            self.task_project_action = ""
+            self.task_values = {}
             if self.focus == "task":
-                self.focus = "projects" if self.snapshot.rows else "jobs"
+                if was_detail_task and self.show_project_detail:
+                    self.focus = "projects"
+                else:
+                    self.focus = "projects" if self.snapshot.rows else "jobs"
             self.message = reason
 
         def _finish_new_project_task(self) -> None:
@@ -2146,6 +2893,18 @@ def cmd_dashboard(args):
             no_credential = credential_choice == "None (log in in container)"
             credential_name = "" if no_credential else credential_choice
 
+            image_mode = self.task_values.get("image_mode", "Build new")
+            if image_mode == "Default image":
+                raw_default = self.task_values.get("default_image", "").strip()
+                resolved_default_image = raw_default.split()[0] if raw_default else ""
+                resolved_image = ""
+            elif image_mode == "Base image":
+                resolved_default_image = ""
+                resolved_image = self.task_values.get("image", "").strip()
+            else:
+                resolved_default_image = ""
+                resolved_image = ""
+
             args = SimpleNamespace(
                 name=self.task_values.get("name", "").strip(),
                 repo=self.task_values.get("repo", "").strip() if self.task_values.get("source_mode") == "Git repository" else "",
@@ -2155,7 +2914,8 @@ def cmd_dashboard(args):
                 env=env,
                 security=sec,
                 agent=agent,
-                image=self.task_values.get("image", "").strip(),
+                image=resolved_image,
+                default_image=resolved_default_image,
                 quick=False,
                 no_prompt=True,
                 no_credential=no_credential,
@@ -2192,40 +2952,6 @@ def cmd_dashboard(args):
                 else:
                     self.message = detail
                 self._refresh_view()
-                return
-            if self.task_mode == "remove_confirm":
-                target = self.task_remove_project
-                if self.task_input.strip() != target:
-                    self.message = f"type '{target}' to confirm remove"
-                    self._refresh_view()
-                    return
-                if self._project_is_running(target):
-                    self.message = f"project '{target}' is running; stop it before remove"
-                    self._refresh_view()
-                    return
-                lock_msg = _lock_block_message(target, "remove")
-                if lock_msg:
-                    self.message = lock_msg
-                    self._refresh_view()
-                    return
-                background = _background_command("remove", target)
-                if not background:
-                    self.message = "remove action is unavailable"
-                    self._refresh_view()
-                    return
-                try:
-                    job = self.jobs.enqueue("remove", target, command=background)
-                    self.message = f"queued job #{job.job_id}: remove {target}"
-                    self.task_mode = ""
-                    self.task_remove_project = ""
-                    self.task_input = ""
-                    self.focus = "projects"
-                    self.show_job_output = False
-                    self.selected_job = 0
-                except Exception as exc:
-                    self.message = f"failed to queue remove {target}: {type(exc).__name__}: {exc}"
-                self._refresh_view()
-                self._request_refresh()
                 return
             if self.task_mode == "export_choice":
                 job = next((j for j in self.jobs.jobs if j.job_id == self.task_job_id), None)
@@ -2293,6 +3019,205 @@ def cmd_dashboard(args):
                 self._refresh_view()
                 self._request_refresh()
                 return
+            if self.task_mode == "project_ssh_add":
+                project_name = self.task_project_name
+                option = (
+                    self.task_project_options[self.task_option_index]
+                    if self.task_project_options
+                    else "Cancel"
+                )
+                if option == "Cancel":
+                    self._task_cancel(f"SSH key add cancelled for '{project_name}'")
+                    self._refresh_view()
+                    return
+                if option == "Manual entry...":
+                    self._start_project_ssh_add_manual_task(project_name)
+                    self._refresh_view()
+                    return
+                self._apply_project_ssh_command(
+                    SimpleNamespace(action="add", name=project_name, ssh_key=option, no_prompt=True),
+                    f"project '{project_name}': SSH key added",
+                )
+                return
+            if self.task_mode == "project_ssh_add_manual":
+                project_name = self.task_project_name
+                key_path = self.task_input.strip()
+                if not key_path:
+                    self.message = "SSH private key path is required"
+                    self._refresh_view()
+                    return
+                self._apply_project_ssh_command(
+                    SimpleNamespace(action="add", name=project_name, ssh_key=key_path, no_prompt=True),
+                    f"project '{project_name}': SSH key added",
+                )
+                return
+            if self.task_mode == "project_ssh_remove":
+                project_name = self.task_project_name
+                option = (
+                    self.task_project_options[self.task_option_index]
+                    if self.task_project_options
+                    else "Cancel"
+                )
+                if option == "Cancel":
+                    self._task_cancel(f"SSH key removal cancelled for '{project_name}'")
+                    self._refresh_view()
+                    return
+                if option == "All keys":
+                    args = SimpleNamespace(action="remove", name=project_name, ssh_key="", all=True, no_prompt=True)
+                else:
+                    args = SimpleNamespace(action="remove", name=project_name, ssh_key=option, all=False, no_prompt=True)
+                self._apply_project_ssh_command(
+                    args,
+                    f"project '{project_name}': SSH keys updated",
+                )
+                return
+            if self.task_mode == "detail_edit_select":
+                options = self.task_project_options or []
+                value = options[self.task_option_index] if options else ""
+                if value == "(none)":
+                    value = ""
+                field = self.task_values.get("field", "")
+                label = self.task_values.get("field_label", field)
+                if field and self.detail_draft is not None:
+                    _set_nested_field(self.detail_draft, field, value)
+                    self.message = f"set {label}: {value or '(none)'}"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
+            if self.task_mode == "detail_edit_text":
+                value = self.task_input
+                field = self.task_values.get("field", "")
+                label = self.task_values.get("field_label", field)
+                if field and self.detail_draft is not None:
+                    _set_nested_field(self.detail_draft, field, value)
+                    display = value if not isinstance(_get_nested_field(self.detail_draft, field), list) else str(_get_nested_field(self.detail_draft, field))
+                    self.message = f"set {label}: {display}"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
+            if self.task_mode == "detail_source_action":
+                option = (self.task_project_options[self.task_option_index]
+                          if self.task_project_options else "Cancel")
+                if option == "Cancel":
+                    self._task_cancel("source action cancelled")
+                    self._refresh_view()
+                    return
+                from skua.commands.source_cmd import explicit_sources, sync_project_primary
+                sources = explicit_sources(self.detail_draft)
+                idx = int(self.task_values.get("source_idx", 0))
+                if option == "Set as primary":
+                    for i, s in enumerate(sources):
+                        s.primary = (i == idx)
+                    self.detail_draft.sources = sources
+                    sync_project_primary(self.detail_draft, sources)
+                    label = getattr(sources[idx], "name", "") or getattr(sources[idx], "project", "") or f"source-{idx + 1}"
+                    self.message = f"'{label}' is now primary (unsaved)"
+                elif option == "Remove":
+                    if len(sources) <= 1:
+                        self.message = "cannot remove the only source"
+                        self._task_cancel(self.message)
+                        self._refresh_view()
+                        return
+                    removed = sources.pop(idx)
+                    if getattr(removed, "primary", False) and sources:
+                        sources[0].primary = True
+                    self.detail_draft.sources = sources
+                    sync_project_primary(self.detail_draft, sources)
+                    label = getattr(removed, "name", "") or getattr(removed, "project", "") or f"source-{idx + 1}"
+                    self.message = f"removed source '{label}' (unsaved)"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
+            if self.task_mode == "detail_source_add":
+                step = self._detail_source_add_current_step()
+                if step is None:
+                    return
+                key = step["key"]
+                if step["kind"] == "text":
+                    value = self.task_input.strip() if step.get("required") else self.task_input
+                    if step.get("required") and not value:
+                        self.message = f"{step['label']} is required"
+                        self.task_error = self.message
+                        self._refresh_view()
+                        return
+                    if key == "dir" and value:
+                        from pathlib import Path as _Path
+                        if not _Path(value).expanduser().exists():
+                            self.message = "directory does not exist"
+                            self.task_error = self.message
+                            self._refresh_view()
+                            return
+                    self.task_values[key] = value
+                    self.task_error = ""
+                else:
+                    options = step.get("options", [])
+                    if options:
+                        self.task_values[key] = options[self.task_option_index]
+                if key == "confirm":
+                    if self.task_values.get("confirm") == "Add source":
+                        self._finish_detail_source_add()
+                    else:
+                        self._task_cancel("add source cancelled")
+                    self._refresh_view()
+                    return
+                self.task_step += 1
+                self.task_error = ""
+                self._sync_detail_source_add_editor()
+                self._refresh_view()
+                return
+
+            if self.task_mode == "detail_ssh_action":
+                option = (self.task_project_options[self.task_option_index]
+                          if self.task_project_options else "Cancel")
+                if option == "Cancel":
+                    self._task_cancel("SSH key action cancelled")
+                    self._refresh_view()
+                    return
+                from skua.config.resources import normalize_project_ssh, ProjectSshSpec
+                key_path = self.task_values.get("key_path", "")
+                key_idx = int(self.task_values.get("key_idx", 0))
+                ssh_keys_list = ssh_private_keys(getattr(self.detail_draft, "ssh", None))
+                if option == "Set as primary":
+                    if key_path in ssh_keys_list:
+                        ssh_keys_list.remove(key_path)
+                    ssh_keys_list.insert(0, key_path)
+                    self.detail_draft.ssh = normalize_project_ssh(
+                        ProjectSshSpec(private_key=ssh_keys_list[0], private_keys=ssh_keys_list))
+                    self.message = f"SSH key set as primary (unsaved)"
+                elif option == "Remove":
+                    ssh_keys_list = [k for k in ssh_keys_list if k != key_path]
+                    first = ssh_keys_list[0] if ssh_keys_list else ""
+                    self.detail_draft.ssh = normalize_project_ssh(
+                        ProjectSshSpec(private_key=first, private_keys=ssh_keys_list))
+                    self.message = f"SSH key removed (unsaved)"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
+            if self.task_mode == "detail_revert":
+                option = (self.task_project_options[self.task_option_index]
+                          if self.task_project_options else "Cancel")
+                if option == "Cancel":
+                    self._task_cancel("revert cancelled")
+                    self._refresh_view()
+                    return
+                import copy
+                # options are in reversed checkpoint order: last saved = index 0
+                chosen_rev_idx = self.task_option_index
+                rev_checkpoints = list(reversed(self.detail_checkpoints))
+                if chosen_rev_idx < len(rev_checkpoints):
+                    ts, cp_project = rev_checkpoints[chosen_rev_idx]
+                    self.detail_draft = copy.deepcopy(cp_project)
+                    self.message = f"reverted to checkpoint {ts} (unsaved — press w to keep)"
+                else:
+                    self.message = "invalid checkpoint selection"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
             if self.task_mode != "new_project":
                 return
             step = self._current_task_step()
@@ -2314,6 +3239,13 @@ def cmd_dashboard(args):
                     if ConfigStore().load_project(value) is not None:
                         self.task_error = "duplicate project name"
                         self.message = "duplicate project name"
+                        self._refresh_view()
+                        return
+                    self.task_error = ""
+                if key == "dir":
+                    if not Path(value).expanduser().exists():
+                        self.task_error = "directory does not exist"
+                        self.message = "directory does not exist"
                         self._refresh_view()
                         return
                     self.task_error = ""
@@ -2349,6 +3281,27 @@ def cmd_dashboard(args):
                 self.task_option_index = (self.task_option_index + delta) % len(self.task_adapt_options)
                 self._refresh_view()
                 return
+            if self.task_mode in {
+                "project_ssh_add", "project_ssh_remove",
+                "detail_edit_select", "detail_source_action",
+                "detail_ssh_action", "detail_revert",
+            }:
+                if not self.task_project_options:
+                    return
+                self.task_option_index = (self.task_option_index + delta) % len(self.task_project_options)
+                self._refresh_view()
+                return
+            if self.task_mode == "detail_source_add":
+                step = self._detail_source_add_current_step()
+                if step is None or step["kind"] != "select":
+                    return
+                options = step.get("options", [])
+                if not options:
+                    return
+                self.task_option_index = (self.task_option_index + delta) % len(options)
+                self.task_values[step["key"]] = options[self.task_option_index]
+                self._refresh_view()
+                return
             step = self._current_task_step()
             if step is None or step["kind"] != "select":
                 return
@@ -2373,6 +3326,24 @@ def cmd_dashboard(args):
                     self._refresh_view()
                 event.stop()
                 return
+            if getattr(event, "key", "") == "delete":
+                if self.task_mode == "new_project" and self.task_step > 0:
+                    self.task_step -= 1
+                    self.task_input = ""
+                    self.task_error = ""
+                    self._sync_task_editor()
+                    self._refresh_view()
+                    event.stop()
+                    return
+                if self.task_mode == "detail_source_add" and self.task_step > 0:
+                    self.task_step -= 1
+                    self.task_input = ""
+                    self.task_error = ""
+                    self._sync_detail_source_add_editor()
+                    self._refresh_view()
+                    event.stop()
+                    return
+                return
             if self.task_mode == "job_input":
                 ch = getattr(event, "character", None)
                 if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
@@ -2381,11 +3352,23 @@ def cmd_dashboard(args):
                 self._refresh_view()
                 event.stop()
                 return
-            if self.task_mode == "remove_confirm":
+            if self.task_mode in ("project_ssh_add_manual", "detail_edit_text"):
                 ch = getattr(event, "character", None)
                 if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
                     return
                 self.task_input += ch
+                self._refresh_view()
+                event.stop()
+                return
+            if self.task_mode == "detail_source_add":
+                step = self._detail_source_add_current_step()
+                if step is None or step["kind"] != "text":
+                    return
+                ch = getattr(event, "character", None)
+                if not ch or len(ch) != 1 or ch in ("\n", "\r", "\t"):
+                    return
+                self.task_input += ch
+                self.task_error = ""
                 self._refresh_view()
                 event.stop()
                 return
@@ -2413,10 +3396,18 @@ def cmd_dashboard(args):
                 self._refresh_view()
                 event.stop()
                 return
-            if self.task_mode == "remove_confirm":
+            if self.task_mode in ("project_ssh_add_manual", "detail_edit_text"):
                 self.task_input += pasted
                 self._refresh_view()
                 event.stop()
+                return
+            if self.task_mode == "detail_source_add":
+                step = self._detail_source_add_current_step()
+                if step is not None and step["kind"] == "text":
+                    self.task_input += pasted
+                    self.task_error = ""
+                    self._refresh_view()
+                    event.stop()
                 return
             step = self._current_task_step()
             if step is None or step["kind"] != "text":
@@ -2480,7 +3471,7 @@ def cmd_dashboard(args):
 
             if self.show_help:
                 help_text = Text(
-                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
+                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | v detail | n new\n"
                     "      tab/f focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
                     "      h toggle help | q quit"
                 )
@@ -2490,6 +3481,30 @@ def cmd_dashboard(args):
                         focus_line,
                         self._section_header("Help"),
                         help_text,
+                    )
+                )
+                return
+
+            if self.show_project_detail:
+                import dataclasses
+                dirty = (
+                    self.detail_draft is not None and self.detail_original is not None
+                    and dataclasses.is_dataclass(self.detail_draft)
+                    and dataclasses.asdict(self.detail_draft) != dataclasses.asdict(self.detail_original)
+                )
+                dirty_tag = "  * unsaved" if dirty else ""
+                detail_title = Text(
+                    f"Project Detail: {self._project_detail_name() or '-'}{dirty_tag}  (v back · w save · u revert)",
+                    style="bold",
+                )
+                view.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Project Detail"),
+                        detail_title,
+                        Text(""),
+                        self._render_project_detail(),
                     )
                 )
                 return
@@ -2652,7 +3667,7 @@ def cmd_dashboard(args):
 
             if self.show_help:
                 help_text = Text(
-                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | n new\n"
+                    "Keys: Up/Down select | Enter run | b build | s stop | a adapt | d remove | r restart | v detail | n new\n"
                     "      tab/f focus projects/jobs | o output | x cancel job | c clear completed jobs | y export output\n"
                     "      h toggle help | q quit"
                 )
@@ -2681,6 +3696,57 @@ def cmd_dashboard(args):
                     pass
                 try:
                     footer.styles.display = "block"
+                except Exception:
+                    pass
+                footer.update(Text(""))
+                return
+
+            if self.show_project_detail:
+                import dataclasses
+                dirty = (
+                    self.detail_draft is not None and self.detail_original is not None
+                    and dataclasses.is_dataclass(self.detail_draft)
+                    and dataclasses.asdict(self.detail_draft) != dataclasses.asdict(self.detail_original)
+                )
+                dirty_tag = "  * unsaved" if dirty else ""
+                detail_title = Text(
+                    f"Project Detail: {self._project_detail_name() or '-'}{dirty_tag}  (v back · w save · u revert)",
+                    style="bold",
+                )
+                header.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Project Detail"),
+                        detail_title,
+                        Text(""),
+                        self._render_project_detail(),
+                    )
+                )
+                try:
+                    projects_table.styles.display = "none"
+                except Exception:
+                    pass
+                project_summary.update(Text(""))
+                try:
+                    project_summary.styles.display = "none"
+                except Exception:
+                    pass
+                jobs_header.update(Text(""))
+                try:
+                    jobs_header.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.clear()
+                except Exception:
+                    pass
+                try:
+                    jobs_table_view.styles.display = "none"
+                except Exception:
+                    pass
+                try:
+                    footer.styles.display = "none"
                 except Exception:
                     pass
                 footer.update(Text(""))
@@ -2827,18 +3893,6 @@ def cmd_dashboard(args):
                     if len(line) > width:
                         line = line[:width]
                     return Text(line.ljust(width), style="bold black on white")
-                if self.task_mode == "remove_confirm":
-                    prefix = f"confirm remove '{self.task_remove_project}': "
-                    suffix = f"{self.task_input}|"
-                    full = prefix + suffix
-                    if len(full) <= width:
-                        return Text(full.ljust(width), style="bold black on white")
-                    keep = max(1, width - len(prefix) - 1)
-                    scrolled = "…" + suffix[-keep:]
-                    line = prefix + scrolled
-                    if len(line) > width:
-                        line = line[:width]
-                    return Text(line.ljust(width), style="bold black on white")
                 if self.task_mode == "export_choice":
                     prefix = "export output:"
                     line = Text(prefix.ljust(width), style="bold black on white")
@@ -2875,6 +3929,109 @@ def cmd_dashboard(args):
                     elif len(plain) < width:
                         rendered.append(" " * (width - len(plain)), style="black on white")
                     return Group(line, rendered)
+                if self.task_mode == "project_ssh_add":
+                    prefix = f"add SSH key to '{self.task_project_name}':"
+                    line = Text(prefix[:width].ljust(width), style="bold black on white")
+                    options = self.task_project_options or ["Manual entry...", "Cancel"]
+                    rendered = Text(style="bold black on white")
+                    for i, option in enumerate(options):
+                        if i > 0:
+                            rendered.append("  |  ", style="black on white")
+                        if i == self.task_option_index:
+                            rendered.append(f"[{option}]", style="bold white on blue")
+                        else:
+                            rendered.append(option, style="bold black on white")
+                    plain = rendered.plain
+                    if len(plain) > width:
+                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
+                    elif len(plain) < width:
+                        rendered.append(" " * (width - len(plain)), style="black on white")
+                    return Group(line, rendered)
+                if self.task_mode == "project_ssh_remove":
+                    prefix = f"remove SSH key from '{self.task_project_name}':"
+                    line = Text(prefix[:width].ljust(width), style="bold black on white")
+                    options = self.task_project_options or ["Cancel"]
+                    rendered = Text(style="bold black on white")
+                    for i, option in enumerate(options):
+                        if i > 0:
+                            rendered.append("  |  ", style="black on white")
+                        if i == self.task_option_index:
+                            rendered.append(f"[{option}]", style="bold white on blue")
+                        else:
+                            rendered.append(option, style="bold black on white")
+                    plain = rendered.plain
+                    if len(plain) > width:
+                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
+                    elif len(plain) < width:
+                        rendered.append(" " * (width - len(plain)), style="black on white")
+                    return Group(line, rendered)
+                if self.task_mode == "project_ssh_add_manual":
+                    prefix = f"SSH private key path for '{self.task_project_name}': "
+                    suffix = f"{self.task_input}|"
+                    full = prefix + suffix
+                    if len(full) <= width:
+                        return Text(full.ljust(width), style="bold black on white")
+                    keep = max(1, width - len(prefix) - 1)
+                    scrolled = "…" + suffix[-keep:]
+                    line = prefix + scrolled
+                    if len(line) > width:
+                        line = line[:width]
+                    return Text(line.ljust(width), style="bold black on white")
+                if self.task_mode == "detail_edit_text":
+                    label = self.task_values.get("field_label", "value")
+                    prefix = f"edit {label}: "
+                    suffix = f"{self.task_input}|"
+                    full = prefix + suffix
+                    if len(full) <= width:
+                        return Text(full.ljust(width), style="bold black on white")
+                    keep = max(1, width - len(prefix) - 1)
+                    scrolled = "…" + suffix[-keep:]
+                    line = (prefix + scrolled)[:width]
+                    return Text(line.ljust(width), style="bold black on white")
+                if self.task_mode in ("detail_edit_select", "detail_source_action",
+                                      "detail_ssh_action", "detail_revert"):
+                    label_map = {
+                        "detail_edit_select": f"select {self.task_values.get('field_label', 'value')}:",
+                        "detail_source_action": "source action:",
+                        "detail_ssh_action": "SSH key action:",
+                        "detail_revert": "revert to checkpoint:",
+                    }
+                    prefix = label_map.get(self.task_mode, "select:")
+                    options = self.task_project_options or []
+                    return self._render_option_panel(prefix, options, self.task_option_index, width)
+                if self.task_mode == "detail_source_add":
+                    step = self._detail_source_add_current_step()
+                    steps = self._detail_source_add_steps()
+                    if step is None:
+                        return Text("add source".ljust(width), style="bold black on white")
+                    idx = self.task_step + 1
+                    total = len(steps)
+                    if step["kind"] == "text":
+                        prefix = f"add source [{idx}/{total}] {step['label']}: "
+                        suffix = f"{self.task_input}|"
+                        show_err = bool(self.task_error)
+                        full = prefix + suffix + (f"  ({self.task_error})" if show_err else "")
+                        if len(full) <= width and not show_err:
+                            return Text(full.ljust(width), style="bold black on white")
+                        if show_err:
+                            t = Text(prefix, style="bold black on white")
+                            t.append(self.task_input + "|", style="bold black on white")
+                            t.append(f"  ({self.task_error})", style="bold red on white")
+                            if len(t.plain) < width:
+                                t.append(" " * (width - len(t.plain)), style="bold black on white")
+                            return t
+                        keep = max(1, width - len(prefix) - 1)
+                        scrolled = "…" + suffix[-keep:]
+                        return Text((prefix + scrolled)[:width].ljust(width), style="bold black on white")
+                    prompt = f"add source [{idx}/{total}] {step['label']}:"[:width - 1]
+                    options = step.get("options", [])
+                    lines = [Text(prompt.ljust(width), style="bold black on white")]
+                    for i, opt in enumerate(options):
+                        pfx = "> " if i == self.task_option_index else "  "
+                        ln = (pfx + opt)[:width - 1]
+                        style = "bold white on blue" if i == self.task_option_index else "bold black on white"
+                        lines.append(Text(ln.ljust(width), style=style))
+                    return Group(*lines)
                 step = self._current_task_step()
                 steps = self._task_steps()
                 if step is None:
@@ -2885,12 +4042,12 @@ def cmd_dashboard(args):
                 if step["kind"] == "text":
                     prefix = f"new project [{idx}/{total}] {step['label']}: "
                     suffix = f"{self.task_input}|"
-                    show_name_error = step.get("key") == "name" and bool(self.task_error)
-                    if show_name_error:
+                    show_task_error = bool(self.task_error)
+                    if show_task_error:
                         suffix = f"{suffix}  ({self.task_error})"
                     full = prefix + suffix
                     if len(full) <= width:
-                        if show_name_error:
+                        if show_task_error:
                             text = Text(prefix, style="bold black on white")
                             text.append(self.task_input + "|", style="bold black on white")
                             text.append("  ", style="bold black on white")
@@ -2926,6 +4083,24 @@ def cmd_dashboard(args):
                 text = text[: max(0, width - 1)]
             return Text(text.ljust(width), style="bold black on white")
 
+        def _render_option_panel(self, prefix: str, options: list, selected: int, width: int):
+            """Render a generic option picker in the task panel."""
+            line = Text(prefix[:width].ljust(width), style="bold black on white")
+            rendered = Text(style="bold black on white")
+            for i, option in enumerate(options):
+                if i > 0:
+                    rendered.append("  |  ", style="black on white")
+                if i == selected:
+                    rendered.append(f"[{option}]", style="bold white on blue")
+                else:
+                    rendered.append(option, style="bold black on white")
+            plain = rendered.plain
+            if len(plain) > width:
+                rendered = Text(plain[:max(0, width - 1)], style="bold black on white")
+            elif len(plain) < width:
+                rendered.append(" " * (width - len(plain)), style="black on white")
+            return Group(line, rendered)
+
         def _context_actions(self, jobs_view: list[DashboardJob]) -> list[tuple[str, str, str]]:
             if self.task_mode:
                 if self.task_mode == "job_input":
@@ -2933,12 +4108,6 @@ def cmd_dashboard(args):
                         ("type", "Reply", "bold cyan"),
                         ("⏎", "Send Input", "bold green"),
                         ("Esc", "Cancel", "bold red"),
-                    ]
-                if self.task_mode == "remove_confirm":
-                    return [
-                        ("type", "Type Project Name", "bold cyan"),
-                        ("⏎", "Confirm Remove", "bold red"),
-                        ("Esc", "Cancel", "bold yellow"),
                     ]
                 if self.task_mode == "export_choice":
                     return [
@@ -2952,10 +4121,51 @@ def cmd_dashboard(args):
                         ("⏎", "Confirm", "bold green"),
                         ("Esc", "Cancel", "bold red"),
                     ]
+                if self.task_mode in {"project_ssh_add", "project_ssh_remove"}:
+                    return [
+                        ("←/→", "Choose", "bold yellow"),
+                        ("⏎", "Confirm", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
+                if self.task_mode == "project_ssh_add_manual":
+                    return [
+                        ("type", "Edit Text", "bold cyan"),
+                        ("⏎", "Save", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
+                if self.task_mode == "detail_edit_text":
+                    return [
+                        ("type", "Edit", "bold cyan"),
+                        ("⏎", "Apply", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
+                if self.task_mode in ("detail_edit_select", "detail_source_action",
+                                      "detail_ssh_action", "detail_revert"):
+                    return [
+                        ("↑/↓", "Choose", "bold yellow"),
+                        ("⏎", "Apply", "bold green"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
+                if self.task_mode == "detail_source_add":
+                    step = self._detail_source_add_current_step()
+                    if step and step["kind"] == "text":
+                        return [
+                            ("type", "Edit", "bold cyan"),
+                            ("⏎", "Next", "bold green"),
+                            ("Del", "Back", "bold yellow"),
+                            ("Esc", "Cancel", "bold red"),
+                        ]
+                    return [
+                        ("↑/↓", "Choose", "bold yellow"),
+                        ("⏎", "Next", "bold green"),
+                        ("Del", "Back", "bold yellow"),
+                        ("Esc", "Cancel", "bold red"),
+                    ]
                 return [
                     ("←/→", "Select", "bold yellow"),
                     ("type", "Edit Text", "bold cyan"),
                     ("⏎", "Next", "bold green"),
+                    ("Del", "Back", "bold yellow"),
                     ("Esc", "Cancel", "bold red"),
                 ]
             nav = [
@@ -2984,6 +4194,32 @@ def cmd_dashboard(args):
                 return [
                     ("q", "Quit", "bold bright_black"),
                 ]
+            if self.show_project_detail:
+                import dataclasses
+                dirty = False
+                if (self.detail_draft is not None and self.detail_original is not None
+                        and dataclasses.is_dataclass(self.detail_draft)):
+                    d_d = dataclasses.asdict(self.detail_draft)
+                    o_d = dataclasses.asdict(self.detail_original)
+                    for d in (d_d, o_d):
+                        d.pop("state", None)
+                        d.pop("resources", None)
+                    dirty = d_d != o_d
+                has_checkpoints = bool(self.detail_checkpoints)
+                actions = [
+                    ("↑/↓", "Navigate", "bold white"),
+                    ("⏎", "Edit field", "bold green"),
+                    ("w", "Save *" if dirty else "Save", "bold yellow" if dirty else "bold white"),
+                    ("v", "Back", "bold cyan"),
+                ]
+                if has_checkpoints:
+                    actions.append(("u", "Revert", "bold magenta"))
+                actions += [
+                    ("b", "Build", "bold yellow"),
+                    ("s", "Stop", "bold yellow"),
+                    ("q", "Quit", "bold bright_black"),
+                ]
+                return actions
             return nav + [
                 ("⏎", "Run", "bold green"),
                 ("b", "Build", "bold yellow"),
@@ -2991,6 +4227,7 @@ def cmd_dashboard(args):
                 ("a", "Adapt", "bold cyan"),
                 ("d", "Remove", "bold red"),
                 ("r", "Restart", "bold blue"),
+                ("v", "Detail", "bold cyan"),
                 ("n", "New", "bold green"),
                 ("q", "Quit", "bold bright_black"),
             ]
@@ -3036,6 +4273,60 @@ def cmd_dashboard(args):
                     style=style,
                 )
             return table
+
+        def _render_project_detail(self):
+            project_name = self._project_detail_name()
+            if not project_name:
+                return Text("No project selected.", style="dim")
+            draft = self.detail_draft
+            if draft is None:
+                return Text("Loading…", style="dim")
+            store = ConfigStore()
+            fields = _project_detail_fields(draft, store)
+            # Determine unsaved state for header marker
+            import dataclasses
+            dirty = False
+            if self.detail_original is not None and dataclasses.is_dataclass(draft):
+                d_d = dataclasses.asdict(draft)
+                o_d = dataclasses.asdict(self.detail_original)
+                for d in (d_d, o_d):
+                    d.pop("state", None)
+                    d.pop("resources", None)
+                dirty = d_d != o_d
+            checkpoint_count = len(self.detail_checkpoints)
+            text = Text()
+            for idx, f in enumerate(fields):
+                display = f["display"]
+                is_cursor = (not self.task_mode) and f.get("editable") and idx == self.detail_cursor
+                if f.get("section"):
+                    if display.startswith("Project:") and dirty:
+                        display = display + "  *"
+                    style = "bold white"
+                elif is_cursor:
+                    style = "bold white on blue"
+                elif f.get("editable"):
+                    if f.get("action") in ("detail_save", "detail_revert"):
+                        if f["action"] == "detail_revert" and not (dirty or checkpoint_count):
+                            style = "dim"
+                        else:
+                            style = "bold cyan"
+                    else:
+                        style = "bold"
+                else:
+                    style = ""
+                prefix = "> " if is_cursor else "  " if f.get("editable") and not f.get("section") and not display.startswith("  ") else ""
+                if is_cursor and not display.startswith("  "):
+                    prefix = "> "
+                elif is_cursor:
+                    display = "> " + display[2:]  # replace leading spaces with cursor
+                    prefix = ""
+                text.append(display if prefix == "" else prefix + display, style=style)
+                if idx < len(fields) - 1:
+                    text.append("\n")
+            # Checkpoint summary line
+            if checkpoint_count:
+                text.append(f"\n  ({checkpoint_count} checkpoint{'s' if checkpoint_count != 1 else ''} available for revert)", style="dim")
+            return text
 
         def _fit_project_columns(self, columns: list[tuple[str, int]]) -> list[tuple[str, int]]:
             """Clamp project column widths to viewport width to avoid row wrapping."""
@@ -3215,10 +4506,39 @@ def cmd_dashboard(args):
             self.show_help = not self.show_help
             self._refresh_view()
 
+        def action_toggle_project_detail(self) -> None:
+            self._log_ui_event("action", name="toggle_project_detail")
+            self._toggle_project_detail()
+
+        def action_quit(self) -> None:
+            active_jobs = _active_jobs_for_quit(self.jobs.jobs)
+            if not active_jobs:
+                self._log_ui_event("action", name="quit")
+                self.exit()
+                return
+
+            now = time.monotonic()
+            if now < float(self._quit_armed_until):
+                self._log_ui_event("action", name="quit_confirmed", active_jobs=len(active_jobs))
+                self.exit()
+                return
+
+            self._quit_armed_until = now + 3.0
+            self._log_ui_event("action", name="quit_blocked", active_jobs=len(active_jobs))
+            self.message = (
+                f"warning: {len(active_jobs)} active job(s) would be orphaned; "
+                "press q again within 3s to quit anyway"
+            )
+            self._refresh_view()
+
         def action_toggle_focus(self) -> None:
             self._log_ui_event("action", name="toggle_focus")
             if self.task_mode:
                 self.focus = "task"
+                self._refresh_view()
+                return
+            if self.show_project_detail:
+                self.focus = "projects"
                 self._refresh_view()
                 return
             if self.show_job_output:
@@ -3351,8 +4671,14 @@ def cmd_dashboard(args):
                 if self.task_mode == "job_input":
                     return
                 step = self._current_task_step()
+                if self.task_mode in _PROJECT_DETAIL_TASKS:
+                    self._task_shift_option(-1)
+                    return
                 if step is not None and step["kind"] == "select":
                     self._task_shift_option(-1)
+                return
+            if self.show_project_detail:
+                self._move_detail_cursor(-1)
                 return
             self._move_cursor(-1)
 
@@ -3362,14 +4688,41 @@ def cmd_dashboard(args):
                 if self.task_mode == "job_input":
                     return
                 step = self._current_task_step()
+                if self.task_mode in _PROJECT_DETAIL_TASKS:
+                    self._task_shift_option(1)
+                    return
                 if step is not None and step["kind"] == "select":
                     self._task_shift_option(1)
                 return
+            if self.show_project_detail:
+                self._move_detail_cursor(1)
+                return
             self._move_cursor(1)
+
+        def _move_detail_cursor(self, delta: int) -> None:
+            if self.detail_draft is None:
+                return
+            store = ConfigStore()
+            fields = _project_detail_fields(self.detail_draft, store)
+            editable = [i for i, f in enumerate(fields) if f.get("editable")]
+            if not editable:
+                return
+            cur = self.detail_cursor
+            if cur in editable:
+                pos = editable.index(cur)
+            else:
+                pos = 0
+            pos = (pos + delta) % len(editable)
+            self.detail_cursor = editable[pos]
+            self._refresh_view()
 
         def _run_selected(self, action_key: str) -> None:
             if self.task_mode:
                 self._task_submit_step()
+                return
+            if self.show_project_detail and action_key == "run":
+                # In detail view, Enter activates the field at the cursor
+                self._activate_detail_field()
                 return
             if self.show_job_output or self.focus != "projects":
                 self.message = "project actions are available only in projects view"
@@ -3513,16 +4866,48 @@ def cmd_dashboard(args):
                 self.message = f"project '{project_name}' is running; stop it before remove"
                 self._refresh_view()
                 return
-            self._start_remove_confirm_task(project_name)
+            lock_msg = _lock_block_message(project_name, "remove")
+            if lock_msg:
+                self.message = lock_msg
+                self._refresh_view()
+                return
+            job, error = _enqueue_remove_job(self.jobs, project_name)
+            if job is None:
+                self.message = error
+            else:
+                self.message = f"queued job #{job.job_id}: remove {project_name}"
+                self.show_job_output = False
+                self.selected_job = 0
             self._refresh_view()
 
         def action_restart_selected(self) -> None:
             self._log_ui_event("action", name="restart_selected")
             self._run_selected("restart")
 
+        def action_add_project_ssh(self) -> None:
+            self._log_ui_event("action", name="add_project_ssh")
+            if self.task_mode:
+                self._refresh_view()
+                return
+            if not self.show_project_detail:
+                self.message = "SSH key add is available only in project detail"
+                self._refresh_view()
+                return
+            project_name = self._project_detail_name()
+            if not project_name:
+                self.message = "no project selected"
+                self._refresh_view()
+                return
+            self._start_project_ssh_add_task(project_name)
+            self._refresh_view()
+
         def action_new_project(self) -> None:
             self._log_ui_event("action", name="new_project")
             if self.task_mode:
+                self._refresh_view()
+                return
+            if self.show_project_detail:
+                self.message = "return to the project list before creating a new project"
                 self._refresh_view()
                 return
             if self.show_job_output or self.focus not in ("projects", "jobs"):
@@ -3564,6 +4949,15 @@ def cmd_dashboard(args):
 
         def action_cancel_job(self) -> None:
             self._log_ui_event("action", name="cancel_job")
+            if self.show_project_detail and not self.task_mode:
+                project_name = self._project_detail_name()
+                if not project_name:
+                    self.message = "no project selected"
+                    self._refresh_view()
+                    return
+                self._start_project_ssh_remove_task(project_name)
+                self._refresh_view()
+                return
             if self.focus != "jobs" and not self.show_job_output:
                 self.message = "switch focus to jobs to cancel jobs"
                 self._refresh_view()
@@ -3712,6 +5106,12 @@ def cmd_dashboard(args):
         def action_task_cancel(self) -> None:
             self._log_ui_event("action", name="task_cancel")
             if not self.task_mode:
+                if self.show_project_detail:
+                    self._toggle_project_detail()
+                return
+            if self.task_mode in _PROJECT_DETAIL_TASKS:
+                self._task_cancel(f"edit cancelled")
+                self._refresh_view()
                 return
             if self.task_mode == "job_input":
                 self.task_mode = ""
@@ -3720,16 +5120,14 @@ def cmd_dashboard(args):
                 self.message = "job input cancelled"
                 self._refresh_view()
                 return
-            if self.task_mode == "remove_confirm":
-                self._task_cancel("remove cancelled")
-                self._refresh_view()
-                return
             if self.task_mode == "adapt_discover":
                 self._task_cancel("adapt cancelled")
                 self._refresh_view()
                 return
             self._task_cancel()
             self._refresh_view()
+
+    _set_terminal_title("<<< skua >>>")
 
     app = DashboardApp(args)
     try:
