@@ -16,12 +16,14 @@ from types import SimpleNamespace
 
 from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
+from skua.config.resources import ssh_private_keys
 from skua.docker import (
     is_container_running,
     exec_into_container,
     build_run_command,
     build_image,
     ensure_agent_base_image,
+    effective_project_image,
     image_exists,
     image_name_for_project,
     project_uses_agent_base_layer,
@@ -282,7 +284,8 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
     ssh_cmd_parts = ["ssh", "-o", "StrictHostKeyChecking=accept-new"]
     key_var = ""
     known_hosts_var = ""
-    key_path_value = str(getattr(project.ssh, "private_key", "") or "").strip()
+    keys = ssh_private_keys(project.ssh)
+    key_path_value = str(keys[0] if keys else "").strip()
     if key_path_value:
         key_path = Path(key_path_value).expanduser()
         if key_path.is_file():
@@ -347,7 +350,7 @@ def _project_sources(project) -> list:
         directory=project.directory,
         repo=project.repo,
         host=getattr(project, "host", "") or "",
-        ssh_private_key=getattr(project.ssh, "private_key", "") or "",
+        ssh_private_key=(ssh_private_keys(project.ssh)[0] if ssh_private_keys(project.ssh) else ""),
         mount_path=_project_mount_path(project),
         primary=True,
     )]
@@ -606,6 +609,29 @@ def _credential_file_expiry(path: Path):
     return min(expiries) if expiries else None
 
 
+def _credential_file_has_refresh_token(path: Path) -> bool:
+    """Return True when a JSON credential file contains a non-empty refresh token."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+    def _walk(obj) -> bool:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_l = str(key).strip().lower()
+                if key_l in {"refresh_token", "refreshtoken"} and str(value or "").strip():
+                    return True
+                if _walk(value):
+                    return True
+            return False
+        if isinstance(obj, list):
+            return any(_walk(item) for item in obj)
+        return False
+
+    return _walk(data)
+
+
 def _credential_refresh_reason(cred, agent, now=None) -> str:
     """Return a reason to refresh local credentials, or empty string if healthy/unknown."""
     now = now or datetime.now(timezone.utc)
@@ -621,6 +647,8 @@ def _credential_refresh_reason(cred, agent, now=None) -> str:
     stale = []
     for src, dest_name in existing:
         expiry = _credential_file_expiry(src)
+        if expiry and _credential_file_has_refresh_token(src):
+            continue
         if expiry and expiry <= stale_cutoff:
             stale.append((dest_name, expiry))
 
@@ -695,7 +723,7 @@ def _detached_run_command(docker_cmd: list) -> list:
         'start_dir="${SKUA_PROJECT_DIR:-/home/dev/project}"; '
         '[ -d "$start_dir" ] || start_dir="/home/dev"; '
         'if ! tmux has-session -t "$session" 2>/dev/null; then '
-        '  tmux new-session -d -s "$session" -c "$start_dir" /bin/bash; '
+        '  tmux new-session -d -s "$session" -c "$start_dir" "exec /bin/bash -i"; '
         "fi; "
         'while tmux has-session -t "$session" 2>/dev/null; do sleep 1; done'
     )
@@ -805,7 +833,6 @@ def cmd_run(args, lock_project: bool = True):
     # Determine image name
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
-    image_name = image_name_for_project(image_name_base, project)
     base_image = g.get("baseImage", "debian:bookworm-slim")
     defaults = g.get("defaults", {})
     build_security_name = defaults.get("security", "open")
@@ -813,81 +840,99 @@ def cmd_run(args, lock_project: bool = True):
     image_config = g.get("image", {})
     global_extra_packages = image_config.get("extraPackages", [])
     global_extra_commands = image_config.get("extraCommands", [])
-    resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
-        default_base_image=base_image,
-        agent=agent,
-        project=project,
-        global_extra_packages=global_extra_packages,
-        global_extra_commands=global_extra_commands,
-        image_name_base=image_name_base,
-    )
-    container_dir = store.get_container_dir()
-    layered_project = project_uses_agent_base_layer(project)
-    if layered_project:
-        if container_dir is None:
-            print("Error: Cannot find container build assets (entrypoint.sh).")
-            print("Set toolDir in global.yaml or reinstall skua.")
+    image_name = effective_project_image(image_name_base, project, global_extra_packages, global_extra_commands)
+
+    # When from_image is the effective image (prebuilt default, no extras layered on top),
+    # skip the entire build pipeline — just verify the image exists.
+    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == project_from_image:
+        if not image_exists(image_name):
+            print(f"Error: default image '{image_name}' not found locally.")
+            print("Rebuild it with: skua default-image build <name>")
+            print("Or re-save it with: skua default-image save <source> <name>")
             sys.exit(1)
-        _, success, _, reason = ensure_agent_base_image(
-            container_dir=container_dir,
-            image_name_base=image_name_base,
+    else:
+        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
             default_base_image=base_image,
-            security=build_security,
             agent=agent,
+            project=project,
             global_extra_packages=global_extra_packages,
             global_extra_commands=global_extra_commands,
-            quiet=True,
+            image_name_base=image_name_base,
         )
-        if not success:
-            print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
-            if reason:
-                print(reason)
-            sys.exit(1)
-
-    needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
-        image_name=image_name,
-        container_dir=container_dir,
-        security=build_security,
-        agent=agent,
-        base_image=resolved_base_image,
-        extra_packages=extra_packages,
-        extra_commands=extra_commands,
-        layer_on_base=layered_project,
-    )
-    if not image_exists(image_name):
-        print(f"Image '{image_name}' not found for agent '{project.agent}'.")
-        print("Building image lazily...")
-    elif force_refresh:
-        print(f"Image '{image_name}' has an available client update: {rebuild_reason}.")
-        print("Rebuilding lazily without Docker cache...")
-    elif needs_rebuild and rebuild_reason:
-        print(f"Image '{image_name}' is out-of-date ({rebuild_reason}); rebuilding lazily...")
-    elif container_dir is None:
-        print("Warning: Cannot verify image build context (missing container assets).")
-        print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
-
-    if needs_rebuild:
         container_dir = store.get_container_dir()
-        if container_dir is None:
-            print("Error: Cannot find container build assets (entrypoint.sh).")
-            print("Set toolDir in global.yaml or reinstall skua.")
-            sys.exit(1)
+        layered_project = project_uses_agent_base_layer(project)
+        if layered_project:
+            if container_dir is None:
+                print("Error: Cannot find container build assets (entrypoint.sh).")
+                print("Set toolDir in global.yaml or reinstall skua.")
+                sys.exit(1)
+            _, success, _, reason = ensure_agent_base_image(
+                container_dir=container_dir,
+                image_name_base=image_name_base,
+                default_base_image=base_image,
+                security=build_security,
+                agent=agent,
+                global_extra_packages=global_extra_packages,
+                global_extra_commands=global_extra_commands,
+                quiet=True,
+            )
+            if not success:
+                print(f"Error: failed to prepare shared agent image for '{project.agent}'.")
+                if reason:
+                    print(reason)
+                sys.exit(1)
+            if not image_exists(resolved_base_image):
+                print(
+                    f"Error: shared agent image '{resolved_base_image}' is still missing "
+                    f"after prepare step for project '{project.name}'."
+                )
+                sys.exit(1)
 
-        success, _ = build_image(
-            container_dir=container_dir,
+        needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
             image_name=image_name,
+            container_dir=container_dir,
             security=build_security,
             agent=agent,
             base_image=resolved_base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
-            pull=force_refresh,
-            no_cache=force_refresh,
             layer_on_base=layered_project,
         )
-        if not success:
-            print(f"Error: failed to build image '{image_name}'.")
-            sys.exit(1)
+        if not image_exists(image_name):
+            print(f"Image '{image_name}' not found for agent '{project.agent}'.")
+            print("Building image lazily...")
+        elif force_refresh:
+            print(f"Image '{image_name}' has an available client update: {rebuild_reason}.")
+            print("Rebuilding lazily without Docker cache...")
+        elif needs_rebuild and rebuild_reason:
+            print(f"Image '{image_name}' is out-of-date ({rebuild_reason}); rebuilding lazily...")
+        elif container_dir is None:
+            print("Warning: Cannot verify image build context (missing container assets).")
+            print("  Reusing existing image; run 'skua build <name>' after reinstall to refresh.")
+
+        if needs_rebuild:
+            container_dir = store.get_container_dir()
+            if container_dir is None:
+                print("Error: Cannot find container build assets (entrypoint.sh).")
+                print("Set toolDir in global.yaml or reinstall skua.")
+                sys.exit(1)
+
+            success, _ = build_image(
+                container_dir=container_dir,
+                image_name=image_name,
+                security=build_security,
+                agent=agent,
+                base_image=resolved_base_image,
+                extra_packages=extra_packages,
+                extra_commands=extra_commands,
+                pull=force_refresh,
+                no_cache=force_refresh,
+                layer_on_base=layered_project,
+            )
+            if not success:
+                print(f"Error: failed to build image '{image_name}'.")
+                sys.exit(1)
 
     # Build persistence path
     data_dir = store.project_data_dir(name, project.agent)
@@ -899,19 +944,14 @@ def cmd_run(args, lock_project: bool = True):
         if cred is None:
             print(f"Warning: Credential '{project.credential}' not found.")
 
+    # Resolve credential sources for live mounting
+    cred_sources = resolve_credential_sources(cred, agent)
+
     # Seed/sync persisted auth files from host if needed
     if env.persistence.mode == "bind":
         data_dir.mkdir(parents=True, exist_ok=True)
-        refreshed = _maybe_refresh_local_credentials(agent=agent, cred=cred)
-        copied = _seed_auth_from_host(
-            data_dir=data_dir,
-            cred=cred,
-            agent=agent,
-            overwrite=refreshed,
-        )
-        if copied:
-            action = "Synced" if refreshed else "Seeded"
-            print(f"{action} {copied} auth file(s).")
+        _maybe_refresh_local_credentials(agent=agent, cred=cred)
+        # Credential files are live-mounted into the container — no copy needed
     elif host:
         refreshed = _maybe_refresh_local_credentials(agent=agent, cred=cred)
         copied = _seed_auth_into_remote_volume(
@@ -935,6 +975,7 @@ def cmd_run(args, lock_project: bool = True):
         data_dir=data_dir,
         repo_volume=repo_volume,
         source_mounts=source_mounts,
+        cred_sources=cred_sources,
     )
 
     # Print summary

@@ -236,6 +236,36 @@ class TestAddCredentialSelection(unittest.TestCase):
         mock_choose_key.assert_called_once_with("/tmp/default-key")
 
 
+class TestListAdaptStatus(unittest.TestCase):
+    def test_shared_directory_projects_share_pending_marker_from_request_status(self):
+        from skua.commands.list_cmd import _has_pending_adapt_request
+        from skua.project_adapt import ensure_adapt_workspace
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "repo"
+            project_dir.mkdir()
+            ensure_adapt_workspace(project_dir, "demo", "codex")
+            (project_dir / ".skua" / "image-request.yaml").write_text(
+                yaml.dump(
+                    {
+                        "schemaVersion": 1,
+                        "status": "applied",
+                        "packages": ["git"],
+                    },
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+            )
+
+            first = Project(name="demo-a", directory=str(project_dir))
+            second = Project(name="demo-b", directory=str(project_dir))
+            second.image.extra_packages = ["git"]
+
+            self.assertFalse(_has_pending_adapt_request(first))
+            self.assertFalse(_has_pending_adapt_request(second))
+
+
 class TestProjectSSHCommand(unittest.TestCase):
     @mock.patch("skua.commands.ssh_cmd.ConfigStore")
     def test_ssh_add_updates_existing_project_with_explicit_key(self, MockStore):
@@ -243,7 +273,7 @@ class TestProjectSSHCommand(unittest.TestCase):
 
         store = MockStore.return_value
         store.is_initialized.return_value = True
-        project = Project(name="demo", ssh=ProjectSshSpec(private_key=""))
+        project = Project(name="demo", ssh=ProjectSshSpec(private_key="", private_keys=[]))
         store.load_project.return_value = project
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -255,23 +285,23 @@ class TestProjectSSHCommand(unittest.TestCase):
                     action="add",
                     name="demo",
                     ssh_key=str(key_path),
-                    clear=False,
                     no_prompt=True,
                 )
             )
 
         saved = store.save_resource.call_args.args[0]
         self.assertEqual(saved.ssh.private_key, str(key_path.resolve()))
+        self.assertEqual(saved.ssh.private_keys, [str(key_path.resolve())])
 
     @mock.patch("skua.commands.ssh_cmd.choose_ssh_key", return_value="")
     @mock.patch("skua.commands.ssh_cmd.ConfigStore")
-    def test_ssh_add_uses_selector_and_can_clear_key(self, MockStore, mock_choose_key):
+    def test_ssh_add_uses_selector_and_noops_when_empty(self, MockStore, mock_choose_key):
         from skua.commands.ssh_cmd import cmd_ssh
 
         store = MockStore.return_value
         store.is_initialized.return_value = True
         store.get_global_defaults.return_value = {"sshKey": "/tmp/default-key"}
-        project = Project(name="demo", ssh=ProjectSshSpec(private_key="/tmp/project-key"))
+        project = Project(name="demo", ssh=ProjectSshSpec(private_key="/tmp/project-key", private_keys=["/tmp/project-key"]))
         store.load_project.return_value = project
 
         cmd_ssh(
@@ -279,14 +309,12 @@ class TestProjectSSHCommand(unittest.TestCase):
                 action="add",
                 name="demo",
                 ssh_key="",
-                clear=False,
                 no_prompt=False,
             )
         )
 
         mock_choose_key.assert_called_once_with("/tmp/project-key")
-        saved = store.save_resource.call_args.args[0]
-        self.assertEqual(saved.ssh.private_key, "")
+        store.save_resource.assert_not_called()
 
     @mock.patch("skua.commands.ssh_cmd.ConfigStore")
     def test_ssh_add_requires_value_when_no_prompt(self, MockStore):
@@ -294,7 +322,7 @@ class TestProjectSSHCommand(unittest.TestCase):
 
         store = MockStore.return_value
         store.is_initialized.return_value = True
-        store.load_project.return_value = Project(name="demo", ssh=ProjectSshSpec(private_key=""))
+        store.load_project.return_value = Project(name="demo", ssh=ProjectSshSpec(private_key="", private_keys=[]))
 
         with self.assertRaises(SystemExit) as ctx:
             cmd_ssh(
@@ -302,12 +330,89 @@ class TestProjectSSHCommand(unittest.TestCase):
                     action="add",
                     name="demo",
                     ssh_key="",
-                    clear=False,
                     no_prompt=True,
                 )
             )
 
         self.assertEqual(ctx.exception.code, 1)
+
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_list_displays_all_keys(self, MockStore):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_project.return_value = Project(
+            name="demo",
+            ssh=ProjectSshSpec(
+                private_key="/tmp/key-a",
+                private_keys=["/tmp/key-a", "/tmp/key-b"],
+            ),
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_ssh(argparse.Namespace(action="list", name="demo"))
+
+        out = buf.getvalue()
+        self.assertIn("/tmp/key-a (primary)", out)
+        self.assertIn("/tmp/key-b", out)
+
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_remove_deletes_selected_key_and_promotes_next(self, MockStore):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_project.return_value = Project(
+            name="demo",
+            ssh=ProjectSshSpec(
+                private_key="/tmp/key-a",
+                private_keys=["/tmp/key-a", "/tmp/key-b"],
+            ),
+        )
+
+        cmd_ssh(
+            argparse.Namespace(
+                action="remove",
+                name="demo",
+                ssh_key="/tmp/key-a",
+                all=False,
+                no_prompt=True,
+            )
+        )
+
+        saved = store.save_resource.call_args.args[0]
+        self.assertEqual(saved.ssh.private_key, "/tmp/key-b")
+        self.assertEqual(saved.ssh.private_keys, ["/tmp/key-b"])
+
+    @mock.patch("skua.commands.ssh_cmd.ConfigStore")
+    def test_ssh_remove_all_clears_keys(self, MockStore):
+        from skua.commands.ssh_cmd import cmd_ssh
+
+        store = MockStore.return_value
+        store.is_initialized.return_value = True
+        store.load_project.return_value = Project(
+            name="demo",
+            ssh=ProjectSshSpec(
+                private_key="/tmp/key-a",
+                private_keys=["/tmp/key-a", "/tmp/key-b"],
+            ),
+        )
+
+        cmd_ssh(
+            argparse.Namespace(
+                action="remove",
+                name="demo",
+                ssh_key="",
+                all=True,
+                no_prompt=True,
+            )
+        )
+
+        saved = store.save_resource.call_args.args[0]
+        self.assertEqual(saved.ssh.private_key, "")
+        self.assertEqual(saved.ssh.private_keys, [])
 
     @mock.patch("skua.commands.add.select_option", return_value="zcred")
     def test_interactive_credential_prompt_uses_selector(self, mock_select):
@@ -641,6 +746,18 @@ class TestListColumns(unittest.TestCase):
 
 
 class TestAgentActivityFormatting(unittest.TestCase):
+    @mock.patch("skua.commands.list_cmd.time.time", return_value=1700000400)
+    @mock.patch("skua.commands.list_cmd.subprocess.run")
+    def test_api_activity_with_stale_timestamp_returns_idle(self, mock_run, _mock_time):
+        from skua.commands.list_cmd import _agent_activity
+
+        mock_run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout='{"state":"api_activity","hits":350,"window":30,"ts":1700000000}\n',
+        )
+
+        self.assertEqual("idle", _agent_activity("skua-demo"))
+
     @mock.patch("skua.commands.list_cmd.subprocess.run")
     def test_api_activity_below_threshold_returns_idle(self, mock_run):
         from skua.commands.list_cmd import _agent_activity
@@ -661,7 +778,7 @@ class TestAgentActivityFormatting(unittest.TestCase):
             stdout='{"state":"api_activity","hits":250,"window":30,"ts":123}\n',
         )
 
-        self.assertEqual("XX", _agent_activity("skua-demo"))
+        self.assertEqual("██", _agent_activity("skua-demo"))
 
     @mock.patch("skua.commands.list_cmd.subprocess.run")
     def test_api_activity_caps_bar_width(self, mock_run):
@@ -672,7 +789,7 @@ class TestAgentActivityFormatting(unittest.TestCase):
             stdout='{"state":"api_activity","hits":1000,"window":30,"ts":123}\n',
         )
 
-        self.assertEqual("XXXXXX", _agent_activity("skua-demo"))
+        self.assertEqual("██████", _agent_activity("skua-demo"))
 
     @mock.patch("skua.commands.list_cmd.subprocess.run")
     def test_processing_state_has_priority(self, mock_run):

@@ -243,57 +243,41 @@ class TestCompositeProjects(unittest.TestCase):
         self.assertIn("SKUA_PROJECT_DIR=/home/dev/a", joined)
         self.assertIn('SKUA_PROJECT_SOURCES=[{"name":"a","path":"/home/dev/a","primary":true},{"name":"b","path":"/home/dev/b","primary":false}]', joined)
 
-    def test_merge_command_uses_master_defaults_and_unions_image_requirements(self):
-        from skua.commands.merge import cmd_merge
+    def test_source_add_appends_source_and_keeps_primary(self):
+        from skua.commands.source_cmd import cmd_source_add, explicit_sources
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ConfigStore(config_dir=Path(tmpdir))
             store.ensure_dirs()
             store.save_global({"defaults": {}})
-            store.save_resource(Project(
-                name="alpha",
-                directory="/src/alpha",
-                environment="env-a",
-                security="secure-a",
-                agent="claude",
-                credential="cred-a",
-                image=ProjectImageSpec(
-                    base_image="debian:bookworm-slim",
-                    extra_packages=["git", "jq"],
-                    extra_commands=["echo alpha"],
-                ),
-            ))
-            store.save_resource(Project(
-                name="beta",
-                directory="/src/beta",
-                environment="env-b",
-                security="secure-b",
-                agent="codex",
-                credential="cred-b",
-                image=ProjectImageSpec(
-                    from_image="ghcr.io/example/beta:latest",
-                    extra_packages=["curl", "jq"],
-                    extra_commands=["echo beta"],
-                ),
-            ))
+            store.save_resource(Project(name="alpha", directory="/src/alpha", agent="claude"))
 
-            with mock.patch("skua.commands.merge.ConfigStore", return_value=store):
-                args = argparse.Namespace(name="combo", projects=["alpha", "beta"], master="alpha")
-                cmd_merge(args)
+            with (
+                mock.patch("skua.commands.source_cmd.ConfigStore", return_value=store),
+                mock.patch("pathlib.Path.is_dir", return_value=True),
+            ):
+                args = argparse.Namespace(
+                    name="alpha",
+                    dir="/src/beta",
+                    repo=None,
+                    source_name="beta",
+                    mount_path="",
+                    primary=False,
+                    ssh_key="",
+                    host="",
+                )
+                cmd_source_add(args)
 
-            merged = store.load_project("combo")
-            self.assertIsNotNone(merged)
-            self.assertEqual(merged.master_project, "alpha")
-            self.assertEqual(merged.environment, "env-a")
-            self.assertEqual(merged.security, "secure-a")
-            self.assertEqual(merged.agent, "claude")
-            self.assertEqual(merged.credential, "cred-a")
-            self.assertEqual(merged.image.base_image, "debian:bookworm-slim")
-            self.assertEqual(merged.image.from_image, "")
-            self.assertEqual(merged.image.extra_packages, ["git", "jq", "curl"])
-            self.assertEqual(merged.image.extra_commands, ["echo alpha", "echo beta"])
-            self.assertEqual(len(merged.sources), 2)
-            self.assertTrue(any(source.primary for source in merged.sources))
+            updated = store.load_project("alpha")
+            self.assertIsNotNone(updated)
+            sources = explicit_sources(updated)
+            self.assertEqual(len(sources), 2)
+            names = [getattr(s, "name", "") for s in sources]
+            self.assertIn("beta", names)
+            # First source should still be primary
+            self.assertTrue(any(getattr(s, "primary", False) for s in sources))
+            primary_src = next(s for s in sources if getattr(s, "primary", False))
+            self.assertEqual(getattr(primary_src, "name", ""), "alpha")
 
 
 class TestBuildRequiredProjects(unittest.TestCase):
@@ -398,6 +382,28 @@ class TestDockerfileAgentInstall(unittest.TestCase):
         dockerfile = generate_dockerfile(agent=AgentConfig(name="claude"))
         self.assertIn("tmux", dockerfile)
 
+    def test_generate_dockerfile_renders_multiline_extra_commands_as_single_run(self):
+        from skua.docker import generate_dockerfile
+
+        dockerfile = generate_dockerfile(
+            agent=AgentConfig(name="claude"),
+            extra_commands=["mkdir -p /tmp/demo\nln -sf /tmp/demo /tmp/demo-link"],
+        )
+
+        self.assertIn("RUN set -eux; \\\n    mkdir -p /tmp/demo; \\\n    ln -sf /tmp/demo /tmp/demo-link", dockerfile)
+        self.assertNotIn("\nln -sf /tmp/demo /tmp/demo-link\n", dockerfile)
+
+    def test_generate_project_overlay_dockerfile_renders_multiline_commands_as_single_run(self):
+        from skua.docker import generate_project_overlay_dockerfile
+
+        dockerfile = generate_project_overlay_dockerfile(
+            base_image="skua-base-claude",
+            extra_commands=["mkdir -p /tmp/demo\nln -sf /tmp/demo /tmp/demo-link"],
+        )
+
+        self.assertIn("RUN set -eux; \\\n    mkdir -p /tmp/demo; \\\n    ln -sf /tmp/demo /tmp/demo-link", dockerfile)
+        self.assertNotIn("\nln -sf /tmp/demo /tmp/demo-link\n", dockerfile)
+
     def test_resolve_project_image_inputs_layers_extra_project_customizations_on_agent_image(self):
         from skua.docker import resolve_project_image_inputs
 
@@ -442,6 +448,37 @@ class TestDockerfileAgentInstall(unittest.TestCase):
                 agent=AgentConfig(name="claude"),
             )
             self.assertNotEqual(h1, h2)
+
+    @mock.patch("skua.docker.Path.home")
+    def test_build_context_hash_ignores_claude_settings_local_json(self, mock_home):
+        from skua.docker import compute_build_context_hash
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            container_dir = root / "container"
+            container_dir.mkdir()
+            (container_dir / "entrypoint.sh").write_text("#!/bin/bash\necho stable\n")
+
+            home = root / "home"
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(parents=True)
+            (claude_dir / "settings.json").write_text('{"theme":"x"}')
+            (claude_dir / "settings.local.json").write_text('{"hooks":{"PreToolUse":[]}}')
+            mock_home.return_value = home
+
+            h1 = compute_build_context_hash(
+                container_dir=container_dir,
+                security=SecurityProfile(name="open"),
+                agent=AgentConfig(name="claude"),
+            )
+            (claude_dir / "settings.local.json").write_text('{"hooks":{"PreToolUse":[{"matcher":".*"}]}}')
+            h2 = compute_build_context_hash(
+                container_dir=container_dir,
+                security=SecurityProfile(name="open"),
+                agent=AgentConfig(name="claude"),
+            )
+
+            self.assertEqual(h1, h2)
 
     @mock.patch("skua.docker._local_image_id")
     def test_build_context_hash_changes_when_layer_base_image_changes(self, mock_image_id):
@@ -529,6 +566,37 @@ class TestRunCommandEnv(unittest.TestCase):
             cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
             joined = " ".join(cmd)
             self.assertIn("SKUA_CREDENTIAL_NAME=cred-main", joined)
+            self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
+
+    def test_build_run_command_mounts_multiple_ssh_keys(self):
+        from skua.docker import build_run_command
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_a = Path(tmpdir) / "id_ed25519"
+            key_b = Path(tmpdir) / "id_rsa"
+            key_a.write_text("key-a")
+            key_b.write_text("key-b")
+            project = Project(
+                name="p1",
+                directory="",
+                agent="codex",
+                ssh=ProjectSshSpec(
+                    private_key=str(key_a),
+                    private_keys=[str(key_a), str(key_b)],
+                ),
+            )
+            env = Environment(name="local-docker")
+            sec = SecurityProfile(name="open")
+            agent = AgentConfig(
+                name="codex",
+                runtime=AgentRuntimeSpec(command="codex"),
+                auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
+            )
+            data_dir = Path(tmpdir) / "data"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            joined = " ".join(cmd)
+            self.assertIn(f"{key_a}:/home/dev/.ssh-mount/id_ed25519:ro", joined)
+            self.assertIn(f"{key_b}:/home/dev/.ssh-mount/id_rsa:ro", joined)
             self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
 
     def test_build_run_command_remote_host_embeds_ssh_material(self):
@@ -683,7 +751,7 @@ class TestRunCommandEnv(unittest.TestCase):
         self.assertEqual(detached[-2], "-lc")
         self.assertIn("tmux", detached[-1])
         self.assertIn("tmux new-session -d -s", detached[-1])
-        self.assertIn("/bin/bash", detached[-1])
+        self.assertIn("/bin/bash -i", detached[-1])
         self.assertNotIn("/tmp/skua-entrypoint-info.txt", detached[-1])
         self.assertNotIn("tmux send-keys", detached[-1])
 
@@ -810,6 +878,31 @@ class TestBuildCommandImageDrift(unittest.TestCase):
         self.assertTrue(mock_rebuild_needed.call_args.kwargs["layer_on_base"])
         self.assertTrue(mock_build.call_args.kwargs["layer_on_base"])
         self.assertEqual("skua-base-codex", mock_build.call_args.kwargs["base_image"])
+
+    @mock.patch("skua.commands.build.ensure_agent_base_image")
+    @mock.patch("skua.commands.build.build_image")
+    @mock.patch("skua.commands.build.image_rebuild_needed")
+    @mock.patch("skua.commands.build.image_exists")
+    @mock.patch("skua.commands.build.ConfigStore")
+    def test_build_fails_early_when_layer_base_still_missing_after_prepare(
+        self, MockStore, mock_exists, mock_rebuild_needed, mock_build, mock_ensure_base
+    ):
+        from skua.commands.build import cmd_build
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store, project = self._setup_store(tmpdir)
+            project.image = ProjectImageSpec(extra_packages=["make"])
+            MockStore.return_value = store
+            store.resolve_project.return_value = project
+            mock_exists.side_effect = [False]
+            mock_rebuild_needed.return_value = (True, False, "build context changed")
+            mock_ensure_base.return_value = ("skua-base-codex", True, False, "")
+
+            with self.assertRaises(SystemExit) as exc:
+                cmd_build(argparse.Namespace(name="proj", verbose=False), lock_project=False)
+
+        self.assertEqual(1, exc.exception.code)
+        mock_build.assert_not_called()
 
 
 class TestAgentInstallRefresh(unittest.TestCase):
@@ -967,6 +1060,7 @@ class TestAgentInstallRefresh(unittest.TestCase):
         self.assertTrue(success)
         docker_cmd = mock_run.call_args_list[0].args[0]
         self.assertEqual("skua-test-proj", docker_cmd[-2])
+        self.assertTrue(_mock_hash.call_args.kwargs["layer_on_base"])
 
     @mock.patch("skua.docker.image_exists", return_value=False)
     def test_image_rebuild_needed_when_image_missing(self, _mock_exists):
@@ -1011,6 +1105,7 @@ class TestContainerAttachCommand(unittest.TestCase):
         joined = " ".join(args)
         self.assertIn('tmux attach-session -t "$session"', joined)
         self.assertIn('/home/dev/.entrypoint.d/tmux-attach-banner.sh', joined)
+        self.assertIn('/bin/bash -i', joined)
         self.assertNotIn("tmux send-keys", joined)
 
 
@@ -1165,6 +1260,28 @@ class TestCredentialRefreshChecks(unittest.TestCase):
             auth = Path(tmpdir) / "auth.json"
             token = self._jwt({"exp": 4070908800})  # 2099-01-01T00:00:00Z
             auth.write_text(json.dumps({"tokens": {"id_token": token}}))
+            mock_sources.return_value = [(auth, "auth.json")]
+            reason = _credential_refresh_reason(
+                cred=None,
+                agent=self._agent(),
+                now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            self.assertEqual(reason, "")
+
+    @mock.patch("skua.commands.run.resolve_credential_sources")
+    def test_refresh_reason_ignores_expired_tokens_when_refresh_token_exists(self, mock_sources):
+        from skua.commands.run import _credential_refresh_reason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            auth = Path(tmpdir) / "auth.json"
+            expired = self._jwt({"exp": 946684800})  # 2000-01-01T00:00:00Z
+            auth.write_text(json.dumps({
+                "tokens": {
+                    "access_token": expired,
+                    "id_token": expired,
+                    "refresh_token": "refresh-token-value",
+                }
+            }))
             mock_sources.return_value = [(auth, "auth.json")]
             reason = _credential_refresh_reason(
                 cred=None,

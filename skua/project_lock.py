@@ -39,6 +39,26 @@ def project_operation_state(project) -> str:
     return str(getattr(state, "status", "") or "").strip()
 
 
+def _lock_is_held(store: ConfigStore, project_name: str) -> bool:
+    """Return True when the project's flock is currently held by any process."""
+    lock_path = _lock_file_path(store, project_name)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fd.close()
+    return False
+
+
 def _project_state_details(project) -> tuple[str, str, str]:
     state = getattr(project, "state", None)
     if state is None:
@@ -86,7 +106,7 @@ def _set_project_state(store: ConfigStore, project_name: str, operation: str, ow
     store.save_resource(project)
 
 
-def _clear_project_state(store: ConfigStore, project_name: str, owner: str) -> None:
+def _clear_project_state(store: ConfigStore, project_name: str, owner: str, force: bool = False) -> None:
     project = store.load_project(project_name)
     if project is None:
         return
@@ -94,12 +114,36 @@ def _clear_project_state(store: ConfigStore, project_name: str, owner: str) -> N
     if state is None:
         return
     current_owner = str(getattr(state, "lock_owner", "") or "").strip()
-    if current_owner and current_owner != owner:
+    if not force and current_owner and current_owner != owner:
         return
     state.status = ""
     state.lock_owner = ""
     state.lock_acquired_at = ""
     store.save_resource(project)
+
+
+def effective_project_operation_state(store: ConfigStore | None, project) -> str:
+    """Return the live project operation state, clearing stale persisted state."""
+    operation = project_operation_state(project)
+    if not operation:
+        return ""
+    project_name = str(getattr(project, "name", "") or "").strip()
+    config_dir = getattr(store, "config_dir", None)
+    if store is None or not isinstance(config_dir, Path) or not project_name:
+        return operation
+    try:
+        locked = _lock_is_held(store, project_name)
+    except OSError:
+        return operation
+    if locked:
+        return operation
+    _clear_project_state(store, project_name, "", force=True)
+    state = getattr(project, "state", None)
+    if state is not None:
+        state.status = ""
+        state.lock_owner = ""
+        state.lock_acquired_at = ""
+    return ""
 
 
 def project_busy_error_if_locked(store: ConfigStore, project_name: str) -> ProjectBusyError | None:

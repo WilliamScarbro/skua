@@ -31,6 +31,7 @@ from skua.project_adapt import (
     load_image_request,
     request_changes_project,
     request_has_updates,
+    request_is_pending,
     apply_image_request_to_project,
     write_applied_image_request,
     smoke_test_path,
@@ -207,23 +208,24 @@ def cmd_adapt(args, lock_project: bool = True):
         build_error = _build_project_image(store, project, agent)
         smoke_error = ""
         if not build_error:
-            smoke_script = smoke_test_path(project_dir)
-            if not smoke_script.exists() and not discover_mode:
-                print("[adapt] No smoke test found; asking agent to create one...")
-                _run_agent_adapt_session(
-                    store, project, env, sec, agent,
-                    prompt_override=_agent_smoke_test_creation_prompt(project.name),
-                    warn_on_failure=True,
-                )
-            if smoke_script.exists():
-                print("[adapt] Step 4: Run smoke test")
-                smoke_error = _run_smoke_test(store, project, project_dir, smoke_script)
-                if smoke_error:
-                    print("[adapt] Smoke test failed.")
+            if discover_mode:
+                smoke_script = smoke_test_path(project_dir)
+                if not smoke_script.exists():
+                    print("[adapt] No smoke test found; asking agent to create one...")
+                    _run_agent_adapt_session(
+                        store, project, env, sec, agent,
+                        prompt_override=_agent_smoke_test_creation_prompt(project.name),
+                        warn_on_failure=True,
+                    )
+                if smoke_script.exists():
+                    print("[adapt] Step 4: Run smoke test")
+                    smoke_error = _run_smoke_test(store, project, project_dir, smoke_script)
+                    if smoke_error:
+                        print("[adapt] Smoke test failed.")
+                    else:
+                        print("[adapt] Smoke test passed.")
                 else:
-                    print("[adapt] Smoke test passed.")
-            else:
-                print("[adapt] Warning: No smoke test available; skipping smoke test step.")
+                    print("[adapt] Warning: No smoke test available; skipping smoke test step.")
         retry_count = 0
         max_retries = 3
         while build_error or smoke_error:
@@ -296,7 +298,7 @@ def _project_has_pending_request(project) -> bool:
     if not req_path.is_file():
         return False
     request = load_image_request(req_path)
-    return request_changes_project(project, request)
+    return request_is_pending(request)
 
 
 def _cmd_adapt_all(store: ConfigStore, args):
@@ -410,19 +412,6 @@ def _auth_files_for_agent(project, agent) -> list:
     return auth_files
 
 
-def _sync_auth_from_host(data_dir: Path, cred, agent) -> int:
-    """Sync persisted auth files from resolved host credential sources."""
-    copied = 0
-    for src, dest_name in resolve_credential_sources(cred, agent):
-        safe_dest = Path(dest_name).name.strip()
-        if not safe_dest:
-            continue
-        if src.is_file():
-            data_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, data_dir / safe_dest)
-            copied += 1
-    return copied
-
 
 def _ensure_base_agent_image(store: ConfigStore, project, sec, agent) -> str:
     """Return the base agent image name, building lazily when needed."""
@@ -457,6 +446,9 @@ def _ensure_base_agent_image(store: ConfigStore, project, sec, agent) -> str:
         print(f"Error: failed to build image '{image_name}'.")
         if reason:
             print(reason)
+        sys.exit(1)
+    if not image_exists(image_name):
+        print(f"Error: shared agent image '{image_name}' is still missing after prepare step.")
         sys.exit(1)
     if not changed:
         print(f"[adapt] Base agent image ready: {image_name}")
@@ -757,7 +749,7 @@ def _agent_adapt_command(agent, project_name: str, build_error: str = "", smoke_
     sys.exit(1)
 
 
-def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, docker_cmd_base: list):
+def _ensure_agent_authenticated(project, env, agent, cred, docker_cmd_base: list):
     auth_files = _auth_files_for_agent(project, agent)
     if not auth_files:
         print(f"Error: No auth files configured for agent '{agent.name}'.")
@@ -766,21 +758,20 @@ def _ensure_agent_authenticated(store: ConfigStore, project, env, agent, cred, d
     auth_dir = (agent.auth.dir or ".claude").lstrip("/")
     primary_auth = auth_files[0]
     if env.persistence.mode == "bind":
-        data_dir = store.project_data_dir(project.name, project.agent)
-        has_persisted_auth = (data_dir / primary_auth).is_file()
+        cred_sources = resolve_credential_sources(cred, agent)
+        has_live_auth = any(
+            Path(src).name == primary_auth and Path(src).is_file()
+            for src, _ in cred_sources
+        )
         _maybe_refresh_local_credentials_for_adapt(
             agent,
             cred,
-            allow_missing_local=has_persisted_auth,
+            allow_missing_local=has_live_auth,
         )
-        copied = _sync_auth_from_host(data_dir, cred, agent)
-        if copied:
-            print(f"Synced {copied} auth file(s) from host.")
-        if not (data_dir / primary_auth).is_file():
+        if not has_live_auth:
             _login_subcmd = "\\login" if agent.name == "codex" else "login"
             login_cmd = agent.auth.login_command or f"{agent.runtime.command or agent.name} {_login_subcmd}"
             print(f"Error: Agent '{agent.name}' is not logged in for project '{project.name}'.")
-            print(f"Missing auth file: {data_dir / primary_auth}")
             print(f"Run 'skua run {project.name}' and execute '{login_cmd}', then retry.")
             sys.exit(1)
 
@@ -813,6 +804,13 @@ def _run_agent_adapt_session(
     image_name = _ensure_base_agent_image(store, project, sec, agent)
     data_dir = store.project_data_dir(project.name, project.agent)
 
+    cred = None
+    if project.credential:
+        cred = store.load_credential(project.credential)
+        if cred is None:
+            print(f"Warning: Credential '{project.credential}' not found; using default auth source.")
+    cred_sources = resolve_credential_sources(cred, agent)
+
     docker_cmd_base = build_run_command(
         project=project,
         environment=env,
@@ -820,14 +818,10 @@ def _run_agent_adapt_session(
         agent=agent,
         image_name=image_name,
         data_dir=data_dir,
+        cred_sources=cred_sources,
     )
-    cred = None
-    if project.credential:
-        cred = store.load_credential(project.credential)
-        if cred is None:
-            print(f"Warning: Credential '{project.credential}' not found; using default auth source.")
-    print("[adapt] Syncing credentials and checking auth...")
-    _ensure_agent_authenticated(store, project, env, agent, cred, docker_cmd_base)
+    print("[adapt] Checking auth...")
+    _ensure_agent_authenticated(project, env, agent, cred, docker_cmd_base)
 
     if prompt_override:
         print(f"[adapt] {agent.name} is creating smoke test...")
@@ -844,12 +838,22 @@ def _run_agent_adapt_session(
     print(f"[adapt] Agent command: {_shell_join(adapt_cmd)}")
     run_cmd.extend(adapt_cmd)
     print(f"[adapt] Full command: {_shell_join(run_cmd)}")
-    result = subprocess.run(run_cmd, capture_output=True, text=True)
-    summary_lines = _summarize_agent_output(result.stdout, result.stderr)
-    if summary_lines:
-        print("[adapt] Agent output:")
-        for line in summary_lines:
-            print(f"  {line}")
+    print("[adapt] Agent output (streaming):")
+    proc = subprocess.Popen(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output_lines: list[str] = []
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\n")
+        output_lines.append(line)
+        print(f"  {line}", flush=True)
+    proc.wait()
+
+    class _Result:
+        returncode = proc.returncode
+        stdout = "\n".join(output_lines)
+        stderr = ""
+
+    result = _Result()
     if result.returncode != 0:
         combined = "\n".join(part for part in [result.stderr, result.stdout] if part)
         if allow_auth_retry and _looks_like_auth_failure(combined):
@@ -1077,6 +1081,11 @@ def _build_project_image(store: ConfigStore, project, agent) -> str:
         if not success:
             print(f"[adapt] Failed to prepare shared agent image for '{project.agent}'.")
             return reason or "Shared agent image build failed."
+        if not image_exists(resolved_base_image):
+            return (
+                f"Shared agent image '{resolved_base_image}' is still missing "
+                f"after prepare step."
+            )
     success, error_output = build_image(
         container_dir=container_dir,
         image_name=image_name,
@@ -1094,4 +1103,11 @@ def _build_project_image(store: ConfigStore, project, agent) -> str:
         context = _format_build_error_context(error_output or "Docker build failed.", dockerfile_text)
         return context or "Docker build failed."
     print(f"Image ready: {image_name}")
+    old_images = [img for img in (project.resources.images or []) if img != image_name]
+    for old in old_images:
+        result = subprocess.run(["docker", "rmi", old], capture_output=True)
+        if result.returncode == 0:
+            print(f"  Removed old image: {old}")
+    project.resources.images = [image_name]
+    store.save_resource(project)
     return ""

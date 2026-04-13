@@ -14,6 +14,7 @@ from skua.config.loader import ConfigStore
 from skua.config.resources import Project
 from skua.project_lock import (
     ProjectBusyError,
+    effective_project_operation_state,
     format_project_busy_error,
     project_busy_error_if_locked,
     project_operation_lock,
@@ -52,6 +53,24 @@ class TestProjectOperationLock(unittest.TestCase):
 
             self.assertEqual("demo", ctx.exception.project_name)
 
+    def test_effective_state_clears_stale_persisted_operation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            project = Project(name="demo", directory="/tmp/demo")
+            project.state.status = "building"
+            project.state.lock_owner = "host:1234"
+            project.state.lock_acquired_at = "2026-03-06T00:00:00+00:00"
+            store.save_resource(project)
+
+            loaded = store.load_project("demo")
+            self.assertEqual("", effective_project_operation_state(store, loaded))
+
+            refreshed = store.load_project("demo")
+            self.assertEqual("", refreshed.state.status)
+            self.assertEqual("", refreshed.state.lock_owner)
+            self.assertEqual("", refreshed.state.lock_acquired_at)
+
     def test_busy_error_format_includes_context(self):
         err = ProjectBusyError(
             project_name="demo",
@@ -78,6 +97,7 @@ class TestProjectOperationLock(unittest.TestCase):
             agent = mock.Mock(name="claude", auth=mock.Mock(dir=".claude"))
             agent.name = "claude"
             agent.auth.dir = ".claude"
+            agent.auth.files = []
             store.load_environment = mock.Mock(return_value=environment)
             store.load_security = mock.Mock(return_value=security)
             store.load_agent = mock.Mock(return_value=agent)

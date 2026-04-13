@@ -3,11 +3,13 @@
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from skua.config import ConfigStore
 from skua.docker import (
+    effective_project_image,
     get_running_skua_containers,
     image_exists,
     image_matches_build_context,
@@ -15,8 +17,8 @@ from skua.docker import (
     project_uses_agent_base_layer,
     resolve_project_image_inputs,
 )
-from skua.project_adapt import image_request_path, load_image_request, request_changes_project
-from skua.project_lock import project_operation_state
+from skua.project_adapt import image_request_path, load_image_request, request_is_pending
+from skua.project_lock import effective_project_operation_state
 from skua.commands.run import _credential_refresh_reason
 
 
@@ -104,7 +106,7 @@ def _has_pending_adapt_request(project) -> bool:
     if not req_path.is_file():
         return False
     request = load_image_request(req_path)
-    return request_changes_project(project, request)
+    return request_is_pending(request)
 
 
 def _credential_state(store: ConfigStore, project) -> tuple:
@@ -269,53 +271,57 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
 
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
-    image_name = image_name_for_project(image_name_base, project)
+    image_config = g.get("image", {})
+    global_packages = image_config.get("extraPackages", [])
+    global_commands = image_config.get("extraCommands", [])
+    image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
+    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
     if image_exists(image_name):
-        container_dir = store.get_container_dir()
-        if container_dir is None:
-            return "".join(flags)
-        defaults = g.get("defaults", {})
-        security_name = defaults.get("security", "open")
-        security = store.load_security(security_name)
-        agent = store.load_agent(project.agent)
-        if agent is None or security is None:
-            return "".join(flags)
-        image_config = g.get("image", {})
-        global_packages = image_config.get("extraPackages", [])
-        global_commands = image_config.get("extraCommands", [])
-        base_image = g.get("baseImage", "debian:bookworm-slim")
-        resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
-            default_base_image=base_image,
-            agent=agent,
-            project=project,
-            global_extra_packages=global_packages,
-            global_extra_commands=global_commands,
-            image_name_base=image_name_base,
-        )
-        if not image_matches_build_context(
-            image_name=image_name,
-            container_dir=container_dir,
-            security=security,
-            agent=agent,
-            base_image=resolved_base_image,
-            extra_packages=extra_packages,
-            extra_commands=extra_commands,
-            layer_on_base=project_uses_agent_base_layer(project),
-        ):
-            flags.add("(B)")
+        # Prebuilt default images have no skua build label — skip context check.
+        if image_name != project_from_image:
+            container_dir = store.get_container_dir()
+            if container_dir is None:
+                return "".join(flags)
+            defaults = g.get("defaults", {})
+            security_name = defaults.get("security", "open")
+            security = store.load_security(security_name)
+            agent = store.load_agent(project.agent)
+            if agent is None or security is None:
+                return "".join(flags)
+            base_image = g.get("baseImage", "debian:bookworm-slim")
+            resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
+                default_base_image=base_image,
+                agent=agent,
+                project=project,
+                global_extra_packages=global_packages,
+                global_extra_commands=global_commands,
+                image_name_base=image_name_base,
+            )
+            if not image_matches_build_context(
+                image_name=image_name,
+                container_dir=container_dir,
+                security=security,
+                agent=agent,
+                base_image=resolved_base_image,
+                extra_packages=extra_packages,
+                extra_commands=extra_commands,
+                layer_on_base=project_uses_agent_base_layer(project),
+            ):
+                flags.add("(B)")
 
     ordered = [flag for flag in ("(A)", "(B)") if flag in flags]
     return "".join(ordered), flags
 
 
 def _base_project_status(
+    store: ConfigStore,
     project,
     running: set,
     unreachable_hosts: set,
     image_name: str,
 ) -> str:
     """Return base project status before adapt/credential suffix markers."""
-    operation = project_operation_state(project)
+    operation = effective_project_operation_state(store, project)
     if operation:
         return operation
 
@@ -355,6 +361,14 @@ def _agent_activity(container_name: str, host: str = "") -> str:
     except (json.JSONDecodeError, ValueError):
         return "?"
     state = data.get("state", "?")
+    ts = data.get("ts")
+    window = data.get("window")
+    if isinstance(ts, int) and ts >= 1_000_000_000 and state in {"thinking", "processing", "api_activity"}:
+        max_age = 90
+        if isinstance(window, int) and window > 0:
+            max_age = max(max_age, window * 2)
+        if int(time.time()) - ts > max_age:
+            return "idle"
     if state == "thinking":
         tool = data.get("tool", "")
         if tool:
@@ -369,16 +383,16 @@ def _agent_activity(container_name: str, host: str = "") -> str:
             if hits < 100:
                 return "idle"
             if hits < 250:
-                return "X"
+                return "█"
             if hits < 400:
-                return "XX"
+                return "██"
             if hits < 550:
-                return "XXX"
+                return "███"
             if hits < 700:
-                return "XXXX"
+                return "████"
             if hits < 850:
-                return "XXXXX"
-            return "XXXXXX"
+                return "█████"
+            return "██████"
         return "?"
     return state
 
@@ -394,6 +408,9 @@ def cmd_list(args):
     show_image = bool(getattr(args, "image", False))
     g = store.load_global()
     image_name_base = g.get("imageName", "skua-base")
+    _list_image_config = g.get("image", {})
+    _list_global_packages = _list_image_config.get("extraPackages", [])
+    _list_global_commands = _list_image_config.get("extraCommands", [])
 
     if not project_names:
         print("No projects configured. Add one with: skua add <name> --dir <path> or --repo <url>")
@@ -427,7 +444,7 @@ def cmd_list(args):
             if container_name not in _running_for_host(host):
                 running_image_values[name] = "-"
                 continue
-            img_name = image_name_for_project(image_name_base, project)
+            img_name = effective_project_image(image_name_base, project, _list_global_packages, _list_global_commands)
             project_id = _image_id(img_name, host=host)
             container_id = _container_image_id(container_name, host=host)
             if project_id and container_id and project_id == container_id:
@@ -476,8 +493,8 @@ def cmd_list(args):
         host = getattr(project, "host", "") or ""
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
-        img_name = image_name_for_project(image_name_base, project)
-        status = _base_project_status(project, running, unreachable_hosts, img_name)
+        img_name = effective_project_image(image_name_base, project, _list_global_packages, _list_global_commands)
+        status = _base_project_status(store, project, running, unreachable_hosts, img_name)
         if pending_adapt:
             status += "*"
             pending_count += 1

@@ -12,7 +12,7 @@ spec:
       - npm
   runtime:
     command: codex
-    adapt_command: "codex exec --skip-git-repo-check {prompt_shell}"
+    adapt_command: "codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check {prompt_shell}"
     env:
       PATH: "/home/dev/.local/bin:${PATH}"
       EDITOR: vim

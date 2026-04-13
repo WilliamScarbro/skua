@@ -137,6 +137,18 @@ def request_has_updates(request: dict) -> bool:
     )
 
 
+def request_is_pending(request: dict) -> bool:
+    """True when the image-request file indicates pending adapt work."""
+    req = normalize_image_request(request or {})
+    if not request_has_updates(req):
+        return False
+
+    status = str(req.get("status", "") or "").strip().lower()
+    if status == "applied":
+        return False
+    return True
+
+
 def request_changes_project(project, request: dict) -> bool:
     """True when applying request would change project image configuration."""
     req = normalize_image_request(request or {})

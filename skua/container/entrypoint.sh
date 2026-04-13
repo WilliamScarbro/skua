@@ -129,13 +129,35 @@ if [ "$AUTH_DIR_REL" = ".claude" ]; then
     ln -sf "${AUTH_DIR}/.claude.json" /home/dev/.claude.json
 fi
 
-# ── Shell aliases ────────────────────────────────────────────────────
-if [ "$AGENT_COMMAND" = "claude" ]; then
-    echo "alias claude-dsp='claude --dangerously-skip-permissions'" >> /home/dev/.bashrc
-fi
-if [ "$AGENT_COMMAND" = "codex" ]; then
-    echo "alias codex-dsp='codex --dangerously-bypass-approvals-and-sandbox'" >> /home/dev/.bashrc
-fi
+# ── Shell aliases and command shims ──────────────────────────────────
+mkdir -p /home/dev/.local/bin
+
+ensure_bash_alias() {
+    alias_line="$1"
+    if ! grep -Fqx "$alias_line" /home/dev/.bashrc 2>/dev/null; then
+        printf '%s\n' "$alias_line" >> /home/dev/.bashrc
+    fi
+}
+
+install_command_shim() {
+    shim_name="$1"
+    shift
+    shim_path="/home/dev/.local/bin/${shim_name}"
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf 'exec'
+        for arg in "$@"; do
+            printf " '%s'" "$arg"
+        done
+        printf ' "$@"\n'
+    } > "$shim_path"
+    chmod +x "$shim_path"
+}
+
+ensure_bash_alias "alias claude-dsp='claude --dangerously-skip-permissions'"
+ensure_bash_alias "alias codex-dsp='codex --dangerously-bypass-approvals-and-sandbox'"
+install_command_shim "claude-dsp" "claude" "--dangerously-skip-permissions"
+install_command_shim "codex-dsp" "codex" "--dangerously-bypass-approvals-and-sandbox"
 
 # ── Persistent Bash history for project shells ───────────────────────
 cat > "$SKUA_BASHRC_SNIPPET" <<EOF
@@ -295,7 +317,7 @@ if [ $# -eq 0 ]; then
         fi
 
         if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-            tmux new-session -d -s "$TMUX_SESSION" -c "$TMUX_START_DIR" /bin/bash
+            tmux new-session -d -s "$TMUX_SESSION" -c "$TMUX_START_DIR" "exec /bin/bash -i"
         fi
 
         # Keep PID 1 alive while the tmux session exists.
@@ -304,7 +326,7 @@ if [ $# -eq 0 ]; then
         done
         exit 0
     fi
-    exec /bin/bash
+    exec /bin/bash -i
 else
     exec "$@"
 fi

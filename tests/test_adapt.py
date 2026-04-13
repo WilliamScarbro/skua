@@ -20,6 +20,7 @@ from skua.project_adapt import (
     ensure_adapt_workspace,
     load_image_request,
     request_has_updates,
+    request_is_pending,
     apply_image_request_to_project,
     smoke_test_path,
 )
@@ -57,28 +58,46 @@ class TestProjectAdaptHelpers(unittest.TestCase):
         self.assertEqual(project.image.extra_commands, ["npm ci"])
         self.assertEqual(project.image.version, 1)
 
-    def test_sync_auth_from_host_overwrites_stale_project_auth(self):
-        from skua.commands.adapt import _sync_auth_from_host
+    def test_cred_files_live_mounted_in_bind_mode(self):
+        from skua.docker import build_run_command
+        from skua.config.resources import (
+            AgentConfig, AgentAuthSpec, AgentInstallSpec, AgentRuntimeSpec,
+            Credential, Environment, Project, SecurityProfile,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             src_dir = tmp / "src-auth"
             src_dir.mkdir(parents=True, exist_ok=True)
-            (src_dir / "auth.json").write_text('{"token":"fresh"}')
+            auth_file = src_dir / "auth.json"
+            auth_file.write_text('{"token":"live"}')
 
             data_dir = tmp / "project-auth"
             data_dir.mkdir(parents=True, exist_ok=True)
-            (data_dir / "auth.json").write_text('{"token":"stale"}')
 
             agent = AgentConfig(
                 name="codex",
                 auth=AgentAuthSpec(dir=".codex", files=["auth.json"]),
+                install=AgentInstallSpec(),
+                runtime=AgentRuntimeSpec(command="codex"),
             )
-            cred = Credential(name="cred", agent="codex", source_dir=str(src_dir))
+            project = Project(name="myproj", agent="codex")
+            env = Environment()
+            env.persistence.mode = "bind"
+            sec = SecurityProfile()
 
-            copied = _sync_auth_from_host(data_dir=data_dir, cred=cred, agent=agent)
-            self.assertEqual(1, copied)
-            self.assertEqual('{"token":"fresh"}', (data_dir / "auth.json").read_text())
+            cred_sources = [(str(auth_file), "auth.json")]
+            cmd = build_run_command(
+                project=project,
+                environment=env,
+                security=sec,
+                agent=agent,
+                image_name="test-image",
+                data_dir=data_dir,
+                cred_sources=cred_sources,
+            )
+            cmd_str = " ".join(cmd)
+            self.assertIn(f"{auth_file}:/home/dev/.codex/auth.json", cmd_str)
 
     def test_summarize_agent_output_filters_entrypoint_noise(self):
         from skua.commands.adapt import _summarize_agent_output
@@ -153,6 +172,40 @@ class TestProjectAdaptHelpers(unittest.TestCase):
                 )
             )
             self.assertTrue(_project_has_pending_request(project))
+
+    def test_request_is_pending_false_when_status_is_applied(self):
+        request = {
+            "schemaVersion": 1,
+            "status": "applied",
+            "packages": ["git"],
+        }
+        self.assertFalse(request_is_pending(request))
+
+    def test_project_pending_request_uses_shared_request_status(self):
+        from skua.commands.adapt import _project_has_pending_request
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "proj"
+            project_dir.mkdir()
+            ensure_adapt_workspace(project_dir, "proj", "codex")
+            (project_dir / ".skua" / "image-request.yaml").write_text(
+                yaml.dump(
+                    {
+                        "schemaVersion": 1,
+                        "status": "applied",
+                        "packages": ["git"],
+                    },
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
+            )
+
+            first = Project(name="proj-a", directory=str(project_dir))
+            second = Project(name="proj-b", directory=str(project_dir))
+            second.image.extra_packages = ["git"]
+
+            self.assertFalse(_project_has_pending_request(first))
+            self.assertFalse(_project_has_pending_request(second))
 
     @mock.patch("skua.commands.adapt._credential_refresh_reason", return_value="no local credential files were found")
     @mock.patch("skua.commands.adapt._is_interactive_tty", return_value=False)
@@ -736,7 +789,7 @@ class TestAdaptCommand(unittest.TestCase):
 
             session_calls = []
             def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
-                             prompt_override="", warn_on_failure=False):
+                             prompt_override="", warn_on_failure=False, **kwargs):
                 session_calls.append({"prompt_override": prompt_override, "warn_on_failure": warn_on_failure})
 
             with (
@@ -745,12 +798,13 @@ class TestAdaptCommand(unittest.TestCase):
                 mock.patch("skua.commands.adapt._build_project_image", return_value=""),
                 mock.patch("skua.commands.adapt._run_smoke_test", return_value=""),
             ):
-                cmd_adapt(self._adapt_args("proj", build=True))
+                cmd_adapt(self._adapt_args("proj", build=True, discover=True))
 
-            # Should have called the session once for smoke test creation (build succeeded, no smoke test existed)
-            self.assertEqual(1, len(session_calls))
-            self.assertTrue(session_calls[0]["warn_on_failure"])
-            self.assertIn("smoke-test.sh", session_calls[0]["prompt_override"])
+            # Should have called the session twice: once for discover, once for smoke test creation
+            self.assertEqual(2, len(session_calls))
+            smoke_call = session_calls[1]
+            self.assertTrue(smoke_call["warn_on_failure"])
+            self.assertIn("smoke-test.sh", smoke_call["prompt_override"])
 
     def test_cmd_adapt_smoke_test_passes_exits_loop(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -803,11 +857,13 @@ class TestAdaptCommand(unittest.TestCase):
 
             session_calls = []
             def fake_session(store, project, env, sec, agent, build_error="", smoke_error="",
-                             prompt_override="", warn_on_failure=False):
+                             prompt_override="", warn_on_failure=False, **kwargs):
                 session_calls.append({"smoke_error": smoke_error})
-                with open(request_path, "w") as f:
-                    yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git", "python3"]},
-                              f, default_flow_style=False, sort_keys=False)
+                # Only revise the request on the smoke-failure retry, not during discover
+                if smoke_error:
+                    with open(request_path, "w") as f:
+                        yaml.dump({"schemaVersion": 1, "status": "ready", "packages": ["git", "python3"]},
+                                  f, default_flow_style=False, sort_keys=False)
 
             with (
                 mock.patch("skua.commands.adapt.ConfigStore", return_value=store),
@@ -815,10 +871,11 @@ class TestAdaptCommand(unittest.TestCase):
                 mock.patch("skua.commands.adapt._build_project_image", return_value=""),
                 mock.patch("skua.commands.adapt._run_smoke_test", side_effect=fake_smoke),
             ):
-                cmd_adapt(self._adapt_args("proj", build=True))
+                cmd_adapt(self._adapt_args("proj", build=True, discover=True))
 
-            self.assertEqual(1, len(session_calls))
-            self.assertIn("python3: command not found", session_calls[0]["smoke_error"])
+            # In discover mode: session[0]=discover, session[1]=smoke revision
+            self.assertEqual(2, len(session_calls))
+            self.assertIn("python3: command not found", session_calls[1]["smoke_error"])
             self.assertEqual(2, smoke_calls[0])
             updated = store.load_project("proj")
             self.assertIn("python3", updated.image.extra_packages)

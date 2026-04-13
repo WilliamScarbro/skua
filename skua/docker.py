@@ -14,7 +14,7 @@ from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
-from skua.config.resources import Environment, SecurityProfile, AgentConfig, Project
+from skua.config.resources import Environment, SecurityProfile, AgentConfig, Project, ssh_private_keys
 
 
 def is_container_running(name: str) -> bool:
@@ -153,6 +153,34 @@ def image_name_for_project(base_image_name: str, project: Project) -> str:
     return f"{repo}-{project_part}-v{version}{tag}"
 
 
+def effective_project_image(
+    image_name_base: str,
+    project: Project,
+    global_extra_packages: list = None,
+    global_extra_commands: list = None,
+) -> str:
+    """Return the effective Docker image name for a project.
+
+    When from_image is set and no extra packages/commands are applied (from
+    project or global config), the from_image is used directly — the prebuilt
+    default image is the final image and no project-specific build is needed.
+    In all other cases this delegates to image_name_for_project.
+    """
+    from_image = ""
+    if project and getattr(project, "image", None):
+        from_image = str(getattr(project.image, "from_image", "") or "").strip()
+
+    if from_image:
+        project_packages = list(getattr(project.image, "extra_packages", []) or [])
+        project_commands = list(getattr(project.image, "extra_commands", []) or [])
+        merged_packages = _merge_unique(list(global_extra_packages or []) + project_packages)
+        merged_commands = _merge_unique(list(global_extra_commands or []) + project_commands)
+        if not merged_packages and not merged_commands:
+            return from_image
+
+    return image_name_for_project(image_name_base, project)
+
+
 def _merge_unique(items: list) -> list:
     """Return unique non-empty strings in order."""
     out = []
@@ -279,6 +307,7 @@ DEFAULT_PACKAGES = [
     "zip", "unzip", "tar", "gzip", "bzip2", "xz-utils",
     "diffutils", "patch", "man-db", "manpages",
     "net-tools", "iputils-ping", "dnsutils", "tcpdump", "libcap2-bin",
+    "ripgrep",
 ]
 
 # Agent install commands keyed by agent name (fallback when no AgentConfig found)
@@ -368,6 +397,24 @@ def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
         if c:
             normalized.append(c)
     return normalized
+
+
+def _render_run_instruction(command: str) -> str:
+    """Render a shell command as a valid Docker RUN instruction.
+
+    Multi-line commands are emitted as a single shell block so embedded lines
+    do not get parsed as Dockerfile instructions.
+    """
+    lines = [line.strip() for line in str(command or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return f"RUN {lines[0]}"
+
+    rendered = "RUN set -eux; \\\n"
+    rendered += " \\\n".join(f"    {line};" for line in lines[:-1])
+    rendered += f" \\\n    {lines[-1]}"
+    return rendered
 
 
 def agent_install_uses_floating_version(agent: AgentConfig = None) -> bool:
@@ -665,12 +712,18 @@ def generate_dockerfile(
             unique_install_cmds.append(cmd)
     install_cmds = unique_install_cmds
 
-    install_lines = "\n".join(f"RUN {cmd}" for cmd in install_cmds)
+    install_lines = "\n".join(
+        rendered for cmd in install_cmds
+        if (rendered := _render_run_instruction(cmd))
+    )
 
     # Extra commands
     extra_lines = ""
     if extra_commands:
-        extra_lines = "\n" + "\n".join(f"RUN {cmd}" for cmd in extra_commands)
+        extra_lines = "\n" + "\n".join(
+            rendered for cmd in extra_commands
+            if (rendered := _render_run_instruction(cmd))
+        )
 
     # Sudo removal
     sudo_removal = ""
@@ -690,6 +743,7 @@ ARG USER_UID=1000
 ARG USER_GID=1000
 
 # ── Core system packages ─────────────────────────────────────────────
+USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \\
     {pkg_line} \\
     && rm -rf /var/lib/apt/lists/*
@@ -772,7 +826,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     extra_lines = ""
     commands = [str(cmd).strip() for cmd in (extra_commands or []) if str(cmd).strip()]
     if commands:
-        extra_lines = "\n" + "\n".join(f"RUN {cmd}" for cmd in commands)
+        extra_lines = "\n" + "\n".join(
+            rendered for cmd in commands
+            if (rendered := _render_run_instruction(cmd))
+        )
 
     return f"""FROM {base_image}
 {package_lines}
@@ -811,6 +868,7 @@ def build_image(
         base_image=base_image,
         extra_packages=extra_packages,
         extra_commands=extra_commands,
+        layer_on_base=layer_on_base,
     )
 
     build_path = Path(tempfile.mkdtemp(prefix=".build-context-", dir=container_dir))
@@ -972,6 +1030,7 @@ def build_run_command(
     data_dir: Path,
     repo_volume: str = "",
     source_mounts: list = None,
+    cred_sources: list = None,
 ) -> list:
     """Build the docker run command list from resolved configuration."""
     container_name = f"skua-{project.name}"
@@ -995,33 +1054,43 @@ def build_run_command(
         docker_cmd.extend(["-e", f"GIT_COMMITTER_EMAIL={project.git.email}"])
 
     # SSH key mounts
-    ssh_key = project.ssh.private_key
+    ssh_keys = ssh_private_keys(project.ssh)
+    ssh_key = ssh_keys[0] if ssh_keys else ""
     is_remote_host = bool(getattr(project, "host", ""))
     if ssh_key and Path(ssh_key).is_file():
         key_name = Path(ssh_key).name
         docker_cmd.extend(["-e", f"SKUA_SSH_KEY_NAME={key_name}"])
+        known_hosts_mounted = False
+        for idx, ssh_key in enumerate(ssh_keys):
+            key_path = Path(ssh_key)
+            if not key_path.is_file():
+                continue
+            key_name = key_path.name
 
-        if is_remote_host:
-            key_b64 = base64.b64encode(Path(ssh_key).read_bytes()).decode("ascii")
-            docker_cmd.extend(["-e", f"SKUA_SSH_KEY_B64={key_b64}"])
-        else:
-            docker_cmd.extend(["-v", f"{ssh_key}:/home/dev/.ssh-mount/{key_name}:ro"])
-
-        pub_key = Path(f"{ssh_key}.pub")
-        if pub_key.is_file():
             if is_remote_host:
-                pub_b64 = base64.b64encode(pub_key.read_bytes()).decode("ascii")
-                docker_cmd.extend(["-e", f"SKUA_SSH_PUB_KEY_B64={pub_b64}"])
+                if idx == 0:
+                    key_b64 = base64.b64encode(key_path.read_bytes()).decode("ascii")
+                    docker_cmd.extend(["-e", f"SKUA_SSH_KEY_B64={key_b64}"])
             else:
-                docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+                docker_cmd.extend(["-v", f"{key_path}:/home/dev/.ssh-mount/{key_name}:ro"])
 
-        known_hosts = Path(ssh_key).parent / "known_hosts"
-        if known_hosts.is_file():
-            if is_remote_host:
-                known_hosts_b64 = base64.b64encode(known_hosts.read_bytes()).decode("ascii")
-                docker_cmd.extend(["-e", f"SKUA_SSH_KNOWN_HOSTS_B64={known_hosts_b64}"])
-            else:
-                docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
+            pub_key = Path(f"{key_path}.pub")
+            if pub_key.is_file():
+                if is_remote_host:
+                    if idx == 0:
+                        pub_b64 = base64.b64encode(pub_key.read_bytes()).decode("ascii")
+                        docker_cmd.extend(["-e", f"SKUA_SSH_PUB_KEY_B64={pub_b64}"])
+                else:
+                    docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+
+            known_hosts = key_path.parent / "known_hosts"
+            if known_hosts.is_file() and not known_hosts_mounted:
+                if is_remote_host:
+                    known_hosts_b64 = base64.b64encode(known_hosts.read_bytes()).decode("ascii")
+                    docker_cmd.extend(["-e", f"SKUA_SSH_KNOWN_HOSTS_B64={known_hosts_b64}"])
+                else:
+                    docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
+                known_hosts_mounted = True
 
     # Project directory mounts (local bind-mounts or remote named volumes)
     mount_specs = list(source_mounts or [])
@@ -1085,6 +1154,10 @@ def build_run_command(
     if environment.persistence.mode == "bind":
         data_dir.mkdir(parents=True, exist_ok=True)
         docker_cmd.extend(["-v", f"{data_dir}:{auth_mount}"])
+        for src_path, dest_name in (cred_sources or []):
+            safe_dest = Path(dest_name).name.strip()
+            if safe_dest and Path(src_path).is_file():
+                docker_cmd.extend(["-v", f"{src_path}:{auth_mount}/{safe_dest}"])
     else:
         vol_name = f"skua-{project.name}-{project.agent}"
         docker_cmd.extend(["-v", f"{vol_name}:{auth_mount}"])
@@ -1122,11 +1195,11 @@ def exec_into_container(container_name: str, replace_process: bool = True) -> bo
     """
     attach_cmd = (
         'if [ "${SKUA_TMUX_ENABLE:-1}" = "0" ] || ! command -v tmux >/dev/null 2>&1; then '
-        '  exec /bin/bash; '
+        '  exec /bin/bash -i; '
         'fi; '
         'session="${SKUA_TMUX_SESSION:-skua}"; '
         'if ! tmux has-session -t "$session" 2>/dev/null; then '
-        '  tmux new-session -d -s "$session"; '
+        '  tmux new-session -d -s "$session" "exec /bin/bash -i"; '
         'fi; '
         'exec tmux attach-session -t "$session" \\; '
         'run-shell "/home/dev/.entrypoint.d/tmux-attach-banner.sh \\"$session\\""'
@@ -1186,7 +1259,7 @@ def compute_build_context_hash(
     entrypoint_path = container_dir / "entrypoint.sh"
 
     hasher = hashlib.sha256()
-    _hash_with_marker(hasher, "version", "v2")
+    _hash_with_marker(hasher, "version", "v3")
     _hash_with_marker(hasher, "dockerfile", dockerfile_content)
     _hash_with_marker(hasher, "base_image_ref", base_image)
     _hash_with_marker(hasher, "base_image_id", _local_image_id(base_image))
@@ -1197,9 +1270,12 @@ def compute_build_context_hash(
 
     if not layer_on_base:
         claude_home = Path.home() / ".claude"
-        for fname in ("settings.json", "settings.local.json"):
-            src = claude_home / fname
-            _hash_with_marker(hasher, f"claude-default:{fname}", src.read_bytes() if src.exists() else None)
+        settings_json = claude_home / "settings.json"
+        _hash_with_marker(
+            hasher,
+            "claude-default:settings.json",
+            settings_json.read_bytes() if settings_json.exists() else None,
+        )
 
         check_monitoring_path = container_dir / "check_monitoring.sh"
         _hash_with_marker(
