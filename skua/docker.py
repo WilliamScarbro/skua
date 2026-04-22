@@ -12,7 +12,8 @@ import tempfile
 import time
 from collections import deque
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+from urllib.request import urlopen
 
 from skua.config.resources import Environment, SecurityProfile, AgentConfig, Project, ssh_private_keys
 
@@ -118,7 +119,8 @@ def project_has_image_customizations(project: Project) -> bool:
         return False
     img = project.image
     return bool(
-        str(getattr(img, "base_image", "") or "").strip()
+        str(getattr(img, "absolute_image", "") or "").strip()
+        or str(getattr(img, "base_image", "") or "").strip()
         or str(getattr(img, "from_image", "") or "").strip()
         or list(getattr(img, "extra_packages", []) or [])
         or list(getattr(img, "extra_commands", []) or [])
@@ -166,9 +168,14 @@ def effective_project_image(
     default image is the final image and no project-specific build is needed.
     In all other cases this delegates to image_name_for_project.
     """
+    absolute_image = ""
     from_image = ""
     if project and getattr(project, "image", None):
+        absolute_image = str(getattr(project.image, "absolute_image", "") or "").strip()
         from_image = str(getattr(project.image, "from_image", "") or "").strip()
+
+    if absolute_image:
+        return absolute_image
 
     if from_image:
         project_packages = list(getattr(project.image, "extra_packages", []) or [])
@@ -179,6 +186,13 @@ def effective_project_image(
             return from_image
 
     return image_name_for_project(image_name_base, project)
+
+
+def absolute_project_image(project: Project) -> str:
+    """Return a direct-run absolute image override for a project, if configured."""
+    if not project or not getattr(project, "image", None):
+        return ""
+    return str(getattr(project.image, "absolute_image", "") or "").strip()
 
 
 def _merge_unique(items: list) -> list:
@@ -467,10 +481,20 @@ def _latest_npm_package_version(package_name: str) -> str:
             check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        result = None
+    if result and result.returncode == 0:
+        version = (result.stdout or "").strip()
+        if version:
+            return version
+
+    registry_pkg = quote(pkg, safe="")
+    registry_url = f"https://registry.npmjs.org/{registry_pkg}/latest"
+    try:
+        with urlopen(registry_url, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
         return ""
-    if result.returncode != 0:
-        return ""
-    return (result.stdout or "").strip()
+    return str(payload.get("version") or "").strip()
 
 
 def latest_agent_client_version(agent_name: str) -> str:
@@ -554,7 +578,10 @@ def image_rebuild_needed(
     if not image_exists(image_name):
         return True, False, "image is missing"
 
-    if agent_install_uses_floating_version(agent):
+    # Layered project images inherit agent installs from a local managed base
+    # image. Agent refresh detection belongs to that base image, not the thin
+    # overlay, which should rebuild only when its effective build context changes.
+    if not layer_on_base and agent_install_uses_floating_version(agent):
         refresh_needed, refresh_reason = floating_agent_update_available(image_name, agent)
         if refresh_needed:
             return True, True, refresh_reason or "floating client update available"
@@ -938,7 +965,9 @@ def build_image(
         for key, value in sorted(version_labels.items()):
             cmd.extend(["--label", f"{key}={value}"])
         cmd.extend(["-t", image_name, str(build_path)])
-        if pull:
+        # Layered project images always build FROM a local managed skua base
+        # image; asking Docker to pull that ref breaks when it is not published.
+        if pull and not layer_on_base:
             cmd.insert(-1, "--pull")
         if no_cache:
             cmd.insert(-1, "--no-cache")

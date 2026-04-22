@@ -7,6 +7,7 @@ from skua.config import ConfigStore
 import subprocess
 
 from skua.docker import (
+    absolute_project_image,
     build_image,
     effective_project_image,
     ensure_agent_base_image,
@@ -82,9 +83,10 @@ def cmd_build(args, lock_project: bool = True):
     global_packages = image_config.get("extraPackages", [])
     global_commands = image_config.get("extraCommands", [])
 
+    _project_absolute = absolute_project_image(project)
     _project_base = str(getattr(project.image, "base_image", "") or "").strip()
     _project_from = str(getattr(project.image, "from_image", "") or "").strip()
-    display_base = _project_from or _project_base or base_image
+    display_base = _project_absolute or _project_from or _project_base or base_image
 
     print("Building Docker image...")
     print(f"  Base image:  {display_base}")
@@ -101,15 +103,15 @@ def cmd_build(args, lock_project: bool = True):
     existing = []
     failed = []
     image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
-    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+    direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
 
-    if image_name == project_from_image:
-        # Prebuilt default image — no build step needed.
+    if image_name == direct_image:
+        # Direct image override — no build step needed.
         if image_exists(image_name):
-            print(f"-> Using prebuilt default image '{image_name}' (project: {project.name})")
+            print(f"-> Using direct project image '{image_name}' (project: {project.name})")
             existing.append(image_name)
         else:
-            print(f"-> Default image '{image_name}' not found locally.")
+            print(f"-> Direct project image '{image_name}' not found locally.")
             print("   Rebuild it with: skua default-image build <name>")
             print("   Or re-save it with: skua default-image save <source> <name>")
             failed.append(image_name)

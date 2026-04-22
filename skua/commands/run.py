@@ -18,6 +18,7 @@ from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
 from skua.config.resources import ssh_private_keys
 from skua.docker import (
+    absolute_project_image,
     is_container_running,
     exec_into_container,
     build_run_command,
@@ -842,12 +843,12 @@ def cmd_run(args, lock_project: bool = True):
     global_extra_commands = image_config.get("extraCommands", [])
     image_name = effective_project_image(image_name_base, project, global_extra_packages, global_extra_commands)
 
-    # When from_image is the effective image (prebuilt default, no extras layered on top),
+    # When a direct image override is the effective image (absolute/default image),
     # skip the entire build pipeline — just verify the image exists.
-    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
-    if image_name == project_from_image:
+    direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == direct_image:
         if not image_exists(image_name):
-            print(f"Error: default image '{image_name}' not found locally.")
+            print(f"Error: direct project image '{image_name}' not found locally.")
             print("Rebuild it with: skua default-image build <name>")
             print("Or re-save it with: skua default-image save <source> <name>")
             sys.exit(1)

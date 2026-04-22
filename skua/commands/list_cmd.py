@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from skua.config import ConfigStore
 from skua.docker import (
+    absolute_project_image,
     effective_project_image,
     get_running_skua_containers,
     image_exists,
@@ -275,10 +276,10 @@ def _image_suffix(project, store: ConfigStore) -> tuple:
     global_packages = image_config.get("extraPackages", [])
     global_commands = image_config.get("extraCommands", [])
     image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
-    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
+    direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
     if image_exists(image_name):
         # Prebuilt default images have no skua build label — skip context check.
-        if image_name != project_from_image:
+        if image_name != direct_image:
             container_dir = store.get_container_dir()
             if container_dir is None:
                 return "".join(flags)

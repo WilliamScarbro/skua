@@ -244,6 +244,7 @@ class ProjectSshSpec:
 
 @dataclass
 class ProjectImageSpec:
+    absolute_image: str = ""
     base_image: str = ""
     from_image: str = ""
     extra_packages: list = field(default_factory=list)

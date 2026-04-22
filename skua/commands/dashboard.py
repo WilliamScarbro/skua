@@ -45,8 +45,9 @@ from skua.commands.run import cmd_run
 from skua.commands.ssh_cmd import cmd_ssh
 from skua.commands.stop import cmd_stop
 from skua.config import ConfigStore
-from skua.config.resources import ssh_private_keys
+from skua.config.resources import resource_from_dict, resource_to_dict, ssh_private_keys
 from skua.docker import (
+    absolute_project_image,
     build_image,
     effective_project_image,
     ensure_agent_base_image,
@@ -66,7 +67,7 @@ _DASHBOARD_UI_LOG_MAX_BYTES = 2_000_000
 _CLIPBOARD_BACKEND_CACHE: str | None = None
 _PROJECT_DETAIL_TASKS = {
     "project_ssh_add", "project_ssh_add_manual", "project_ssh_remove",
-    "detail_edit_text", "detail_edit_select",
+    "detail_edit_text", "detail_edit_select", "detail_edit_absolute_image",
     "detail_source_action", "detail_source_add",
     "detail_ssh_action", "detail_revert",
 }
@@ -260,6 +261,8 @@ def _project_detail_fields(project, store: ConfigStore) -> list[dict]:
 
     # ── Image ──
     fields.append(_f("Image", section=True))
+    fields.append(_f(f"  absolute_image: {getattr(image, 'absolute_image', '') or '-'}", editable=True,
+                     action="detail_edit_absolute_image", field="image.absolute_image", label="absolute image"))
     fields.append(_f(f"  base_image: {getattr(image, 'base_image', '') or '-'}", editable=True,
                      action="detail_edit_text", field="image.base_image", label="base image"))
     fields.append(_f(f"  from_image: {getattr(image, 'from_image', '') or '-'}", editable=True,
@@ -314,6 +317,42 @@ def _set_nested_field(obj, path: str, value) -> None:
     if field == "extra_packages" and isinstance(value, str):
         value = [v.strip() for v in value.replace(",", " ").split() if v.strip()]
     setattr(obj, field, value)
+
+
+def _compatible_default_images(store: ConfigStore, agent_name: str) -> list:
+    """Return default images compatible with the selected agent."""
+    compatible = [
+        default_image
+        for default_image in store.load_all_resources("DefaultImage")
+        if not default_image.agent or default_image.agent == agent_name
+    ]
+    compatible.sort(key=lambda default_image: str(getattr(default_image, "name", "") or ""))
+    return compatible
+
+
+def _default_image_option_label(default_image) -> str:
+    """Format a default image for display in selection lists."""
+    label = str(getattr(default_image, "name", "") or "").strip()
+    description = str(getattr(default_image, "description", "") or "").strip()
+    if description:
+        return f"{label}  [{description}]"
+    return label
+
+
+def _project_detail_is_dirty(draft, original) -> bool:
+    """Return True when editable project detail state differs from its original value."""
+    import dataclasses
+
+    if draft is None or original is None:
+        return False
+    if not dataclasses.is_dataclass(draft) or not dataclasses.is_dataclass(original):
+        return False
+    draft_data = dataclasses.asdict(draft)
+    original_data = dataclasses.asdict(original)
+    for data in (draft_data, original_data):
+        data.pop("state", None)
+        data.pop("resources", None)
+    return draft_data != original_data
 
 
 def _resolve_skua_cli_prefix() -> list[str]:
@@ -822,6 +861,79 @@ class DashboardJobManager:
         return lines[-max(200, max_lines):]
 
 
+class DashboardCheckpointManager:
+    """Persist project-detail checkpoints across dashboard sessions."""
+
+    def __init__(self, config_dir: Path | None = None, max_checkpoints: int = 10):
+        base_dir = config_dir or ConfigStore().config_dir
+        self.state_dir = Path(base_dir) / "dashboard"
+        self.state_file = self.state_dir / "checkpoints.json"
+        self.max_checkpoints = max(1, int(max_checkpoints))
+        self._checkpoints: dict[str, list[tuple[str, object]]] = {}
+        self._load()
+
+    def _ensure_dir(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load(self) -> None:
+        self._ensure_dir()
+        if not self.state_file.exists():
+            return
+        try:
+            data = json.loads(self.state_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        raw_projects = data.get("projects", {}) if isinstance(data, dict) else {}
+        loaded: dict[str, list[tuple[str, object]]] = {}
+        for project_name, raw_items in raw_projects.items():
+            if not isinstance(project_name, str) or not isinstance(raw_items, list):
+                continue
+            items: list[tuple[str, object]] = []
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                ts = str(raw.get("ts", "") or "").strip()
+                project_data = raw.get("project")
+                if not ts or not isinstance(project_data, dict):
+                    continue
+                try:
+                    project = resource_from_dict(project_data)
+                except Exception:
+                    continue
+                items.append((ts, project))
+            if items:
+                loaded[project_name] = items[-self.max_checkpoints:]
+        self._checkpoints = loaded
+
+    def _persist(self) -> None:
+        self._ensure_dir()
+        payload = {
+            "version": 1,
+            "projects": {
+                project_name: [
+                    {"ts": ts, "project": resource_to_dict(project)}
+                    for ts, project in checkpoints[-self.max_checkpoints:]
+                ]
+                for project_name, checkpoints in self._checkpoints.items()
+                if checkpoints
+            },
+        }
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=False))
+        tmp.replace(self.state_file)
+
+    def list(self, project_name: str) -> list[tuple[str, object]]:
+        import copy
+        return [(ts, copy.deepcopy(project)) for ts, project in self._checkpoints.get(project_name, [])]
+
+    def append(self, project_name: str, ts: str, project) -> None:
+        import copy
+        items = list(self._checkpoints.get(project_name, []))
+        items.append((ts, copy.deepcopy(project)))
+        self._checkpoints[project_name] = items[-self.max_checkpoints:]
+        self._persist()
+
+
 def _collect_snapshot(args) -> DashboardSnapshot:
     store = ConfigStore()
     project_names = store.list_resources("Project")
@@ -920,9 +1032,13 @@ def _collect_snapshot(args) -> DashboardSnapshot:
         running = _running_for_host(host)
         pending_adapt = _has_pending_adapt_request(project)
         img_name = effective_project_image(image_name_base, project, _snap_global_packages, _snap_global_commands)
-        status = _base_project_status(store, project, running, unreachable_hosts, img_name)
+        status = _dashboard_project_status(store, project, running, unreachable_hosts, img_name)
         if status.startswith("running"):
             running_count += 1
+        if status == "refresh":
+            needs_build = True
+        elif status == "rebuild":
+            needs_build = True
         if pending_adapt:
             status += "*"
             pending_count += 1
@@ -963,6 +1079,11 @@ def _collect_snapshot(args) -> DashboardSnapshot:
     if stale_credential_count:
         summary.append(f"  ! stale/missing local credentials for {stale_credential_count} project(s)")
         summary.append("    run 'skua run <name>' and complete agent login to refresh")
+    if any(
+        str(row["cells"][2]).startswith(("ready", "refresh", "rebuild"))
+        for row in rows
+    ):
+        summary.append("  STATUS: ready=run now, refresh=client update before run, rebuild=image build required")
     if show_image and (needs_adapt or needs_build):
         if needs_adapt:
             summary.append("  (A) image-request changes pending; run 'skua adapt'")
@@ -1007,15 +1128,15 @@ def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck
     global_commands = image_config.get("extraCommands", [])
     image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
 
-    # Prebuilt default image — no build step needed, just check existence.
-    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
-    if image_name == project_from_image:
+    # Direct image override — no build step needed, just check existence.
+    direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == direct_image:
         needs_rebuild = not image_exists(image_name)
         return BuildPreflightCheck(
             project=project.name,
             needs_rebuild=needs_rebuild,
             force_refresh=False,
-            reason="default image missing" if needs_rebuild else "",
+            reason="direct image missing" if needs_rebuild else "",
             error="",
         )
 
@@ -1045,6 +1166,30 @@ def _project_build_preflight(store: ConfigStore, project) -> BuildPreflightCheck
         reason=str(reason or ""),
         error="",
     )
+
+
+def _dashboard_project_status(
+    store: ConfigStore,
+    project,
+    running: set,
+    unreachable_hosts: set,
+    image_name: str,
+) -> str:
+    """Return dashboard status aligned with run preflight behavior."""
+    status = _base_project_status(store, project, running, unreachable_hosts, image_name)
+    if status != "built":
+        return status
+
+    check = _project_build_preflight(store, project)
+    if check.error:
+        return "unknown"
+    if not check.needs_rebuild:
+        return "ready"
+    if check.force_refresh:
+        return "refresh"
+    if image_exists(image_name):
+        return "rebuild"
+    return "missing"
 
 
 def _run_preflight_checks(project_name: str) -> tuple[list[BuildPreflightCheck], list[str]]:
@@ -1092,13 +1237,13 @@ def _build_selected_project(name: str, verbose: bool = False) -> bool:
     global_commands = image_config.get("extraCommands", [])
     image_name = effective_project_image(image_name_base, project, global_packages, global_commands)
 
-    # Prebuilt default image — no build step needed.
-    project_from_image = str(getattr(project.image, "from_image", "") or "").strip()
-    if image_name == project_from_image:
+    # Direct image override — no build step needed.
+    direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
+    if image_name == direct_image:
         if image_exists(image_name):
-            print(f"Image '{image_name}' is already up-to-date (prebuilt default).")
+            print(f"Image '{image_name}' is already up-to-date (direct project image).")
             return True
-        print(f"Error: default image '{image_name}' not found locally.")
+        print(f"Error: direct project image '{image_name}' not found locally.")
         print("Rebuild it with: skua default-image build <name>")
         return False
 
@@ -1473,10 +1618,7 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
                 step = _advance_step(step, values)
                 continue
         elif step == 10:
-            agent_defaults = [
-                d for d in store.load_all_resources("DefaultImage")
-                if not d.agent or d.agent == values["agent"]
-            ]
+            agent_defaults = _compatible_default_images(store, values["agent"])
             options = ["Build new"]
             if agent_defaults:
                 options.append("Default image")
@@ -1490,14 +1632,8 @@ def _prompt_new_project_args() -> SimpleNamespace | None:
                     values["image"] = ""
         elif step == 11:
             if values["image_mode"] == "Default image":
-                agent_defaults = [
-                    d for d in store.load_all_resources("DefaultImage")
-                    if not d.agent or d.agent == values["agent"]
-                ]
-                opts = [
-                    d.name + (f"  [{d.description}]" if d.description else "")
-                    for d in agent_defaults
-                ]
+                agent_defaults = _compatible_default_images(store, values["agent"])
+                opts = [_default_image_option_label(d) for d in agent_defaults]
                 default_idx = 0
                 if values["default_image"]:
                     matching = [i for i, o in enumerate(opts) if o.split()[0] == values["default_image"]]
@@ -1666,30 +1802,30 @@ def cmd_dashboard(args):
         }
         """
         BINDINGS = [
-            Binding("q", "quit", "Quit"),
-            Binding("h", "toggle_help", "Help"),
-            Binding("tab", "toggle_focus", "Focus"),
-            Binding("f", "toggle_focus", "Focus"),
-            Binding("v", "toggle_project_detail", "Detail"),
-            Binding("k", "add_project_ssh", "Add SSH", show=False),
-            Binding("w", "detail_save", "Save", show=False),
-            Binding("u", "detail_revert", "Revert", show=False),
+            Binding("q", "quit", "Quit", priority=True),
+            Binding("h", "toggle_help", "Help", priority=True),
+            Binding("tab", "toggle_focus", "Focus", priority=True),
+            Binding("f", "toggle_focus", "Focus", priority=True),
+            Binding("v", "toggle_project_detail", "Detail", priority=True),
+            Binding("k", "add_project_ssh", "Add SSH", show=False, priority=True),
+            Binding("w", "detail_save", "Save", show=False, priority=True),
+            Binding("u", "detail_revert", "Revert", show=False, priority=True),
             Binding("left", "task_prev_option", show=False),
             Binding("right", "task_next_option", show=False),
             Binding("escape", "task_cancel", show=False),
-            Binding("up", "cursor_up", "Up"),
-            Binding("down", "cursor_down", "Down"),
-            Binding("enter", "run_selected", "Run"),
-            Binding("b", "build_selected", "Build"),
-            Binding("s", "stop_selected", "Stop"),
-            Binding("a", "adapt_selected", "Adapt"),
-            Binding("d", "remove_selected", "Remove"),
-            Binding("r", "restart_selected", "Restart"),
-            Binding("n", "new_project", "New"),
-            Binding("o", "open_job_output", "Output"),
-            Binding("x", "cancel_job", "Cancel Job"),
-            Binding("c", "clear_jobs", "Clear Jobs"),
-            Binding("y", "export_job_output", "Export Output"),
+            Binding("up", "cursor_up", "Up", priority=True),
+            Binding("down", "cursor_down", "Down", priority=True),
+            Binding("enter", "run_selected", "Run", priority=True),
+            Binding("b", "build_selected", "Build", priority=True),
+            Binding("s", "stop_selected", "Stop", priority=True),
+            Binding("a", "adapt_selected", "Adapt", priority=True),
+            Binding("d", "remove_selected", "Remove", priority=True),
+            Binding("r", "restart_selected", "Restart", priority=True),
+            Binding("n", "new_project", "New", priority=True),
+            Binding("o", "open_job_output", "Output", priority=True),
+            Binding("x", "cancel_job", "Cancel Job", priority=True),
+            Binding("c", "clear_jobs", "Clear Jobs", priority=True),
+            Binding("y", "export_job_output", "Export Output", priority=True),
         ]
 
         def __init__(self, dashboard_args):
@@ -1705,6 +1841,7 @@ def cmd_dashboard(args):
             self.show_project_detail = False
             self.message = ""
             self.jobs = DashboardJobManager()
+            self.checkpoints = DashboardCheckpointManager()
             self.task_mode = ""
             self.task_step = 0
             self.task_values = {}
@@ -1724,7 +1861,7 @@ def cmd_dashboard(args):
             self.detail_cursor = 0          # index into _project_detail_fields list
             self.detail_draft = None        # Project copy being edited (None = not editing)
             self.detail_original = None     # Project state when detail was opened
-            self.detail_checkpoints = []    # list of (iso_timestamp, Project) saved states
+            self.detail_checkpoints = []    # list of (iso_timestamp, Project) loaded from checkpoint store
             self._detail_close_pending = False  # waiting for second v to discard unsaved changes
             self.project_scroll = 0
             self.project_hscroll = 0
@@ -1736,6 +1873,8 @@ def cmd_dashboard(args):
             self._jobs_table_sig = None
             self._project_cursor_visible = None
             self._jobs_cursor_visible = None
+            self._suspend_project_widget_sync = False
+            self._suspend_jobs_widget_sync = False
             self._refresh_lock = threading.Lock()
             self._refresh_inflight = False
             self._refresh_pending = False
@@ -1814,14 +1953,18 @@ def cmd_dashboard(args):
             table = self.query_one("#projects-table")
             target = max(0, int(idx))
             try:
-                table.cursor_row = target
-                return
-            except Exception:
-                pass
-            try:
-                table.move_cursor(row=target, column=0)
-            except Exception:
-                pass
+                self._suspend_project_widget_sync = True
+                try:
+                    table.cursor_row = target
+                    return
+                except Exception:
+                    pass
+                try:
+                    table.move_cursor(row=target, column=0)
+                except Exception:
+                    pass
+            finally:
+                self._suspend_project_widget_sync = False
 
         def _init_jobs_table(self) -> None:
             if not self._use_project_widget:
@@ -1846,14 +1989,44 @@ def cmd_dashboard(args):
             table = self.query_one("#jobs-table")
             target = max(0, int(idx))
             try:
-                table.cursor_row = target
+                self._suspend_jobs_widget_sync = True
+                try:
+                    table.cursor_row = target
+                    return
+                except Exception:
+                    pass
+                try:
+                    table.move_cursor(row=target, column=0)
+                except Exception:
+                    pass
+            finally:
+                self._suspend_jobs_widget_sync = False
+
+        def _sync_selected_project_from_widget(self, row: int | None) -> None:
+            if self._suspend_project_widget_sync or not isinstance(row, int):
                 return
-            except Exception:
-                pass
-            try:
-                table.move_cursor(row=target, column=0)
-            except Exception:
-                pass
+            if row < 0 or row >= len(self.snapshot.rows):
+                return
+            self._set_selected_project_index(row)
+
+        def _sync_selected_job_from_widget(self, row: int | None) -> None:
+            if self._suspend_jobs_widget_sync or not isinstance(row, int):
+                return
+            jobs_view = self.jobs.list_for_view()
+            visible_jobs = min(len(jobs_view), 10)
+            if row < 0 or row >= visible_jobs:
+                return
+            self.selected_job = row
+
+        def on_data_table_row_highlighted(self, event) -> None:
+            table_id = getattr(getattr(event, "data_table", None), "id", "")
+            if table_id == "projects-table":
+                self._sync_selected_project_from_widget(getattr(event, "cursor_row", None))
+            elif table_id == "jobs-table":
+                self._sync_selected_job_from_widget(getattr(event, "cursor_row", None))
+
+        def on_data_table_row_selected(self, event) -> None:
+            self.on_data_table_row_highlighted(event)
 
         def _refresh_jobs_widget_local(self) -> None:
             if not self._use_project_widget:
@@ -1979,41 +2152,45 @@ def cmd_dashboard(args):
             columns = self._fit_project_columns(self.snapshot.columns)
             rows = self.snapshot.rows or []
             try:
-                table.clear(columns=True)
-            except Exception:
+                self._suspend_project_widget_sync = True
                 try:
-                    table.clear()
+                    table.clear(columns=True)
                 except Exception:
-                    pass
-            if not columns:
-                try:
-                    table.add_column("PROJECTS")
-                    table.add_row("No projects configured.")
-                except Exception:
-                    pass
-                self._project_table_sig = ((), ())
-                self._set_project_cursor(0)
-                return
-            for col_name, _col_width in columns:
-                try:
-                    table.add_column(col_name)
-                except Exception:
-                    pass
-            for row in rows:
-                cells = row.get("cells", [])
-                values = []
-                for i, (col_name, _col_width) in enumerate(columns):
-                    raw_value = str(cells[i]) if i < len(cells) else ""
-                    values.append(Text(raw_value, style=self._cell_style(col_name, raw_value)))
-                try:
-                    table.add_row(*values)
-                except Exception:
-                    pass
-            sig_cols = tuple((name, width) for name, width in columns)
-            sig_rows = tuple(tuple(str(cell) for cell in row.get("cells", [])) for row in rows)
-            self._project_table_sig = (sig_cols, sig_rows)
-            self._restore_table_x("#projects-table", keep_scroll_x)
-            self._set_project_cursor(min(self.selected, max(0, len(rows) - 1)))
+                    try:
+                        table.clear()
+                    except Exception:
+                        pass
+                if not columns:
+                    try:
+                        table.add_column("PROJECTS")
+                        table.add_row("No projects configured.")
+                    except Exception:
+                        pass
+                    self._project_table_sig = ((), ())
+                    self._set_project_cursor(0)
+                    return
+                for col_name, _col_width in columns:
+                    try:
+                        table.add_column(col_name)
+                    except Exception:
+                        pass
+                for row in rows:
+                    cells = row.get("cells", [])
+                    values = []
+                    for i, (col_name, _col_width) in enumerate(columns):
+                        raw_value = str(cells[i]) if i < len(cells) else ""
+                        values.append(Text(raw_value, style=self._cell_style(col_name, raw_value)))
+                    try:
+                        table.add_row(*values)
+                    except Exception:
+                        pass
+                sig_cols = tuple((name, width) for name, width in columns)
+                sig_rows = tuple(tuple(str(cell) for cell in row.get("cells", [])) for row in rows)
+                self._project_table_sig = (sig_cols, sig_rows)
+                self._restore_table_x("#projects-table", keep_scroll_x)
+                self._set_project_cursor(min(self.selected, max(0, len(rows) - 1)))
+            finally:
+                self._suspend_project_widget_sync = False
 
         def _rebuild_jobs_table(self, jobs_view: list[DashboardJob]) -> None:
             if not self._use_project_widget:
@@ -2021,52 +2198,56 @@ def cmd_dashboard(args):
             table = self.query_one("#jobs-table")
             keep_scroll_x = int(self._jobs_table_scroll_x)
             try:
-                table.clear(columns=True)
-            except Exception:
+                self._suspend_jobs_widget_sync = True
                 try:
-                    table.clear()
+                    table.clear(columns=True)
                 except Exception:
-                    pass
-            columns = [("JOBS", 6), ("ACTION", 8), ("PROJECT", 18), ("STATUS", 14), ("AGE", 6), ("EXIT", 6)]
-            for col_name, _col_width in columns:
-                try:
-                    table.add_column(col_name)
-                except Exception:
-                    pass
-            if not jobs_view:
-                try:
-                    table.add_row("-", "-", "-", Text("none", style="dim"), "-", "-")
-                except Exception:
-                    pass
-                self._jobs_table_sig = (tuple(c[0] for c in columns), ())
-                self._set_jobs_cursor(0)
-                return
+                    try:
+                        table.clear()
+                    except Exception:
+                        pass
+                columns = [("JOBS", 6), ("ACTION", 8), ("PROJECT", 18), ("STATUS", 14), ("AGE", 6), ("EXIT", 6)]
+                for col_name, _col_width in columns:
+                    try:
+                        table.add_column(col_name)
+                    except Exception:
+                        pass
+                if not jobs_view:
+                    try:
+                        table.add_row("-", "-", "-", Text("none", style="dim"), "-", "-")
+                    except Exception:
+                        pass
+                    self._jobs_table_sig = (tuple(c[0] for c in columns), ())
+                    self._set_jobs_cursor(0)
+                    return
 
-            visible = jobs_view[:10]
-            sig_rows = []
-            for job in visible:
-                rc_raw = "-" if job.return_code is None else str(job.return_code)
-                project_raw = job.project
-                status_raw = job.status
-                age_raw = _format_age(job.started_at)
-                action_raw = job.action
-                id_raw = str(job.job_id)
-                status_style = self._job_status_style(job.status)
-                sig_rows.append((id_raw, action_raw, project_raw, status_raw, age_raw, rc_raw))
-                try:
-                    table.add_row(
-                        id_raw,
-                        action_raw,
-                        project_raw,
-                        Text(status_raw, style=status_style),
-                        age_raw,
-                        rc_raw,
-                    )
-                except Exception:
-                    pass
-            self._jobs_table_sig = (tuple(c[0] for c in columns), tuple(sig_rows))
-            self._restore_table_x("#jobs-table", keep_scroll_x)
-            self._set_jobs_cursor(min(self.selected_job, max(0, len(visible) - 1)))
+                visible = jobs_view[:10]
+                sig_rows = []
+                for job in visible:
+                    rc_raw = "-" if job.return_code is None else str(job.return_code)
+                    project_raw = job.project
+                    status_raw = job.status
+                    age_raw = _format_age(job.started_at)
+                    action_raw = job.action
+                    id_raw = str(job.job_id)
+                    status_style = self._job_status_style(job.status)
+                    sig_rows.append((id_raw, action_raw, project_raw, status_raw, age_raw, rc_raw))
+                    try:
+                        table.add_row(
+                            id_raw,
+                            action_raw,
+                            project_raw,
+                            Text(status_raw, style=status_style),
+                            age_raw,
+                            rc_raw,
+                        )
+                    except Exception:
+                        pass
+                self._jobs_table_sig = (tuple(c[0] for c in columns), tuple(sig_rows))
+                self._restore_table_x("#jobs-table", keep_scroll_x)
+                self._set_jobs_cursor(min(self.selected_job, max(0, len(visible) - 1)))
+            finally:
+                self._suspend_jobs_widget_sync = False
 
         @staticmethod
         def _apply_hscroll(value: str, offset: int) -> str:
@@ -2232,19 +2413,11 @@ def cmd_dashboard(args):
                 return
             if self.show_project_detail:
                 # Closing: warn about unsaved changes
-                if self.detail_draft is not None and self.detail_original is not None:
-                    import copy, dataclasses
-                    draft_d = dataclasses.asdict(self.detail_draft) if dataclasses.is_dataclass(self.detail_draft) else {}
-                    orig_d = dataclasses.asdict(self.detail_original) if dataclasses.is_dataclass(self.detail_original) else {}
-                    # Strip read-only state/resources from comparison
-                    for d in (draft_d, orig_d):
-                        d.pop("state", None)
-                        d.pop("resources", None)
-                    if draft_d != orig_d:
-                        self.message = "unsaved changes — press w to save or press v again to discard"
-                        self._detail_close_pending = True
-                        self._refresh_view()
-                        return
+                if _project_detail_is_dirty(self.detail_draft, self.detail_original):
+                    self.message = "unsaved changes — press w to save or press v again to discard"
+                    self._detail_close_pending = True
+                    self._refresh_view()
+                    return
                 self._close_project_detail()
                 return
             if self.show_job_output or self.focus != "projects":
@@ -2268,7 +2441,7 @@ def cmd_dashboard(args):
                 return
             self.detail_draft = copy.deepcopy(project)
             self.detail_original = copy.deepcopy(project)
-            self.detail_checkpoints = []
+            self.detail_checkpoints = self.checkpoints.list(project_name)
             self.detail_cursor = 0
             self._detail_close_pending = False
             self.show_project_detail = True
@@ -2324,6 +2497,33 @@ def cmd_dashboard(args):
                 self.task_mode = "detail_edit_text"
                 self.task_input = str(current or "")
                 self.task_values = {"field": field["field"], "field_label": field.get("label", field["field"])}
+                self.focus = "task"
+                self.message = f"edit {field.get('label', field['field'])}"
+
+            elif action == "detail_edit_absolute_image":
+                current = str(_get_nested_field(self.detail_draft, field["field"]) or "").strip()
+                agent_name = str(getattr(self.detail_draft, "agent", "") or "").strip()
+                defaults = _compatible_default_images(store, agent_name)
+                option_refs = {}
+                options = []
+                for default_image in defaults:
+                    label = _default_image_option_label(default_image)
+                    options.append(label)
+                    option_refs[label] = str(getattr(default_image, "image", "") or "").strip()
+                options.extend(["Manual entry...", "Clear"])
+                default_index = options.index("Clear") if not current else options.index("Manual entry...")
+                for idx, option in enumerate(options):
+                    if option_refs.get(option, "") == current:
+                        default_index = idx
+                        break
+                self.task_mode = "detail_edit_absolute_image"
+                self.task_values = {
+                    "field": field["field"],
+                    "field_label": field.get("label", field["field"]),
+                    "default_image_refs": option_refs,
+                }
+                self.task_project_options = options
+                self.task_option_index = default_index
                 self.focus = "task"
                 self.message = f"edit {field.get('label', field['field'])}"
 
@@ -2398,9 +2598,8 @@ def cmd_dashboard(args):
             current_disk = store.load_project(project_name)
             if current_disk is not None:
                 ts = _utc_now_iso()
-                self.detail_checkpoints.append((ts, copy.deepcopy(current_disk)))
-                if len(self.detail_checkpoints) > 10:
-                    self.detail_checkpoints = self.detail_checkpoints[-10:]
+                self.checkpoints.append(project_name, ts, current_disk)
+                self.detail_checkpoints = self.checkpoints.list(project_name)
             try:
                 store.save_resource(self.detail_draft)
                 self.detail_original = copy.deepcopy(self.detail_draft)
@@ -2642,10 +2841,7 @@ def cmd_dashboard(args):
                 }
             )
             # Image source: filter default images to those compatible with the selected agent
-            agent_defaults = [
-                d for d in store.load_all_resources("DefaultImage")
-                if not d.agent or d.agent == agent_name
-            ]
+            agent_defaults = _compatible_default_images(store, agent_name)
             image_mode_options = ["Build new"]
             if agent_defaults:
                 image_mode_options.append("Default image")
@@ -2653,10 +2849,7 @@ def cmd_dashboard(args):
             steps.append({"key": "image_mode", "kind": "select", "label": "Image source", "options": image_mode_options})
             image_mode = self.task_values.get("image_mode", "Build new")
             if image_mode == "Default image":
-                default_opts = [
-                    d.name + (f"  [{d.description}]" if d.description else "")
-                    for d in agent_defaults
-                ]
+                default_opts = [_default_image_option_label(d) for d in agent_defaults]
                 steps.append({"key": "default_image", "kind": "select", "label": "Default image", "options": default_opts})
             elif image_mode == "Base image":
                 steps.append({"key": "image", "kind": "text", "label": "Base image (e.g. ubuntu:24.04)"})
@@ -3085,6 +3278,31 @@ def cmd_dashboard(args):
                 self._refresh_view()
                 return
 
+            if self.task_mode == "detail_edit_absolute_image":
+                options = self.task_project_options or []
+                choice = options[self.task_option_index] if options else "Clear"
+                field = self.task_values.get("field", "")
+                label = self.task_values.get("field_label", field)
+                if choice == "Manual entry...":
+                    current = ""
+                    if field and self.detail_draft is not None:
+                        current = str(_get_nested_field(self.detail_draft, field) or "")
+                    self.task_mode = "detail_edit_text"
+                    self.task_input = current
+                    self.task_values = {"field": field, "field_label": label}
+                    self.message = f"edit {label}"
+                    self._refresh_view()
+                    return
+                value = ""
+                if choice != "Clear":
+                    value = str(self.task_values.get("default_image_refs", {}).get(choice, "") or "").strip()
+                if field and self.detail_draft is not None:
+                    _set_nested_field(self.detail_draft, field, value)
+                    self.message = f"set {label}: {value or '(none)'}"
+                self._task_cancel(self.message)
+                self._refresh_view()
+                return
+
             if self.task_mode == "detail_edit_text":
                 value = self.task_input
                 field = self.task_values.get("field", "")
@@ -3283,7 +3501,7 @@ def cmd_dashboard(args):
                 return
             if self.task_mode in {
                 "project_ssh_add", "project_ssh_remove",
-                "detail_edit_select", "detail_source_action",
+                "detail_edit_select", "detail_edit_absolute_image", "detail_source_action",
                 "detail_ssh_action", "detail_revert",
             }:
                 if not self.task_project_options:
@@ -3486,13 +3704,8 @@ def cmd_dashboard(args):
                 return
 
             if self.show_project_detail:
-                import dataclasses
-                dirty = (
-                    self.detail_draft is not None and self.detail_original is not None
-                    and dataclasses.is_dataclass(self.detail_draft)
-                    and dataclasses.asdict(self.detail_draft) != dataclasses.asdict(self.detail_original)
-                )
-                dirty_tag = "  * unsaved" if dirty else ""
+                dirty = _project_detail_is_dirty(self.detail_draft, self.detail_original)
+                dirty_tag = "  [UNSAVED CHANGES]" if dirty else ""
                 detail_title = Text(
                     f"Project Detail: {self._project_detail_name() or '-'}{dirty_tag}  (v back · w save · u revert)",
                     style="bold",
@@ -3702,13 +3915,8 @@ def cmd_dashboard(args):
                 return
 
             if self.show_project_detail:
-                import dataclasses
-                dirty = (
-                    self.detail_draft is not None and self.detail_original is not None
-                    and dataclasses.is_dataclass(self.detail_draft)
-                    and dataclasses.asdict(self.detail_draft) != dataclasses.asdict(self.detail_original)
-                )
-                dirty_tag = "  * unsaved" if dirty else ""
+                dirty = _project_detail_is_dirty(self.detail_draft, self.detail_original)
+                dirty_tag = "  [UNSAVED CHANGES]" if dirty else ""
                 detail_title = Text(
                     f"Project Detail: {self._project_detail_name() or '-'}{dirty_tag}  (v back · w save · u revert)",
                     style="bold",
@@ -3931,40 +4139,12 @@ def cmd_dashboard(args):
                     return Group(line, rendered)
                 if self.task_mode == "project_ssh_add":
                     prefix = f"add SSH key to '{self.task_project_name}':"
-                    line = Text(prefix[:width].ljust(width), style="bold black on white")
                     options = self.task_project_options or ["Manual entry...", "Cancel"]
-                    rendered = Text(style="bold black on white")
-                    for i, option in enumerate(options):
-                        if i > 0:
-                            rendered.append("  |  ", style="black on white")
-                        if i == self.task_option_index:
-                            rendered.append(f"[{option}]", style="bold white on blue")
-                        else:
-                            rendered.append(option, style="bold black on white")
-                    plain = rendered.plain
-                    if len(plain) > width:
-                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
-                    elif len(plain) < width:
-                        rendered.append(" " * (width - len(plain)), style="black on white")
-                    return Group(line, rendered)
+                    return self._render_vertical_option_panel(prefix, options, self.task_option_index, width)
                 if self.task_mode == "project_ssh_remove":
                     prefix = f"remove SSH key from '{self.task_project_name}':"
-                    line = Text(prefix[:width].ljust(width), style="bold black on white")
                     options = self.task_project_options or ["Cancel"]
-                    rendered = Text(style="bold black on white")
-                    for i, option in enumerate(options):
-                        if i > 0:
-                            rendered.append("  |  ", style="black on white")
-                        if i == self.task_option_index:
-                            rendered.append(f"[{option}]", style="bold white on blue")
-                        else:
-                            rendered.append(option, style="bold black on white")
-                    plain = rendered.plain
-                    if len(plain) > width:
-                        rendered = Text(plain[: max(0, width - 1)], style="bold black on white")
-                    elif len(plain) < width:
-                        rendered.append(" " * (width - len(plain)), style="black on white")
-                    return Group(line, rendered)
+                    return self._render_vertical_option_panel(prefix, options, self.task_option_index, width)
                 if self.task_mode == "project_ssh_add_manual":
                     prefix = f"SSH private key path for '{self.task_project_name}': "
                     suffix = f"{self.task_input}|"
@@ -3988,6 +4168,10 @@ def cmd_dashboard(args):
                     scrolled = "…" + suffix[-keep:]
                     line = (prefix + scrolled)[:width]
                     return Text(line.ljust(width), style="bold black on white")
+                if self.task_mode == "detail_edit_absolute_image":
+                    prefix = f"select {self.task_values.get('field_label', 'value')}:"
+                    options = self.task_project_options or []
+                    return self._render_vertical_option_panel(prefix, options, self.task_option_index, width)
                 if self.task_mode in ("detail_edit_select", "detail_source_action",
                                       "detail_ssh_action", "detail_revert"):
                     label_map = {
@@ -4101,6 +4285,19 @@ def cmd_dashboard(args):
                 rendered.append(" " * (width - len(plain)), style="black on white")
             return Group(line, rendered)
 
+        def _render_vertical_option_panel(self, prefix: str, options: list, selected: int, width: int):
+            """Render a vertical option picker matching the wizard layout."""
+            prompt = prefix[: max(0, width - 1)] if len(prefix) >= width else prefix
+            lines = [Text(prompt.ljust(width), style="bold black on white")]
+            for i, option in enumerate(options):
+                option_prefix = "> " if i == selected else "  "
+                line = option_prefix + option
+                if len(line) >= width:
+                    line = line[: max(0, width - 1)]
+                style = "bold white on blue" if i == selected else "bold black on white"
+                lines.append(Text(line.ljust(width), style=style))
+            return Group(*lines)
+
         def _context_actions(self, jobs_view: list[DashboardJob]) -> list[tuple[str, str, str]]:
             if self.task_mode:
                 if self.task_mode == "job_input":
@@ -4123,7 +4320,7 @@ def cmd_dashboard(args):
                     ]
                 if self.task_mode in {"project_ssh_add", "project_ssh_remove"}:
                     return [
-                        ("←/→", "Choose", "bold yellow"),
+                        ("↑/↓", "Choose", "bold yellow"),
                         ("⏎", "Confirm", "bold green"),
                         ("Esc", "Cancel", "bold red"),
                     ]
@@ -4139,7 +4336,7 @@ def cmd_dashboard(args):
                         ("⏎", "Apply", "bold green"),
                         ("Esc", "Cancel", "bold red"),
                     ]
-                if self.task_mode in ("detail_edit_select", "detail_source_action",
+                if self.task_mode in ("detail_edit_select", "detail_edit_absolute_image", "detail_source_action",
                                       "detail_ssh_action", "detail_revert"):
                     return [
                         ("↑/↓", "Choose", "bold yellow"),
@@ -4195,16 +4392,7 @@ def cmd_dashboard(args):
                     ("q", "Quit", "bold bright_black"),
                 ]
             if self.show_project_detail:
-                import dataclasses
-                dirty = False
-                if (self.detail_draft is not None and self.detail_original is not None
-                        and dataclasses.is_dataclass(self.detail_draft)):
-                    d_d = dataclasses.asdict(self.detail_draft)
-                    o_d = dataclasses.asdict(self.detail_original)
-                    for d in (d_d, o_d):
-                        d.pop("state", None)
-                        d.pop("resources", None)
-                    dirty = d_d != o_d
+                dirty = _project_detail_is_dirty(self.detail_draft, self.detail_original)
                 has_checkpoints = bool(self.detail_checkpoints)
                 actions = [
                     ("↑/↓", "Navigate", "bold white"),
@@ -4283,18 +4471,13 @@ def cmd_dashboard(args):
                 return Text("Loading…", style="dim")
             store = ConfigStore()
             fields = _project_detail_fields(draft, store)
-            # Determine unsaved state for header marker
-            import dataclasses
-            dirty = False
-            if self.detail_original is not None and dataclasses.is_dataclass(draft):
-                d_d = dataclasses.asdict(draft)
-                o_d = dataclasses.asdict(self.detail_original)
-                for d in (d_d, o_d):
-                    d.pop("state", None)
-                    d.pop("resources", None)
-                dirty = d_d != o_d
+            dirty = _project_detail_is_dirty(draft, self.detail_original)
             checkpoint_count = len(self.detail_checkpoints)
             text = Text()
+            if dirty:
+                text.append(" UNSAVED CHANGES ", style="bold black on yellow")
+                text.append(" press w to save or u/v to discard", style="bold yellow")
+                text.append("\n\n")
             for idx, f in enumerate(fields):
                 display = f["display"]
                 is_cursor = (not self.task_mode) and f.get("editable") and idx == self.detail_cursor
@@ -4461,8 +4644,10 @@ def cmd_dashboard(args):
                     return "yellow bold"
                 if value.startswith("running"):
                     return "green bold"
-                if value.startswith("built"):
+                if value.startswith("ready"):
                     return "blue"
+                if value.startswith("refresh") or value.startswith("rebuild"):
+                    return "yellow bold"
                 if value.startswith("missing") or value.startswith("unreachable"):
                     return "red bold"
                 return ""

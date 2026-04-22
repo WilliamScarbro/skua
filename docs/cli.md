@@ -176,6 +176,7 @@ The dashboard auto-refreshes every 2 seconds. Background job history and logs ar
 The bottom command bar is context-aware and changes based on whether focus is in projects, jobs, or job output view.
 Pressing `n` opens an in-dashboard wizard in the status bar (no terminal suspend): type text fields, use `←/→` or `↑/↓` for selectors, `Enter` to advance, and `Esc` to cancel.
 Background jobs now run in a PTY and can enter a `waiting_input` state when they prompt. Open the job output view and type a reply in the status bar, then press `Enter` to send input back to the running job.
+Dashboard convention: selectors with long option labels should render vertically instead of as a horizontal chip row. This avoids truncation and is the preferred fix for project-detail pickers such as `absolute image`.
 
 ### `skua clean [<name>]`
 

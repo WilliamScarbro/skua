@@ -2,6 +2,7 @@
 """Tests for skua dashboard command."""
 
 import argparse
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -16,14 +17,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from skua.config.loader import ConfigStore
-from skua.config.resources import Project, ProjectSourceSpec
+from skua.config.resources import DefaultImage, Project, ProjectSourceSpec
 
 class TestDashboardSnapshot(unittest.TestCase):
     @mock.patch("skua.commands.dashboard.get_running_skua_containers", return_value=[])
+    @mock.patch("skua.commands.dashboard._project_build_preflight")
     @mock.patch("skua.commands.list_cmd.image_exists", return_value=True)
-    def test_collect_snapshot_clears_stale_operation_state(self, _mock_image_exists, _mock_running):
+    def test_collect_snapshot_clears_stale_operation_state(self, _mock_image_exists, mock_preflight, _mock_running):
         from skua.commands.dashboard import _collect_snapshot
 
+        mock_preflight.return_value = mock.Mock(needs_rebuild=False, force_refresh=False, error="")
         with tempfile.TemporaryDirectory() as tmpdir:
             store = ConfigStore(config_dir=Path(tmpdir))
             store.ensure_dirs()
@@ -37,7 +40,7 @@ class TestDashboardSnapshot(unittest.TestCase):
                 snap = _collect_snapshot(argparse.Namespace())
 
             status_idx = [c[0] for c in snap.columns].index("STATUS")
-            self.assertEqual("built", snap.rows[0]["cells"][status_idx])
+            self.assertEqual("ready", snap.rows[0]["cells"][status_idx])
             refreshed = store.load_project("demo")
             self.assertEqual("", refreshed.state.status)
 
@@ -171,6 +174,67 @@ class TestDashboardSnapshot(unittest.TestCase):
         self.assertEqual("running!", snap.rows[0]["cells"][status_idx])
         self.assertEqual("cred-main !stale", snap.rows[0]["cells"][cred_idx])
         self.assertTrue(any("stale/missing local credentials" in line for line in snap.summary))
+
+    @mock.patch("skua.commands.dashboard._project_build_preflight")
+    @mock.patch("skua.commands.dashboard.image_exists", return_value=True)
+    @mock.patch("skua.commands.list_cmd.image_exists", return_value=True)
+    @mock.patch("skua.commands.dashboard.get_running_skua_containers")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_collect_snapshot_marks_refresh_required(self, MockStore, mock_running, _mock_list_exists, _mock_dash_exists, mock_preflight):
+        from skua.commands.dashboard import _collect_snapshot
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = SimpleNamespace(
+            name="demo",
+            directory="/tmp/demo",
+            repo="",
+            host="",
+            environment="local-docker",
+            security="open",
+            agent="codex",
+            credential="",
+        )
+        store.load_environment.return_value = SimpleNamespace(network=SimpleNamespace(mode="bridge"))
+        mock_running.return_value = []
+        mock_preflight.return_value = mock.Mock(needs_rebuild=True, force_refresh=True, error="")
+
+        snap = _collect_snapshot(argparse.Namespace())
+        status_idx = [c[0] for c in snap.columns].index("STATUS")
+
+        self.assertEqual("refresh", snap.rows[0]["cells"][status_idx])
+        self.assertTrue(any("ready=run now" in line for line in snap.summary))
+
+    @mock.patch("skua.commands.dashboard._project_build_preflight")
+    @mock.patch("skua.commands.dashboard.image_exists", return_value=True)
+    @mock.patch("skua.commands.list_cmd.image_exists", return_value=True)
+    @mock.patch("skua.commands.dashboard.get_running_skua_containers")
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_collect_snapshot_marks_rebuild_required(self, MockStore, mock_running, _mock_list_exists, _mock_dash_exists, mock_preflight):
+        from skua.commands.dashboard import _collect_snapshot
+
+        store = MockStore.return_value
+        store.load_global.return_value = {}
+        store.list_resources.return_value = ["demo"]
+        store.resolve_project.return_value = SimpleNamespace(
+            name="demo",
+            directory="/tmp/demo",
+            repo="",
+            host="",
+            environment="local-docker",
+            security="open",
+            agent="codex",
+            credential="",
+        )
+        store.load_environment.return_value = SimpleNamespace(network=SimpleNamespace(mode="bridge"))
+        mock_running.return_value = []
+        mock_preflight.return_value = mock.Mock(needs_rebuild=True, force_refresh=False, error="")
+
+        snap = _collect_snapshot(argparse.Namespace())
+        status_idx = [c[0] for c in snap.columns].index("STATUS")
+
+        self.assertEqual("rebuild", snap.rows[0]["cells"][status_idx])
 
 
 class TestDashboardCli(unittest.TestCase):
@@ -709,6 +773,104 @@ class TestDashboardAddFlow(unittest.TestCase):
         self.assertEqual("cred-a", app.task_values["credential_choice"])
 
 
+class TestDashboardWidgetSelection(unittest.TestCase):
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_project_widget_selection_survives_refresh(self, MockStore):
+        import skua.commands.dashboard as dashboard
+        from skua.commands.dashboard import DashboardSnapshot
+
+        store = MockStore.return_value
+        store.list_resources.return_value = []
+        store.load_all_resources.return_value = []
+        store.load_project.return_value = None
+
+        captured = {}
+
+        def fake_run(self, **_kwargs):
+            captured["app"] = self
+
+        args = argparse.Namespace(refresh_seconds=0)
+        with mock.patch("textual.app.App.run", new=fake_run):
+            dashboard.cmd_dashboard(args)
+
+        app = captured["app"]
+        rows = [{"name": f"p{i}", "cells": [f"p{i}", "built"]} for i in range(5)]
+        snapshot = DashboardSnapshot(columns=[("NAME", 12), ("STATUS", 8)], rows=rows, summary=["ok"])
+
+        async def run_case():
+            with mock.patch.object(app, "_request_refresh", lambda: None):
+                async with app.run_test() as pilot:
+                    app.snapshot = snapshot
+                    app._refresh_view()
+                    table = app.query_one("#projects-table")
+
+                    table.move_cursor(row=3, column=0)
+                    await pilot.pause()
+
+                    self.assertEqual(3, app.selected)
+                    self.assertEqual("p3", app.selected_project_name)
+
+                    refreshed_rows = [{"name": f"p{i}", "cells": [f"p{i}", "running"]} for i in range(5)]
+                    app._apply_snapshot(
+                        DashboardSnapshot(
+                            columns=[("NAME", 12), ("STATUS", 8)],
+                            rows=refreshed_rows,
+                            summary=["ok"],
+                        )
+                    )
+                    await pilot.pause()
+
+                    self.assertEqual(3, app.selected)
+                    self.assertEqual("p3", app.selected_project_name)
+                    self.assertEqual(3, table.cursor_row)
+
+        asyncio.run(run_case())
+
+    @mock.patch("skua.commands.dashboard.ConfigStore")
+    def test_enter_binding_runs_project_even_when_table_has_focus(self, MockStore):
+        import skua.commands.dashboard as dashboard
+        from skua.commands.dashboard import DashboardSnapshot
+
+        store = MockStore.return_value
+        store.list_resources.return_value = []
+        store.load_all_resources.return_value = []
+        store.load_project.return_value = None
+
+        captured = {}
+
+        def fake_run(self, **_kwargs):
+            captured["app"] = self
+
+        args = argparse.Namespace(refresh_seconds=0)
+        with mock.patch("textual.app.App.run", new=fake_run):
+            dashboard.cmd_dashboard(args)
+
+        app = captured["app"]
+        snapshot = DashboardSnapshot(
+            columns=[("NAME", 12), ("STATUS", 8)],
+            rows=[{"name": "demo", "cells": ["demo", "built"]}],
+            summary=["ok"],
+        )
+
+        async def run_case():
+            with mock.patch.object(app, "_request_refresh", lambda: None), \
+                 mock.patch("skua.commands.dashboard._lock_block_message", return_value=""), \
+                 mock.patch.object(app, "_project_is_running", return_value=True), \
+                 mock.patch("skua.commands.dashboard._execute_action", return_value=(True, "ok")) as mock_exec:
+                async with app.run_test() as pilot:
+                    app._apply_snapshot(snapshot)
+                    await pilot.pause()
+
+                    self.assertEqual("projects-table", getattr(app.focused, "id", ""))
+
+                    await pilot.press("enter")
+                    await pilot.pause()
+
+                    mock_exec.assert_called_once_with("run", "demo", replace_process=False)
+
+        asyncio.run(run_case())
+
+
 class TestDashboardClipboard(unittest.TestCase):
     @mock.patch("skua.commands.dashboard.Path.exists", return_value=True)
     @mock.patch("skua.commands.dashboard._clipboard_commands", return_value=[])
@@ -742,6 +904,34 @@ class TestDashboardClipboard(unittest.TestCase):
 
 
 class TestDashboardProjectDetail(unittest.TestCase):
+    def test_project_detail_dirty_ignores_runtime_state_and_resources(self):
+        from skua.commands.dashboard import _project_detail_is_dirty
+
+        original = Project(name="demo", directory="/tmp/demo")
+        draft = Project(name="demo", directory="/tmp/demo")
+
+        draft.state.status = "running"
+        draft.resources.images = ["skua-demo:1"]
+
+        self.assertFalse(_project_detail_is_dirty(draft, original))
+
+        draft.image.base_image = "ubuntu:24.04"
+        self.assertTrue(_project_detail_is_dirty(draft, original))
+
+    def test_compatible_default_images_filter_by_agent(self):
+        from skua.commands.dashboard import _compatible_default_images
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            store.save_resource(DefaultImage(name="shared", image="ghcr.io/acme/shared:latest"))
+            store.save_resource(DefaultImage(name="codex-only", image="ghcr.io/acme/codex:latest", agent="codex"))
+            store.save_resource(DefaultImage(name="claude-only", image="ghcr.io/acme/claude:latest", agent="claude"))
+
+            compatible = _compatible_default_images(store, "codex")
+
+        self.assertEqual(["codex-only", "shared"], [default.name for default in compatible])
+
     def test_project_detail_fields_include_sources_and_ssh_keys(self):
         from skua.commands.dashboard import _project_detail_fields
 
@@ -762,6 +952,7 @@ class TestDashboardProjectDetail(unittest.TestCase):
                 "/home/dev/.ssh/id_rsa_work",
             ]
             project.image.base_image = "ubuntu:24.04"
+            project.image.absolute_image = "ghcr.io/acme/codex-default:latest"
             project.image.extra_packages = ["git", "ripgrep"]
             project.image.extra_commands = ["apt-get update", "apt-get install -y jq"]
             project.image.version = 3
@@ -793,6 +984,7 @@ class TestDashboardProjectDetail(unittest.TestCase):
         self.assertIn("base-b:", detail)
         self.assertIn("/home/dev/.ssh/id_ed25519 (primary)", detail)
         self.assertIn("/home/dev/.ssh/id_rsa_work", detail)
+        self.assertIn("absolute_image: ghcr.io/acme/codex-default:latest", detail)
         self.assertIn("base_image: ubuntu:24.04", detail)
         self.assertIn("extra_packages: git, ripgrep", detail)
         self.assertIn("images: skua-myproj:3", detail)
@@ -801,6 +993,8 @@ class TestDashboardProjectDetail(unittest.TestCase):
         self.assertTrue(any(f["section"] and "Sources" in f["display"] for f in fields))
         self.assertTrue(any(f["section"] and "SSH keys" in f["display"] for f in fields))
         self.assertTrue(any(f["section"] and "Image" in f["display"] for f in fields))
+        self.assertTrue(any(f.get("field") == "image.absolute_image" and f.get("action") == "detail_edit_absolute_image" for f in fields))
+        self.assertTrue(any(f.get("field") == "image.from_image" and f.get("action") == "detail_edit_text" for f in fields))
         # Editable fields exist
         editable = [f for f in fields if f.get("editable")]
         self.assertGreater(len(editable), 5)
@@ -817,3 +1011,44 @@ class TestDashboardProjectDetail(unittest.TestCase):
             fields = _project_detail_fields(project, store)
             self.assertIsInstance(fields, list)
             self.assertGreater(len(fields), 0)
+
+
+class TestDashboardCheckpointManager(unittest.TestCase):
+    def test_checkpoint_manager_persists_across_instances(self):
+        from skua.commands.dashboard import DashboardCheckpointManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = Path(tmpdir)
+            first = DashboardCheckpointManager(config_dir=config_dir)
+            project = Project(name="demo", directory="/tmp/demo-v1")
+            first.append("demo", "2026-04-13T00:00:00+00:00", project)
+
+            second = DashboardCheckpointManager(config_dir=config_dir)
+            checkpoints = second.list("demo")
+
+        self.assertEqual(1, len(checkpoints))
+        ts, restored = checkpoints[0]
+        self.assertEqual("2026-04-13T00:00:00+00:00", ts)
+        self.assertEqual("demo", restored.name)
+        self.assertEqual("/tmp/demo-v1", restored.directory)
+
+    def test_checkpoint_manager_limits_history_per_project(self):
+        from skua.commands.dashboard import DashboardCheckpointManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = DashboardCheckpointManager(config_dir=Path(tmpdir), max_checkpoints=3)
+            for idx in range(5):
+                project = Project(name="demo", directory=f"/tmp/demo-{idx}")
+                manager.append("demo", f"2026-04-13T00:00:0{idx}+00:00", project)
+
+            checkpoints = manager.list("demo")
+
+        self.assertEqual(3, len(checkpoints))
+        self.assertEqual(
+            [
+                "2026-04-13T00:00:02+00:00",
+                "2026-04-13T00:00:03+00:00",
+                "2026-04-13T00:00:04+00:00",
+            ],
+            [ts for ts, _project in checkpoints],
+        )

@@ -117,7 +117,7 @@ def cmd_stop(args, lock_project: bool = True) -> bool:
         print("Stop cancelled.")
         return False
 
-    cmd = ["docker", "stop", container_name]
+    cmd = ["docker", "stop", "--time", "15", container_name]
     if host:
         cmd = ["ssh", host, *cmd]
     result = subprocess.run(cmd)

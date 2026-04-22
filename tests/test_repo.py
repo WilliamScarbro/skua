@@ -214,6 +214,24 @@ class TestProjectImageNaming(unittest.TestCase):
         self.assertEqual(packages, ["curl", "git", "jq"])
         self.assertEqual(commands, ["echo global", "echo hi"])
 
+    def test_effective_project_image_prefers_absolute_image(self):
+        from skua.docker import effective_project_image
+
+        project = Project(
+            name="myproj",
+            agent="codex",
+            image=ProjectImageSpec(
+                absolute_image="ghcr.io/example/codex-default:latest",
+                from_image="ghcr.io/example/base-layer:latest",
+                extra_packages=["git"],
+            ),
+        )
+
+        self.assertEqual(
+            effective_project_image("skua-base", project, ["curl"], ["echo global"]),
+            "ghcr.io/example/codex-default:latest",
+        )
+
 
 class TestCompositeProjects(unittest.TestCase):
     def test_build_run_command_mounts_multiple_sources(self):
@@ -1062,6 +1080,31 @@ class TestAgentInstallRefresh(unittest.TestCase):
         self.assertEqual("skua-test-proj", docker_cmd[-2])
         self.assertTrue(_mock_hash.call_args.kwargs["layer_on_base"])
 
+    @mock.patch("skua.docker.subprocess.run")
+    @mock.patch("skua.docker.compute_build_context_hash", return_value="ctx-hash")
+    def test_build_image_layered_project_does_not_pull_local_base(self, _mock_hash, mock_run):
+        from skua.docker import build_image
+
+        mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            container_dir = Path(tmpdir) / "container"
+            container_dir.mkdir()
+            success, _ = build_image(
+                container_dir=container_dir,
+                image_name="skua-test-proj",
+                base_image="skua-base-codex",
+                quiet=True,
+                pull=True,
+                no_cache=True,
+                layer_on_base=True,
+            )
+
+        self.assertTrue(success)
+        docker_cmd = mock_run.call_args_list[0].args[0]
+        self.assertNotIn("--pull", docker_cmd)
+        self.assertIn("--no-cache", docker_cmd)
+
     @mock.patch("skua.docker.image_exists", return_value=False)
     def test_image_rebuild_needed_when_image_missing(self, _mock_exists):
         from skua.docker import image_rebuild_needed
@@ -1091,6 +1134,31 @@ class TestAgentInstallRefresh(unittest.TestCase):
         self.assertTrue(needs_rebuild)
         self.assertTrue(force_refresh)
         self.assertIn("update", reason)
+
+    @mock.patch("skua.docker.image_matches_build_context", return_value=True)
+    @mock.patch("skua.docker.floating_agent_update_available", return_value=(True, "codex client update available"))
+    @mock.patch("skua.docker.agent_install_uses_floating_version", return_value=True)
+    @mock.patch("skua.docker.image_exists", return_value=True)
+    def test_image_rebuild_needed_layered_project_skips_floating_client_refresh(
+        self, _mock_exists, _mock_floating, _mock_update, _mock_matches
+    ):
+        from skua.docker import image_rebuild_needed
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        needs_rebuild, force_refresh, reason = image_rebuild_needed(
+            "skua-base-codex-skua-v2",
+            Path("/tmp"),
+            agent=agent,
+            base_image="skua-base-codex",
+            layer_on_base=True,
+        )
+        self.assertFalse(needs_rebuild)
+        self.assertFalse(force_refresh)
+        self.assertEqual("", reason)
+        _mock_update.assert_not_called()
 
 
 class TestContainerAttachCommand(unittest.TestCase):
