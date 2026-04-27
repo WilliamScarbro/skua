@@ -1859,6 +1859,7 @@ def cmd_dashboard(args):
             self.output_scroll = 0
             self.output_follow = False
             self.detail_cursor = 0          # index into _project_detail_fields list
+            self.detail_scroll = 0          # first visible field index for project detail viewport
             self.detail_draft = None        # Project copy being edited (None = not editing)
             self.detail_original = None     # Project state when detail was opened
             self.detail_checkpoints = []    # list of (iso_timestamp, Project) loaded from checkpoint store
@@ -2443,6 +2444,7 @@ def cmd_dashboard(args):
             self.detail_original = copy.deepcopy(project)
             self.detail_checkpoints = self.checkpoints.list(project_name)
             self.detail_cursor = 0
+            self.detail_scroll = 0
             self._detail_close_pending = False
             self.show_project_detail = True
             self.selected_project_name = project_name
@@ -2479,6 +2481,9 @@ def cmd_dashboard(args):
 
             if action == "detail_edit_select":
                 options = store.list_resources(field["options_kind"])
+                if field["field"] == "credential":
+                    agent_name = str(getattr(self.detail_draft, "agent", "") or "").strip()
+                    options = [c for c in options if _cred_matches_agent(store, c, agent_name)]
                 if field.get("allow_none"):
                     options = ["(none)"] + options
                 current = _get_nested_field(self.detail_draft, field["field"])
@@ -3273,7 +3278,15 @@ def cmd_dashboard(args):
                 label = self.task_values.get("field_label", field)
                 if field and self.detail_draft is not None:
                     _set_nested_field(self.detail_draft, field, value)
-                    self.message = f"set {label}: {value or '(none)'}"
+                    msg = f"set {label}: {value or '(none)'}"
+                    # Changing the agent can invalidate the project's credential.
+                    # Clear it transparently so the draft stays consistent.
+                    if field == "agent":
+                        cred_name = str(getattr(self.detail_draft, "credential", "") or "").strip()
+                        if cred_name and not _cred_matches_agent(ConfigStore(), cred_name, value):
+                            self.detail_draft.credential = ""
+                            msg = f"{msg}; cleared incompatible credential '{cred_name}'"
+                    self.message = msg
                 self._task_cancel(self.message)
                 self._refresh_view()
                 return
@@ -4473,42 +4486,133 @@ def cmd_dashboard(args):
             fields = _project_detail_fields(draft, store)
             dirty = _project_detail_is_dirty(draft, self.detail_original)
             checkpoint_count = len(self.detail_checkpoints)
+
+            # 90s retro neon palette — one accent per section so each block reads
+            # at a glance even when fields share the same indent.
+            section_palette = {
+                "Project":    "#FF00FF",  # hot magenta
+                "References": "#00FFFF",  # neon cyan
+                "Sources":    "#39FF14",  # lime green
+                "SSH keys":   "#FFD700",  # arcade gold
+                "Image":      "#FF69B4",  # bubblegum pink
+                "Git":        "#FF8C00",  # neon orange
+                "State":      "#B14EFF",  # vaporwave purple
+                "Resources":  "#1E90FF",  # electric blue
+            }
+            default_accent = "#FFFFFF"
+
+            section_for_field: list[str] = []
+            current_section = "Project"
+            for f in fields:
+                if f.get("section"):
+                    label = f["display"].split(":", 1)[0].strip()
+                    if label:
+                        current_section = label
+                section_for_field.append(current_section)
+
+            # Reserve enough lines for the surrounding chrome (titles, dirty
+            # banner, scroll hints, status bar, command bar).
+            viewport_h = (getattr(self, "size", None).height or 24)
+            reserved = 12 + (2 if dirty else 0)
+            visible_h = max(6, viewport_h - reserved)
+
+            # Keep the cursor inside the viewport with a small margin.
+            if not self.task_mode:
+                margin = 2
+                if self.detail_cursor < self.detail_scroll + margin:
+                    self.detail_scroll = max(0, self.detail_cursor - margin)
+                elif self.detail_cursor >= self.detail_scroll + visible_h - margin:
+                    self.detail_scroll = max(0, self.detail_cursor - visible_h + margin + 1)
+
+            max_scroll = max(0, len(fields) - visible_h)
+            self.detail_scroll = max(0, min(self.detail_scroll, max_scroll))
+            start = self.detail_scroll
+            end = min(len(fields), start + visible_h)
+
+            width = max(20, (getattr(self, "size", None).width or 80))
+
             text = Text()
             if dirty:
-                text.append(" UNSAVED CHANGES ", style="bold black on yellow")
-                text.append(" press w to save or u/v to discard", style="bold yellow")
+                text.append(" ★ UNSAVED CHANGES ★ ", style="bold black on #FFFF00")
+                text.append("  press ", style="bold #FF00FF")
+                text.append("w", style="bold #00FFFF")
+                text.append(" to save or ", style="bold #FF00FF")
+                text.append("u/v", style="bold #00FFFF")
+                text.append(" to discard", style="bold #FF00FF")
                 text.append("\n\n")
-            for idx, f in enumerate(fields):
+
+            if start > 0:
+                hint = f"  ▲▲▲  {start} more above  ▲▲▲"
+                text.append(hint + "\n", style="bold #00FFFF")
+
+            for idx in range(start, end):
+                f = fields[idx]
                 display = f["display"]
                 is_cursor = (not self.task_mode) and f.get("editable") and idx == self.detail_cursor
+                accent = section_palette.get(section_for_field[idx], default_accent)
+
                 if f.get("section"):
-                    if display.startswith("Project:") and dirty:
-                        display = display + "  *"
-                    style = "bold white"
+                    label = display.strip()
+                    if label.startswith("Project:") and dirty:
+                        label = label + "  ✱"
+                    bar = f"▓▒░ {label} "
+                    fill_len = max(2, width - len(bar) - 1)
+                    text.append(bar, style=f"bold {accent} on black")
+                    text.append("░▒▓" + "▒" * max(0, fill_len - 3), style=f"{accent}")
+                elif not display.strip():
+                    # blank spacer line
+                    pass
                 elif is_cursor:
-                    style = "bold white on blue"
+                    body = display.lstrip()
+                    text.append("▶ ", style="bold #FFFF00 on #FF00FF")
+                    text.append(body.ljust(max(0, width - 3)), style="bold black on #FF00FF")
                 elif f.get("editable"):
-                    if f.get("action") in ("detail_save", "detail_revert"):
-                        if f["action"] == "detail_revert" and not (dirty or checkpoint_count):
-                            style = "dim"
+                    action = f.get("action", "")
+                    if action in ("detail_save", "detail_revert"):
+                        if action == "detail_revert" and not (dirty or checkpoint_count):
+                            text.append(display, style="dim")
+                        elif action == "detail_save":
+                            text.append(display, style="bold black on #39FF14")
                         else:
-                            style = "bold cyan"
+                            text.append(display, style="bold black on #FFD700")
+                    elif display.lstrip().startswith("[+]"):
+                        # Add-source / Add-SSH affordances pop in the section accent.
+                        text.append("  ", style="")
+                        text.append(display.lstrip(), style=f"bold {accent}")
                     else:
-                        style = "bold"
+                        body = display.lstrip()
+                        # Split "key: value" so labels read in the section accent
+                        # and values stay readable in white.
+                        if ": " in body:
+                            key, _, value = body.partition(": ")
+                            text.append("  ", style="")
+                            text.append(key, style=f"bold {accent}")
+                            text.append(": ", style="dim")
+                            text.append(value, style="bold white")
+                        else:
+                            text.append("  " + body, style=f"bold {accent}")
                 else:
-                    style = ""
-                prefix = "> " if is_cursor else "  " if f.get("editable") and not f.get("section") and not display.startswith("  ") else ""
-                if is_cursor and not display.startswith("  "):
-                    prefix = "> "
-                elif is_cursor:
-                    display = "> " + display[2:]  # replace leading spaces with cursor
-                    prefix = ""
-                text.append(display if prefix == "" else prefix + display, style=style)
-                if idx < len(fields) - 1:
+                    body = display.lstrip()
+                    if ": " in body:
+                        key, _, value = body.partition(": ")
+                        text.append("  ", style="")
+                        text.append(key, style=f"dim {accent}")
+                        text.append(": ", style="dim")
+                        text.append(value, style="white")
+                    else:
+                        text.append(display, style="dim white")
+
+                if idx < end - 1:
                     text.append("\n")
-            # Checkpoint summary line
+
+            if end < len(fields):
+                hint = f"\n  ▼▼▼  {len(fields) - end} more below  ▼▼▼"
+                text.append(hint, style="bold #00FFFF")
+
             if checkpoint_count:
-                text.append(f"\n  ({checkpoint_count} checkpoint{'s' if checkpoint_count != 1 else ''} available for revert)", style="dim")
+                cp_msg = f"\n\n  ◆ {checkpoint_count} checkpoint{'s' if checkpoint_count != 1 else ''} available for revert"
+                text.append(cp_msg, style="dim #B14EFF")
+
             return text
 
         def _fit_project_columns(self, columns: list[tuple[str, int]]) -> list[tuple[str, int]]:
