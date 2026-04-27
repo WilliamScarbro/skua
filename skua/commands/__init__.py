@@ -20,9 +20,10 @@ from skua.commands.dashboard import cmd_dashboard
 from skua.commands.source_cmd import cmd_source
 from skua.commands.ssh_cmd import cmd_ssh
 from skua.commands.default_image import cmd_default_image
+from skua.commands.agent_cmd import cmd_agent
 __all__ = [
     "cmd_build", "cmd_init", "cmd_add", "cmd_remove", "cmd_run", "cmd_stop",
     "cmd_restart", "cmd_adapt", "cmd_list", "cmd_clean", "cmd_purge",
     "cmd_config", "cmd_validate", "cmd_describe", "cmd_credential", "cmd_dashboard",
-    "cmd_source", "cmd_ssh", "cmd_default_image",
+    "cmd_source", "cmd_ssh", "cmd_default_image", "cmd_agent",
 ]

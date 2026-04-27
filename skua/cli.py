@@ -343,6 +343,21 @@ def main():
         help="Do not prompt for key selection; requires --ssh-key or --all",
     )
 
+    # agent
+    p_agent = sub.add_parser("agent", help="Manage the agent assigned to a project")
+    agent_sub = p_agent.add_subparsers(dest="action")
+
+    agent_sub.add_parser("list", help="List configured agents")
+
+    p_agent_set = agent_sub.add_parser("set", help="Change a project's agent")
+    p_agent_set.add_argument("name", help="Project name")
+    p_agent_set.add_argument("agent", help="Agent config name to assign")
+    p_agent_set.add_argument(
+        "--keep-credential",
+        action="store_true",
+        help="Keep an existing credential even if it does not match the new agent",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -354,7 +369,7 @@ def main():
         cmd_build, cmd_init, cmd_add, cmd_remove, cmd_run, cmd_stop, cmd_restart,
         cmd_adapt, cmd_list, cmd_clean, cmd_purge, cmd_config, cmd_validate,
         cmd_describe, cmd_credential, cmd_dashboard, cmd_source, cmd_ssh,
-        cmd_default_image,
+        cmd_default_image, cmd_agent,
     )
 
     commands = {
@@ -377,6 +392,7 @@ def main():
         "credential": _handle_credential,
         "ssh": _handle_ssh,
         "default-image": _handle_default_image,
+        "agent": _handle_agent,
     }
     commands[args.command](args)
 
@@ -428,6 +444,19 @@ def _handle_default_image(args):
         print("  remove <name>             Remove a default image entry")
         sys.exit(1)
     cmd_default_image(args)
+
+
+def _handle_agent(args):
+    """Dispatch agent subcommands, showing help if no action given."""
+    from skua.commands import cmd_agent
+    if not args.action:
+        print("usage: skua agent <action> [options]")
+        print()
+        print("actions:")
+        print("  list                       List configured agents")
+        print("  set <project> <agent>      Change a project's agent")
+        sys.exit(1)
+    cmd_agent(args)
 
 
 if __name__ == "__main__":
