@@ -1012,6 +1012,89 @@ class TestDashboardProjectDetail(unittest.TestCase):
             self.assertIsInstance(fields, list)
             self.assertGreater(len(fields), 0)
 
+    def test_detail_cursor_only_repaints_two_rows(self):
+        """Cursor moves over the project detail must not rebuild every row.
+
+        Regression: the entire detail pane used to repaint on every up/down,
+        which made Emacs term buffers visibly jump. The fix mirrors the
+        projects table — content rebuilds are signature-gated and cursor
+        moves go through update_cell on just the previous and new rows.
+        """
+        captured = {}
+
+        def fake_run(self):
+            captured["app"] = self
+            return None
+
+        with mock.patch("textual.app.App.run", new=fake_run):
+            from skua.commands.dashboard import cmd_dashboard, _project_detail_fields
+            cmd_dashboard(SimpleNamespace(refresh_seconds=0))
+
+        app = captured["app"]
+        AppClass = type(app)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ConfigStore(config_dir=Path(tmpdir))
+            store.ensure_dirs()
+            project = Project(name="demo", directory="/tmp",
+                              agent="claude", environment="local-docker",
+                              security="open")
+            project.image.absolute_image = "ghcr.io/acme/demo:1"
+            store.save_resource(project)
+
+            class FakeTable:
+                def __init__(self):
+                    self.rows = {}
+                    self.add_row_calls = 0
+                    self.update_cell_calls = 0
+                def clear(self, columns=False):
+                    self.rows.clear()
+                def add_column(self, name, key=None):
+                    pass
+                def add_row(self, *cells, key=None, height=1, label=None):
+                    self.rows[key] = list(cells)
+                    self.add_row_calls += 1
+                def update_cell(self, row_key, col_key, value, update_width=False):
+                    self.update_cell_calls += 1
+                def move_cursor(self, row=0, column=0, animate=False):
+                    pass
+                def scroll_to(self, **kw):
+                    pass
+
+            fake_table = FakeTable()
+            app.detail_draft = project
+            app.detail_original = project
+            app.detail_checkpoints = []
+            app.task_mode = ""
+            app.show_project_detail = True
+            app.query_one = mock.MagicMock(return_value=fake_table)
+
+            with mock.patch.object(AppClass, "size", new_callable=mock.PropertyMock) as size_prop, \
+                 mock.patch("skua.commands.dashboard.ConfigStore", return_value=store):
+                size_prop.return_value = SimpleNamespace(width=100, height=30)
+
+                fields = _project_detail_fields(project, store)
+                sections = app._detail_section_for_fields(fields)
+                editable = [i for i, f in enumerate(fields) if f.get("editable")]
+                app.detail_cursor = editable[0]
+                app._rebuild_detail_table(fields, sections,
+                                            dirty=False, checkpoint_count=0,
+                                            width=100)
+
+                rebuild_after_initial = fake_table.add_row_calls
+                self.assertGreater(rebuild_after_initial, 0)
+
+                for idx in editable[1:5]:
+                    app.detail_cursor = idx
+                    app._apply_detail_cursor(dirty=False, checkpoint_count=0,
+                                              width=100)
+
+        self.assertEqual(rebuild_after_initial, fake_table.add_row_calls,
+                         "cursor moves must not trigger add_row (full rebuild)")
+        # Each cursor move repaints up to 2 rows (old + new). Allow some slack.
+        self.assertLessEqual(fake_table.update_cell_calls, 4 * 2)
+        self.assertGreater(fake_table.update_cell_calls, 0)
+
 
 class TestDashboardCheckpointManager(unittest.TestCase):
     def test_checkpoint_manager_persists_across_instances(self):

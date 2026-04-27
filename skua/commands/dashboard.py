@@ -1792,6 +1792,14 @@ def cmd_dashboard(args):
             height: auto;
             max-height: 12;
         }
+        #project-detail-title {
+            height: auto;
+            display: none;
+        }
+        #project-detail-table {
+            height: 1fr;
+            display: none;
+        }
         #dashboard-footer {
             height: auto;
         }
@@ -1859,11 +1867,16 @@ def cmd_dashboard(args):
             self.output_scroll = 0
             self.output_follow = False
             self.detail_cursor = 0          # index into _project_detail_fields list
-            self.detail_scroll = 0          # first visible field index for project detail viewport
             self.detail_draft = None        # Project copy being edited (None = not editing)
             self.detail_original = None     # Project state when detail was opened
             self.detail_checkpoints = []    # list of (iso_timestamp, Project) loaded from checkpoint store
             self._detail_close_pending = False  # waiting for second v to discard unsaved changes
+            self._detail_table_sig = None   # signature of last-built detail table content
+            self._detail_chrome_sig = None  # signature of last-rendered detail title chrome
+            self._detail_fields_cache: list = []     # last fields list used to build the table
+            self._detail_section_cache: list = []    # parallel list of section names for accent lookup
+            self._detail_cursor_widget_idx = None    # last cursor index applied to the detail table
+            self._detail_widget_visible = False      # whether detail-table widgets are currently shown
             self.project_scroll = 0
             self.project_hscroll = 0
             self.jobs_hscroll = 0
@@ -1915,6 +1928,8 @@ def cmd_dashboard(args):
                 yield Static(id="project-summary")
                 yield Static(id="jobs-header")
                 yield DataTable(id="jobs-table")
+                yield Static(id="project-detail-title")
+                yield DataTable(id="project-detail-table")
                 yield Static(id="dashboard-footer")
             else:
                 yield Static(id="dashboard-view")
@@ -1925,6 +1940,7 @@ def cmd_dashboard(args):
             if self._use_project_widget:
                 self._init_project_table()
                 self._init_jobs_table()
+                self._init_detail_table()
             self._request_refresh()
             if refresh_seconds > 0:
                 self.set_interval(refresh_seconds, self._request_refresh)
@@ -2002,6 +2018,260 @@ def cmd_dashboard(args):
                     pass
             finally:
                 self._suspend_jobs_widget_sync = False
+
+        def _init_detail_table(self) -> None:
+            """Configure the project detail DataTable.
+
+            We render our own cursor (▶ marker + retro highlight) by re-styling
+            the affected rows, so the widget's built-in cursor is disabled.
+            """
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#project-detail-table")
+            try:
+                table.cursor_type = "none"
+            except Exception:
+                pass
+            try:
+                table.show_cursor = False
+            except Exception:
+                pass
+            try:
+                table.zebra_stripes = False
+            except Exception:
+                pass
+            try:
+                table.can_focus = False
+            except Exception:
+                pass
+
+        def _detail_section_palette(self) -> dict:
+            return {
+                "Project":    "#FF00FF",  # hot magenta
+                "References": "#00FFFF",  # neon cyan
+                "Sources":    "#39FF14",  # lime green
+                "SSH keys":   "#FFD700",  # arcade gold
+                "Image":      "#FF69B4",  # bubblegum pink
+                "Git":        "#FF8C00",  # neon orange
+                "State":      "#B14EFF",  # vaporwave purple
+                "Resources":  "#1E90FF",  # electric blue
+            }
+
+        def _detail_section_for_fields(self, fields: list) -> list:
+            """Return a parallel list naming the section that owns each field."""
+            sections: list = []
+            current = "Project"
+            for f in fields:
+                if f.get("section"):
+                    label = f["display"].split(":", 1)[0].strip()
+                    if label:
+                        current = label
+                sections.append(current)
+            return sections
+
+        def _render_detail_row(self, field: dict, accent: str, *,
+                                is_cursor: bool, dirty: bool,
+                                checkpoint_count: int, width: int):
+            """Render one project-detail field as a single Text cell.
+
+            Cursor styling lives in the row content itself (no DataTable
+            cursor) so individual cell updates are enough to move the cursor
+            without touching neighbouring rows.
+            """
+            display = field["display"]
+            text = Text()
+            if field.get("section"):
+                label = display.strip()
+                if label.startswith("Project:") and dirty:
+                    label = label + "  ✱"
+                bar = f"▓▒░ {label} "
+                fill_len = max(2, width - len(bar) - 1)
+                text.append(bar, style=f"bold {accent} on black")
+                text.append("░▒▓" + "▒" * max(0, fill_len - 3), style=f"{accent}")
+                return text
+            if not display.strip():
+                return text
+            if is_cursor:
+                body = display.lstrip()
+                text.append("▶ ", style="bold #FFFF00 on #FF00FF")
+                text.append(body.ljust(max(0, width - 3)), style="bold black on #FF00FF")
+                return text
+            if field.get("editable"):
+                action = field.get("action", "")
+                if action == "detail_save":
+                    text.append(display, style="bold black on #39FF14")
+                    return text
+                if action == "detail_revert":
+                    if not (dirty or checkpoint_count):
+                        text.append(display, style="dim")
+                    else:
+                        text.append(display, style="bold black on #FFD700")
+                    return text
+                body = display.lstrip()
+                if body.startswith("[+]"):
+                    text.append("  ", style="")
+                    text.append(body, style=f"bold {accent}")
+                    return text
+                if ": " in body:
+                    key, _, value = body.partition(": ")
+                    text.append("  ", style="")
+                    text.append(key, style=f"bold {accent}")
+                    text.append(": ", style="dim")
+                    text.append(value, style="bold white")
+                else:
+                    text.append("  " + body, style=f"bold {accent}")
+                return text
+            body = display.lstrip()
+            if ": " in body:
+                key, _, value = body.partition(": ")
+                text.append("  ", style="")
+                text.append(key, style=f"dim {accent}")
+                text.append(": ", style="dim")
+                text.append(value, style="white")
+            else:
+                text.append(display, style="dim white")
+            return text
+
+        def _detail_content_signature(self, fields: list, dirty: bool,
+                                       checkpoint_count: int, width: int) -> tuple:
+            """Stable signature of detail content excluding cursor position.
+
+            Used to skip the costly table rebuild when only the cursor moved.
+            """
+            return (
+                tuple(f.get("display", "") for f in fields),
+                tuple(bool(f.get("editable")) for f in fields),
+                tuple(bool(f.get("section")) for f in fields),
+                tuple(f.get("action", "") for f in fields),
+                bool(dirty),
+                int(checkpoint_count),
+                int(width),
+            )
+
+        def _rebuild_detail_table(self, fields: list, sections: list, *,
+                                   dirty: bool, checkpoint_count: int,
+                                   width: int) -> None:
+            if not self._use_project_widget:
+                return
+            table = self.query_one("#project-detail-table")
+            palette = self._detail_section_palette()
+            try:
+                table.clear(columns=True)
+            except Exception:
+                try:
+                    table.clear()
+                except Exception:
+                    pass
+            try:
+                table.add_column(" ", key="content")
+            except Exception:
+                pass
+            for idx, field in enumerate(fields):
+                accent = palette.get(sections[idx], "#FFFFFF")
+                is_cursor = (not self.task_mode) and field.get("editable") \
+                    and idx == self.detail_cursor
+                rendered = self._render_detail_row(
+                    field, accent,
+                    is_cursor=is_cursor,
+                    dirty=dirty,
+                    checkpoint_count=checkpoint_count,
+                    width=width,
+                )
+                try:
+                    table.add_row(rendered, key=f"detail-{idx}")
+                except Exception:
+                    pass
+            self._detail_fields_cache = list(fields)
+            self._detail_section_cache = list(sections)
+            self._detail_cursor_widget_idx = (
+                self.detail_cursor
+                if (not self.task_mode)
+                and 0 <= self.detail_cursor < len(fields)
+                and fields[self.detail_cursor].get("editable")
+                else None
+            )
+            # Auto-scroll the freshly built table to the cursor row.
+            self._scroll_detail_to_cursor()
+
+        def _scroll_detail_to_cursor(self) -> None:
+            if not self._use_project_widget:
+                return
+            if not (0 <= self.detail_cursor < len(self._detail_fields_cache)):
+                return
+            table = self.query_one("#project-detail-table")
+            try:
+                table.move_cursor(row=self.detail_cursor, column=0, animate=False)
+            except Exception:
+                try:
+                    table.scroll_to(y=self.detail_cursor, animate=False)
+                except Exception:
+                    pass
+
+        def _apply_detail_cursor(self, *, dirty: bool, checkpoint_count: int,
+                                  width: int) -> None:
+            """Restyle the previous and new cursor rows without rebuilding.
+
+            This is the cursor-move fast path that prevents the entire detail
+            pane from repainting on every ↑/↓ keystroke (which made Emacs term
+            buffers visibly jump).
+            """
+            if not self._use_project_widget:
+                return
+            fields = self._detail_fields_cache
+            sections = self._detail_section_cache
+            if not fields:
+                return
+            table = self.query_one("#project-detail-table")
+            palette = self._detail_section_palette()
+            previous = self._detail_cursor_widget_idx
+            new_cursor = (
+                self.detail_cursor
+                if (not self.task_mode)
+                and 0 <= self.detail_cursor < len(fields)
+                and fields[self.detail_cursor].get("editable")
+                else None
+            )
+            indices_to_repaint = set()
+            if previous is not None and 0 <= previous < len(fields):
+                indices_to_repaint.add(previous)
+            if new_cursor is not None:
+                indices_to_repaint.add(new_cursor)
+            for idx in indices_to_repaint:
+                accent = palette.get(sections[idx], "#FFFFFF")
+                is_cursor = (idx == new_cursor)
+                rendered = self._render_detail_row(
+                    fields[idx], accent,
+                    is_cursor=is_cursor,
+                    dirty=dirty,
+                    checkpoint_count=checkpoint_count,
+                    width=width,
+                )
+                try:
+                    table.update_cell(f"detail-{idx}", "content", rendered)
+                except Exception:
+                    pass
+            self._detail_cursor_widget_idx = new_cursor
+            self._scroll_detail_to_cursor()
+
+        def _hide_detail_widgets(self) -> None:
+            if not self._use_project_widget or not self._detail_widget_visible:
+                return
+            for widget_id in ("#project-detail-title", "#project-detail-table"):
+                try:
+                    self.query_one(widget_id).styles.display = "none"
+                except Exception:
+                    pass
+            self._detail_widget_visible = False
+
+        def _show_detail_widgets(self) -> None:
+            if not self._use_project_widget or self._detail_widget_visible:
+                return
+            for widget_id in ("#project-detail-title", "#project-detail-table"):
+                try:
+                    self.query_one(widget_id).styles.display = "block"
+                except Exception:
+                    pass
+            self._detail_widget_visible = True
 
         def _sync_selected_project_from_widget(self, row: int | None) -> None:
             if self._suspend_project_widget_sync or not isinstance(row, int):
@@ -2444,7 +2714,9 @@ def cmd_dashboard(args):
             self.detail_original = copy.deepcopy(project)
             self.detail_checkpoints = self.checkpoints.list(project_name)
             self.detail_cursor = 0
-            self.detail_scroll = 0
+            self._detail_table_sig = None
+            self._detail_chrome_sig = None
+            self._detail_cursor_widget_idx = None
             self._detail_close_pending = False
             self.show_project_detail = True
             self.selected_project_name = project_name
@@ -3889,6 +4161,7 @@ def cmd_dashboard(args):
                 except Exception:
                     pass
                 footer.update(Text(""))
+                self._hide_detail_widgets()
                 return
 
             if self.show_help:
@@ -3925,52 +4198,20 @@ def cmd_dashboard(args):
                 except Exception:
                     pass
                 footer.update(Text(""))
+                self._hide_detail_widgets()
                 return
 
             if self.show_project_detail:
-                dirty = _project_detail_is_dirty(self.detail_draft, self.detail_original)
-                dirty_tag = "  [UNSAVED CHANGES]" if dirty else ""
-                detail_title = Text(
-                    f"Project Detail: {self._project_detail_name() or '-'}{dirty_tag}  (v back · w save · u revert)",
-                    style="bold",
+                self._refresh_project_detail_widgets(
+                    title=title,
+                    focus_line=focus_line,
+                    header=header,
+                    projects_table=projects_table,
+                    project_summary=project_summary,
+                    jobs_header=jobs_header,
+                    jobs_table_view=jobs_table_view,
+                    footer=footer,
                 )
-                header.update(
-                    Group(
-                        title,
-                        focus_line,
-                        self._section_header("Project Detail"),
-                        detail_title,
-                        Text(""),
-                        self._render_project_detail(),
-                    )
-                )
-                try:
-                    projects_table.styles.display = "none"
-                except Exception:
-                    pass
-                project_summary.update(Text(""))
-                try:
-                    project_summary.styles.display = "none"
-                except Exception:
-                    pass
-                jobs_header.update(Text(""))
-                try:
-                    jobs_header.styles.display = "none"
-                except Exception:
-                    pass
-                try:
-                    jobs_table_view.clear()
-                except Exception:
-                    pass
-                try:
-                    jobs_table_view.styles.display = "none"
-                except Exception:
-                    pass
-                try:
-                    footer.styles.display = "none"
-                except Exception:
-                    pass
-                footer.update(Text(""))
                 return
 
             if self.show_job_output and jobs_view:
@@ -4026,6 +4267,7 @@ def cmd_dashboard(args):
                 except Exception:
                     pass
                 footer.update(Text(""))
+                self._hide_detail_widgets()
                 return
 
             try:
@@ -4048,6 +4290,7 @@ def cmd_dashboard(args):
                 footer.styles.display = "block"
             except Exception:
                 pass
+            self._hide_detail_widgets()
             header.update(Group(title, focus_line, self._section_header("Projects")))
             fitted_columns = self._fit_project_columns(self.snapshot.columns)
             sig_cols = tuple((name, width) for name, width in fitted_columns)
@@ -4474,6 +4717,127 @@ def cmd_dashboard(args):
                     style=style,
                 )
             return table
+
+        def _refresh_project_detail_widgets(self, *, title, focus_line, header,
+                                              projects_table, project_summary,
+                                              jobs_header, jobs_table_view, footer) -> None:
+            """Update detail-mode widgets, repainting only what actually changed.
+
+            The expensive field list lives in #project-detail-table. We rebuild
+            its rows only when the underlying content changes; cursor moves go
+            through update_cell on the two affected rows so the surrounding
+            pane does not flash.
+            """
+            draft = self.detail_draft
+            project_name = self._project_detail_name() or "-"
+            dirty = _project_detail_is_dirty(draft, self.detail_original) if draft is not None else False
+            checkpoint_count = len(self.detail_checkpoints)
+
+            # Hide the projects/jobs surfaces and show the detail surfaces.
+            try:
+                projects_table.styles.display = "none"
+            except Exception:
+                pass
+            project_summary.update(Text(""))
+            try:
+                project_summary.styles.display = "none"
+            except Exception:
+                pass
+            jobs_header.update(Text(""))
+            try:
+                jobs_header.styles.display = "none"
+            except Exception:
+                pass
+            try:
+                jobs_table_view.clear()
+            except Exception:
+                pass
+            try:
+                jobs_table_view.styles.display = "none"
+            except Exception:
+                pass
+            try:
+                footer.styles.display = "none"
+            except Exception:
+                pass
+            footer.update(Text(""))
+            self._show_detail_widgets()
+
+            # Header chrome (title + focus line + section banner). It only
+            # needs to be re-rendered when its inputs change, so signature it.
+            chrome_sig = ("chrome", self.focus, self.jobs.summary())
+            if self._detail_chrome_sig != chrome_sig:
+                header.update(
+                    Group(
+                        title,
+                        focus_line,
+                        self._section_header("Project Detail"),
+                    )
+                )
+                self._detail_chrome_sig = chrome_sig
+
+            # Detail title strip (project name + dirty banner + key hints).
+            dirty_tag = "  [UNSAVED CHANGES]" if dirty else ""
+            cp_suffix = (
+                f"   ◆ {checkpoint_count} checkpoint"
+                f"{'s' if checkpoint_count != 1 else ''}"
+                if checkpoint_count else ""
+            )
+            detail_title_widget = self.query_one("#project-detail-title", Static)
+            detail_title_text = Text()
+            detail_title_text.append(
+                f"Project Detail: {project_name}",
+                style="bold #FF00FF",
+            )
+            if dirty_tag:
+                detail_title_text.append(dirty_tag, style="bold black on #FFFF00")
+            detail_title_text.append(
+                "  (v back · w save · u revert)",
+                style="bold #00FFFF",
+            )
+            if cp_suffix:
+                detail_title_text.append(cp_suffix, style="dim #B14EFF")
+            detail_title_widget.update(detail_title_text)
+
+            if draft is None:
+                # Loading or no project — clear the table so we don't show stale rows.
+                table = self.query_one("#project-detail-table")
+                try:
+                    table.clear(columns=True)
+                except Exception:
+                    try:
+                        table.clear()
+                    except Exception:
+                        pass
+                self._detail_table_sig = None
+                self._detail_fields_cache = []
+                self._detail_section_cache = []
+                self._detail_cursor_widget_idx = None
+                return
+
+            store = ConfigStore()
+            fields = _project_detail_fields(draft, store)
+            sections = self._detail_section_for_fields(fields)
+            width = max(20, (getattr(self, "size", None).width or 80))
+            content_sig = self._detail_content_signature(
+                fields, dirty, checkpoint_count, width,
+            )
+
+            if self._detail_table_sig != content_sig:
+                self._rebuild_detail_table(
+                    fields, sections,
+                    dirty=dirty,
+                    checkpoint_count=checkpoint_count,
+                    width=width,
+                )
+                self._detail_table_sig = content_sig
+            else:
+                # Content unchanged: only the cursor row(s) need repainting.
+                self._apply_detail_cursor(
+                    dirty=dirty,
+                    checkpoint_count=checkpoint_count,
+                    width=width,
+                )
 
         def _render_project_detail(self):
             project_name = self._project_detail_name()
@@ -5003,6 +5367,24 @@ def cmd_dashboard(args):
                 pos = 0
             pos = (pos + delta) % len(editable)
             self.detail_cursor = editable[pos]
+            # Cursor-only move: only repaint the two affected rows in the
+            # detail table, not the entire pane. Falls back to a full refresh
+            # if widget mode isn't active or the table isn't populated yet.
+            if (
+                self._use_project_widget
+                and self.show_project_detail
+                and not self.task_mode
+                and self._detail_fields_cache
+            ):
+                dirty = _project_detail_is_dirty(self.detail_draft, self.detail_original)
+                checkpoint_count = len(self.detail_checkpoints)
+                width = max(20, (getattr(self, "size", None).width or 80))
+                self._apply_detail_cursor(
+                    dirty=dirty,
+                    checkpoint_count=checkpoint_count,
+                    width=width,
+                )
+                return
             self._refresh_view()
 
         def _run_selected(self, action_key: str) -> None:
