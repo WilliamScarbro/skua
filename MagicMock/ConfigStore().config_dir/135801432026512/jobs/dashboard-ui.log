@@ -1,0 +1,4 @@
+{"event": "mount", "log_path": "MagicMock/ConfigStore().config_dir/135801432026512/jobs/dashboard-ui.log", "ts": "2026-04-27T21:26:04+00:00"}
+{"action": "run_selected", "allowed": true, "event": "check_action", "task_mode": "", "ts": "2026-04-27T21:26:04+00:00"}
+{"event": "action", "name": "run_selected", "ts": "2026-04-27T21:26:04+00:00"}
+{"event": "message", "ts": "2026-04-27T21:26:04+00:00", "value": "run demo: ok"}

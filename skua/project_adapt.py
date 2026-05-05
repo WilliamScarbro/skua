@@ -47,26 +47,26 @@ def claude_hint_path(project_dir: Path) -> Path:
     return project_dir / CLAUDE_HINT_NAME
 
 
+def adapt_workspace_templates(project_name: str, agent_name: str) -> dict[str, str]:
+    """Return default workspace file contents keyed by relative path."""
+    return {
+        f"{ADAPT_DIRNAME}/{ADAPT_GUIDE_NAME}": _adapt_guide_text(project_name=project_name, agent_name=agent_name),
+        f"{ADAPT_DIRNAME}/{IMAGE_REQUEST_NAME}": _image_request_template_text(),
+        AGENTS_HINT_NAME: _agents_hint_text(project_name=project_name),
+        CLAUDE_HINT_NAME: _claude_hint_text(project_name=project_name),
+    }
+
+
 def ensure_adapt_workspace(project_dir: Path, project_name: str, agent_name: str) -> tuple[Path, Path]:
     """Create per-project adapt files if missing and return (guide, request) paths."""
     d = adapt_dir(project_dir)
     d.mkdir(parents=True, exist_ok=True)
 
-    guide = adapt_guide_path(project_dir)
-    if not guide.exists():
-        guide.write_text(_adapt_guide_text(project_name=project_name, agent_name=agent_name))
-
-    request = image_request_path(project_dir)
-    if not request.exists():
-        request.write_text(_image_request_template_text())
-
-    agents_hint = agents_hint_path(project_dir)
-    if not agents_hint.exists():
-        agents_hint.write_text(_agents_hint_text(project_name=project_name))
-
-    claude_hint = claude_hint_path(project_dir)
-    if not claude_hint.exists():
-        claude_hint.write_text(_claude_hint_text(project_name=project_name))
+    templates = adapt_workspace_templates(project_name=project_name, agent_name=agent_name)
+    for rel_path, content in templates.items():
+        target = project_dir / rel_path
+        if not target.exists():
+            target.write_text(content)
 
     _ensure_git_exclude(
         project_dir,
@@ -77,6 +77,8 @@ def ensure_adapt_workspace(project_dir: Path, project_name: str, agent_name: str
             CLAUDE_HINT_NAME,
         ],
     )
+    guide = adapt_guide_path(project_dir)
+    request = image_request_path(project_dir)
     return guide, request
 
 

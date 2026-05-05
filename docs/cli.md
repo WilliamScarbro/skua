@@ -76,7 +76,7 @@ skua add myapp --dir ~/projects/myapp \
 | `--ssh-key` | SSH private key path for git operations |
 | `--env` | Environment resource name (default: from global config) |
 | `--security` | Security profile name (default: from global config) |
-| `--agent` | Agent config name (default: from global config) |
+| `--agent` | Agent config name (default: from global config; bundled presets: `claude`, `codex`, `pi`) |
 | `--quick` | Use all defaults, skip all prompts |
 | `--no-prompt` | Skip prompts for missing values |
 

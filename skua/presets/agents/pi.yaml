@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: BUSL-1.1
+apiVersion: skua/v1
+kind: AgentConfig
+metadata:
+  name: pi
+spec:
+  install:
+    commands:
+      - "npm install -g --prefix /home/dev/.local @mariozechner/pi-coding-agent"
+    required_packages:
+      - nodejs
+      - npm
+  runtime:
+    command: pi
+    adapt_command: "pi -p --no-session {prompt_shell}"
+    env:
+      PATH: "/home/dev/.local/bin:${PATH}"
+      EDITOR: vim
+  auth:
+    dir: .pi/agent
+    files:
+      - auth.json
+    login_command: "pi --login"

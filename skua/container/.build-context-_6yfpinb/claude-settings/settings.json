@@ -1,0 +1,23 @@
+{
+  "env": {
+    "EDITOR": "vim"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/scarbro/.claude/hooks/prompt-save-before-read.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "voiceEnabled": true
+}

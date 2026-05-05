@@ -558,7 +558,8 @@ Project: my-app
 │   └── my-custom.yaml           # user-defined
 ├── agents/
 │   ├── claude.yaml              # shipped preset
-│   ├── aider.yaml               # shipped preset
+│   ├── codex.yaml               # shipped preset
+│   ├── pi.yaml                  # shipped preset
 │   └── my-agent.yaml            # user-defined
 ├── projects/
 │   ├── my-app.yaml

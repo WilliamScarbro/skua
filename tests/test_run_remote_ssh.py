@@ -242,6 +242,33 @@ class TestRemoteDockerTransportFallback(unittest.TestCase):
                                 cmd_run(SimpleNamespace(name="qar"), lock_project=False)
                                 mock_transport.assert_called_once_with("docker.example.com")
 
+    def test_cmd_run_clears_remote_transport_for_local_project(self):
+        from skua.commands.run import cmd_run
+
+        fake_project = Project(name="localproj")
+        wrapper_dir = tempfile.mkdtemp(prefix="skua-test-wrapper-")
+        original_path = os.environ.get("PATH", "")
+        os.environ["DOCKER_HOST"] = "ssh://docker.example.com"
+        os.environ["SKUA_DOCKER_TRANSPORT"] = "ssh-wrapper"
+        os.environ["SKUA_DOCKER_REMOTE_HOST"] = "docker.example.com"
+        os.environ["SKUA_DOCKER_WRAPPER_DIR"] = wrapper_dir
+        os.environ["PATH"] = f"{wrapper_dir}:{original_path}" if original_path else wrapper_dir
+
+        with mock.patch("skua.commands.run.ConfigStore") as MockStore:
+            store = MockStore.return_value
+            store.resolve_project.return_value = fake_project
+
+            with mock.patch("skua.commands.run.is_container_running", return_value=True):
+                with mock.patch("skua.commands.run.exec_into_container"):
+                    with mock.patch("builtins.input", return_value="n"):
+                        cmd_run(SimpleNamespace(name="localproj"), lock_project=False)
+
+        self.assertEqual("", os.environ.get("DOCKER_HOST", ""))
+        self.assertEqual("", os.environ.get("SKUA_DOCKER_TRANSPORT", ""))
+        self.assertEqual("", os.environ.get("SKUA_DOCKER_REMOTE_HOST", ""))
+        self.assertEqual("", os.environ.get("SKUA_DOCKER_WRAPPER_DIR", ""))
+        self.assertNotIn(wrapper_dir, os.environ.get("PATH", "").split(os.pathsep))
+
 
 class TestRemoteRepoCloneWithProjectSshKey(unittest.TestCase):
     """Validate remote repo clone behavior with project SSH key support."""
@@ -276,6 +303,7 @@ class TestRemoteRepoCloneWithProjectSshKey(unittest.TestCase):
                 clone_call = mock_run.call_args_list[1]
                 clone_cmd = clone_call.args[0]
                 clone_env = clone_call.kwargs.get("env", {})
+                script = clone_cmd[-1]
 
                 self.assertIn("-e", clone_cmd)
                 self.assertIn("SKUA_REMOTE_GIT_REPO", clone_cmd)
@@ -284,6 +312,7 @@ class TestRemoteRepoCloneWithProjectSshKey(unittest.TestCase):
                 self.assertIn("--entrypoint", clone_cmd)
                 self.assertIn("sh", clone_cmd)
                 self.assertIn("alpine/git", clone_cmd)
+                self.assertIn("chown -R", script)
                 self.assertEqual("git@github.com:org/repo.git", clone_env.get("SKUA_REMOTE_GIT_REPO"))
                 self.assertTrue(clone_env.get("SKUA_REMOTE_GIT_SSH_KEY_B64"))
                 self.assertTrue(clone_env.get("SKUA_REMOTE_GIT_KNOWN_HOSTS_B64"))
@@ -301,7 +330,42 @@ class TestRemoteRepoCloneWithProjectSshKey(unittest.TestCase):
             clone_cmd = mock_run.call_args_list[1].args[0]
             script = clone_cmd[-1]
             self.assertIn("StrictHostKeyChecking=accept-new", script)
+            self.assertIn("chown -R", script)
             self.assertNotIn("SKUA_REMOTE_GIT_SSH_KEY_B64", clone_cmd)
+
+    def test_remote_clone_repairs_existing_volume_ownership_when_clone_skipped(self):
+        from skua.commands.run import _clone_repo_into_remote_volume
+
+        project = Project(name="qar", repo="git@github.com:org/repo.git")
+        project.ssh.private_key = ""
+
+        mock_check = mock.Mock(returncode=0, stdout="cloned\n")
+        mock_fix = mock.Mock(returncode=0)
+        with mock.patch("skua.commands.run.subprocess.run", side_effect=[mock_check, mock_fix]) as mock_run:
+            _clone_repo_into_remote_volume(project, "skua-qar-repo")
+            self.assertEqual(2, mock_run.call_count)
+            fix_cmd = mock_run.call_args_list[1].args[0]
+            self.assertIn("skua-qar-repo:/workspace", fix_cmd)
+            self.assertIn("chown -R", fix_cmd[-1])
+
+    def test_remote_adapt_workspace_bootstrap_creates_skua_dir(self):
+        from skua.commands.run import _ensure_remote_adapt_workspace
+
+        mock_init = mock.Mock(returncode=0)
+        with mock.patch("skua.commands.run.subprocess.run", return_value=mock_init) as mock_run:
+            _ensure_remote_adapt_workspace("skua-qar-repo", "qar", "codex")
+            init_cmd = mock_run.call_args.args[0]
+            init_env = mock_run.call_args.kwargs.get("env", {})
+            script = init_cmd[-1]
+
+            self.assertIn("-v", init_cmd)
+            self.assertIn("skua-qar-repo:/workspace", init_cmd)
+            self.assertIn("mkdir -p /workspace/.skua", script)
+            self.assertIn("/workspace/.skua/ADAPT.md", script)
+            self.assertIn("/workspace/.skua/image-request.yaml", script)
+            self.assertIn("/workspace/AGENTS.md", script)
+            self.assertIn("/workspace/CLAUDE.md", script)
+            self.assertTrue(any(key.startswith("SKUA_REMOTE_FILE_") for key in init_env))
 
 
 class TestRemoteAuthSeeding(unittest.TestCase):
@@ -380,6 +444,58 @@ class TestRemoteRunImageRefresh(unittest.TestCase):
         store.get_container_dir.return_value = Path("/tmp/skua-container")
         store.load_credential.return_value = None
         return store
+
+    def test_cmd_run_copies_direct_image_to_remote_when_missing(self):
+        from skua.commands.run import cmd_run
+
+        project = Project(name="qar", host="docker.example.com", agent="codex")
+        project.image.from_image = "skua-default-codex"
+        store = self._store_for(project)
+
+        with mock.patch("skua.commands.run.ConfigStore", return_value=store):
+            with mock.patch("skua.commands.run._ensure_local_ssh_client_for_remote_docker"):
+                with mock.patch("skua.commands.run._configure_remote_docker_transport"):
+                    with mock.patch("skua.commands.run.is_container_running", return_value=False):
+                        with mock.patch("skua.commands.run.validate_project", return_value=SimpleNamespace(valid=True, warnings=[], errors=[])):
+                            with mock.patch("skua.commands.run.effective_project_image", return_value="skua-default-codex"):
+                                with mock.patch("skua.commands.run.image_exists", side_effect=[False, True]):
+                                    with mock.patch("skua.commands.run._ensure_remote_image_available", return_value=True) as mock_copy:
+                                        with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
+                                            with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
+                                                with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
+                                                    with mock.patch("skua.commands.run.start_container", return_value=True):
+                                                        with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
+                                                            with mock.patch("skua.commands.run.exec_into_container"):
+                                                                cmd_run(SimpleNamespace(name="qar"), lock_project=False)
+                                        mock_copy.assert_called_once_with("skua-default-codex", label="direct image")
+
+    def test_cmd_run_copies_local_from_image_to_remote_before_build(self):
+        from skua.commands.run import cmd_run
+
+        project = Project(name="qar", host="docker.example.com", agent="codex")
+        project.image.from_image = "skua-default-codex"
+        project.image.extra_packages = ["make"]
+        store = self._store_for(project)
+
+        with mock.patch("skua.commands.run.ConfigStore", return_value=store):
+            with mock.patch("skua.commands.run._ensure_local_ssh_client_for_remote_docker"):
+                with mock.patch("skua.commands.run._configure_remote_docker_transport"):
+                    with mock.patch("skua.commands.run.is_container_running", return_value=False):
+                        with mock.patch("skua.commands.run.validate_project", return_value=SimpleNamespace(valid=True, warnings=[], errors=[])):
+                            with mock.patch("skua.commands.run.resolve_project_image_inputs", return_value=("skua-default-codex", ["make"], [])):
+                                with mock.patch("skua.commands.run.image_exists", return_value=False):
+                                    with mock.patch("skua.commands.run._ensure_remote_image_available", return_value=True) as mock_copy:
+                                        with mock.patch("skua.commands.run.image_rebuild_needed", return_value=(True, False, "image is missing")):
+                                            with mock.patch("skua.commands.run.build_image", return_value=(True, "")) as mock_build:
+                                                with mock.patch("skua.commands.run._maybe_refresh_local_credentials", return_value=False):
+                                                    with mock.patch("skua.commands.run._seed_auth_into_remote_volume", return_value=0):
+                                                        with mock.patch("skua.commands.run.build_run_command", return_value=["docker", "run"]):
+                                                            with mock.patch("skua.commands.run.start_container", return_value=True):
+                                                                with mock.patch("skua.commands.run.wait_for_running_container", return_value=True):
+                                                                    with mock.patch("skua.commands.run.exec_into_container"):
+                                                                        cmd_run(SimpleNamespace(name="qar"), lock_project=False)
+                                                mock_copy.assert_called_once_with("skua-default-codex", label="base image")
+                                                mock_build.assert_called_once()
 
     def test_cmd_run_rebuilds_existing_remote_image_when_context_is_stale(self):
         from skua.commands.run import cmd_run

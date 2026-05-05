@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from skua.config import ConfigStore, validate_project
 from skua.commands.credential import resolve_credential_sources, agent_default_source_dir
 from skua.config.resources import ssh_private_keys
+from skua.project_adapt import adapt_workspace_templates
 from skua.docker import (
     absolute_project_image,
     is_container_running,
@@ -38,6 +39,148 @@ from skua.docker import (
 )
 from skua.project_adapt import ensure_adapt_workspace
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
+
+
+def _local_docker_binary() -> str:
+    """Return the host Docker CLI path, excluding any temporary SSH wrapper."""
+    wrapper_dir = str(os.environ.get("SKUA_DOCKER_WRAPPER_DIR", "") or "").strip()
+    path_entries = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+    candidates = []
+
+    current = shutil.which("docker") or ""
+    if current:
+        candidates.append(current)
+
+    for entry in path_entries:
+        if wrapper_dir and os.path.abspath(entry) == os.path.abspath(wrapper_dir):
+            continue
+        candidate = Path(entry) / "docker"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            candidates.append(str(candidate))
+
+    for candidate in (
+        "/usr/local/bin/docker",
+        str(Path.home() / ".local" / "bin" / "docker"),
+        "/usr/bin/docker",
+    ):
+        p = Path(candidate).expanduser()
+        if p.is_file() and os.access(p, os.X_OK):
+            candidates.append(str(p))
+
+    seen = set()
+    for candidate in candidates:
+        resolved = str(Path(candidate).expanduser().resolve())
+        if wrapper_dir and resolved.startswith(str(Path(wrapper_dir).resolve())):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        return resolved
+    return ""
+
+
+def _local_docker_env() -> dict:
+    """Return environment for the host-local Docker daemon."""
+    env = os.environ.copy()
+    env.pop("DOCKER_HOST", None)
+    env.pop("SKUA_DOCKER_TRANSPORT", None)
+    env.pop("SKUA_DOCKER_REMOTE_HOST", None)
+    wrapper_dir = str(env.pop("SKUA_DOCKER_WRAPPER_DIR", "") or "").strip()
+    if wrapper_dir:
+        env["PATH"] = os.pathsep.join(
+            entry
+            for entry in env.get("PATH", "").split(os.pathsep)
+            if entry and os.path.abspath(entry) != os.path.abspath(wrapper_dir)
+        )
+    return env
+
+
+def _reset_docker_transport_to_local() -> None:
+    """Clear any remote Docker transport overrides from this process."""
+    wrapper_dir = str(os.environ.pop("SKUA_DOCKER_WRAPPER_DIR", "") or "").strip()
+    os.environ.pop("DOCKER_HOST", None)
+    os.environ.pop("SKUA_DOCKER_TRANSPORT", None)
+    os.environ.pop("SKUA_DOCKER_REMOTE_HOST", None)
+    if wrapper_dir:
+        os.environ["PATH"] = os.pathsep.join(
+            entry
+            for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry and os.path.abspath(entry) != os.path.abspath(wrapper_dir)
+        )
+
+
+def _local_image_exists(name: str) -> bool:
+    """Return True when the image exists on the local host daemon."""
+    docker_bin = _local_docker_binary()
+    if not docker_bin:
+        return False
+    try:
+        result = subprocess.run(
+            [docker_bin, "image", "inspect", name],
+            capture_output=True,
+            text=True,
+            env=_local_docker_env(),
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _copy_local_image_to_remote(name: str) -> bool:
+    """Stream a local Docker image into the current remote Docker target."""
+    docker_bin = _local_docker_binary()
+    if not docker_bin:
+        return False
+
+    save_proc = None
+    try:
+        save_proc = subprocess.Popen(
+            [docker_bin, "image", "save", name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_local_docker_env(),
+        )
+        load_proc = subprocess.Popen(
+            ["docker", "image", "load"],
+            stdin=save_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if save_proc.stdout is not None:
+            save_proc.stdout.close()
+        load_stdout, load_stderr = load_proc.communicate()
+        save_stderr = ""
+        if save_proc.stderr is not None:
+            save_stderr = save_proc.stderr.read().decode("utf-8", errors="replace")
+        save_rc = save_proc.wait()
+    except OSError:
+        if save_proc is not None:
+            save_proc.kill()
+        return False
+
+    if save_rc != 0 or load_proc.returncode != 0:
+        err = (load_stderr or save_stderr or load_stdout or "").strip()
+        if err:
+            print(f"Warning: failed to copy local image '{name}' to remote host: {err}")
+        else:
+            print(f"Warning: failed to copy local image '{name}' to remote host.")
+        return False
+    return True
+
+
+def _ensure_remote_image_available(name: str, *, label: str = "image") -> bool:
+    """Ensure the current remote Docker target can use the named image."""
+    if image_exists(name):
+        return True
+    if not _local_image_exists(name):
+        return False
+
+    print(f"Remote host is missing {label} '{name}'; copying it from the local Docker daemon...")
+    if not _copy_local_image_to_remote(name):
+        return False
+    return image_exists(name)
 
 
 def _is_snap_binary(path: str) -> bool:
@@ -202,6 +345,7 @@ def _enable_ssh_docker_wrapper(host: str):
 
     current_path = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{wrapper_dir}:{current_path}" if current_path else str(wrapper_dir)
+    os.environ["SKUA_DOCKER_WRAPPER_DIR"] = str(wrapper_dir)
     os.environ.pop("DOCKER_HOST", None)
     os.environ["SKUA_DOCKER_TRANSPORT"] = "ssh-wrapper"
     os.environ["SKUA_DOCKER_REMOTE_HOST"] = host
@@ -266,6 +410,9 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
     Requires the current process Docker transport to target the remote host.
     Skips silently if the repo is already cloned in the volume.
     """
+    uid = os.getuid()
+    gid = os.getgid()
+
     check = subprocess.run(
         [
             "docker", "run", "--rm",
@@ -277,6 +424,7 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
     )
     if check.returncode == 0 and "cloned" in check.stdout:
         print(f"Using existing repo clone in volume '{vol_name}'.")
+        _ensure_remote_repo_volume_ownership(vol_name, uid=uid, gid=gid)
         return
 
     clone_env = os.environ.copy()
@@ -319,6 +467,7 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
         "fi\n"
         f"export GIT_SSH_COMMAND={shlex.quote(' '.join(ssh_cmd_parts))}\n"
         "git clone \"$SKUA_REMOTE_GIT_REPO\" /workspace\n"
+        f"chown -R {uid}:{gid} /workspace\n"
     )
 
     clone_cmd = [
@@ -338,6 +487,44 @@ def _clone_repo_into_remote_volume(project, vol_name: str):
         print("Error: Failed to clone repository into remote volume.")
         print("  Tip: Confirm repository access for the configured SSH key and remote host network reachability.")
         sys.exit(1)
+
+
+def _ensure_remote_repo_volume_ownership(vol_name: str, *, uid: int, gid: int):
+    """Ensure a remote repo volume is writable by the in-container `dev` user."""
+    fix_cmd = [
+        "docker", "run", "--rm",
+        "-v", f"{vol_name}:/workspace",
+        "alpine", "sh", "-lc",
+        f"chown -R {uid}:{gid} /workspace",
+    ]
+    result = subprocess.run(fix_cmd)
+    if result.returncode != 0:
+        print(f"Warning: failed to repair ownership for remote repo volume '{vol_name}'.")
+
+
+def _ensure_remote_adapt_workspace(vol_name: str, project_name: str, agent_name: str):
+    """Create the default `.skua` workspace files inside a remote repo volume."""
+    templates = adapt_workspace_templates(project_name=project_name, agent_name=agent_name)
+    init_env = os.environ.copy()
+    init_script_lines = ["set -eu", "mkdir -p /workspace/.skua"]
+    init_cmd = ["docker", "run", "--rm", "-v", f"{vol_name}:/workspace"]
+
+    for index, (rel_path, content) in enumerate(templates.items()):
+        env_name = f"SKUA_REMOTE_FILE_{index}_B64"
+        init_env[env_name] = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        init_cmd.extend(["-e", env_name])
+        quoted_rel = shlex.quote(rel_path)
+        init_script_lines.extend([
+            f"if [ ! -e /workspace/{quoted_rel} ]; then",
+            f"  mkdir -p $(dirname /workspace/{quoted_rel})",
+            f"  printf '%s' \"${env_name}\" | base64 -d > /workspace/{quoted_rel}",
+            "fi",
+        ])
+
+    init_cmd.extend(["alpine", "sh", "-lc", "\n".join(init_script_lines)])
+    result = subprocess.run(init_cmd, env=init_env)
+    if result.returncode != 0:
+        print(f"Warning: failed to initialize remote .skua workspace in volume '{vol_name}'.")
 
 
 def _project_sources(project) -> list:
@@ -415,6 +602,7 @@ def _resolve_source_mounts(store: ConfigStore, project) -> list:
                 ssh=SimpleNamespace(private_key=getattr(source, "ssh_private_key", "") or ""),
             )
             _clone_repo_into_remote_volume(clone_project, volume_name)
+            _ensure_remote_adapt_workspace(volume_name, project.name, project.agent)
             mounts.append({
                 "name": mount_name,
                 "source": volume_name,
@@ -753,6 +941,8 @@ def cmd_run(args, lock_project: bool = True):
     if host:
         _ensure_local_ssh_client_for_remote_docker(host)
         _configure_remote_docker_transport(host)
+    else:
+        _reset_docker_transport_to_local()
 
     container_name = f"skua-{name}"
 
@@ -848,10 +1038,12 @@ def cmd_run(args, lock_project: bool = True):
     direct_image = absolute_project_image(project) or str(getattr(project.image, "from_image", "") or "").strip()
     if image_name == direct_image:
         if not image_exists(image_name):
-            print(f"Error: direct project image '{image_name}' not found locally.")
-            print("Rebuild it with: skua default-image build <name>")
-            print("Or re-save it with: skua default-image save <source> <name>")
-            sys.exit(1)
+            if not host or not _ensure_remote_image_available(image_name, label="direct image"):
+                location = "on the remote host or locally" if host else "locally"
+                print(f"Error: direct project image '{image_name}' not found {location}.")
+                print("Rebuild it with: skua default-image build <name>")
+                print("Or re-save it with: skua default-image save <source> <name>")
+                sys.exit(1)
     else:
         resolved_base_image, extra_packages, extra_commands = resolve_project_image_inputs(
             default_base_image=base_image,
@@ -889,6 +1081,8 @@ def cmd_run(args, lock_project: bool = True):
                     f"after prepare step for project '{project.name}'."
                 )
                 sys.exit(1)
+        elif host:
+            _ensure_remote_image_available(resolved_base_image, label="base image")
 
         needs_rebuild, force_refresh, rebuild_reason = image_rebuild_needed(
             image_name=image_name,

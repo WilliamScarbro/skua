@@ -1,0 +1,365 @@
+#!/bin/bash
+# SPDX-License-Identifier: BUSL-1.1
+set -e
+
+AGENT_NAME="${SKUA_AGENT_NAME:-agent}"
+AGENT_COMMAND="${SKUA_AGENT_COMMAND:-$AGENT_NAME}"
+AGENT_LOGIN_COMMAND="${SKUA_AGENT_LOGIN_COMMAND:-$AGENT_COMMAND login}"
+AUTH_DIR_REL="${SKUA_AUTH_DIR:-.claude}"
+AUTH_DIR="/home/dev/${AUTH_DIR_REL#/}"
+AUTH_FILES_RAW="${SKUA_AUTH_FILES:-}"
+PROJECT_DIR="${SKUA_PROJECT_DIR:-/home/dev/project}"
+PROJECT_NAME="${SKUA_PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+IMAGE_REQUEST_FILE="${SKUA_IMAGE_REQUEST_FILE:-$PROJECT_DIR/.skua/image-request.yaml}"
+ADAPT_GUIDE_FILE="${SKUA_ADAPT_GUIDE_FILE:-$PROJECT_DIR/.skua/ADAPT.md}"
+TMUX_ENABLE="${SKUA_TMUX_ENABLE:-1}"
+TMUX_SESSION="${SKUA_TMUX_SESSION:-skua}"
+STOP_GRACE="${SKUA_STOP_GRACE:-15}"
+CREDENTIAL_NAME="${SKUA_CREDENTIAL_NAME:-}"
+SSH_KEY_NAME="${SKUA_SSH_KEY_NAME:-}"
+STARTUP_INFO_FILE="/tmp/skua-entrypoint-info.txt"
+SSH_KEY_BASENAME="(none)"
+SKUA_BASHRC_SNIPPET="/home/dev/.bashrc.skua"
+
+echo "============================================"
+echo "  skua — Dockerized Coding Agent"
+echo "============================================"
+echo ""
+echo "Agent: ${AGENT_NAME}"
+echo "Auth:  ${AUTH_DIR_REL}"
+echo "Credential: ${CREDENTIAL_NAME:-"(none)"}"
+echo ""
+
+# ── Configure git identity from env vars ─────────────────────────────
+if [ -n "$GIT_AUTHOR_NAME" ]; then
+    git config --global user.name "$GIT_AUTHOR_NAME"
+    git config --global user.email "$GIT_AUTHOR_EMAIL"
+    echo "[OK] Git: $GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>"
+else
+    echo "[--] Git identity not set"
+fi
+
+# ── SSH key pair (read-only mount -> local copy with correct perms) ───
+SSH_KEY=""
+# Remote-host mode: SSH key/known_hosts can be passed via base64 env vars.
+if [ -n "${SKUA_SSH_KEY_B64:-}" ] || [ -n "${SKUA_SSH_PUB_KEY_B64:-}" ] || [ -n "${SKUA_SSH_KNOWN_HOSTS_B64:-}" ]; then
+    mkdir -p /home/dev/.ssh
+    chmod 700 /home/dev/.ssh
+    REMOTE_KEY_NAME="${SSH_KEY_NAME:-id_key}"
+
+    if [ -n "${SKUA_SSH_KEY_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_KEY_B64" | base64 -d > "/home/dev/.ssh/${REMOTE_KEY_NAME}" 2>/dev/null; then
+            chmod 600 "/home/dev/.ssh/${REMOTE_KEY_NAME}"
+        else
+            rm -f "/home/dev/.ssh/${REMOTE_KEY_NAME}" || true
+            echo "[!!] Failed to decode SKUA_SSH_KEY_B64"
+        fi
+    fi
+
+    if [ -n "${SKUA_SSH_PUB_KEY_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_PUB_KEY_B64" | base64 -d > "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub" 2>/dev/null; then
+            chmod 600 "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub"
+        else
+            rm -f "/home/dev/.ssh/${REMOTE_KEY_NAME}.pub" || true
+            echo "[!!] Failed to decode SKUA_SSH_PUB_KEY_B64"
+        fi
+    fi
+
+    if [ -n "${SKUA_SSH_KNOWN_HOSTS_B64:-}" ]; then
+        if printf '%s' "$SKUA_SSH_KNOWN_HOSTS_B64" | base64 -d > /home/dev/.ssh/known_hosts 2>/dev/null; then
+            chmod 600 /home/dev/.ssh/known_hosts
+        else
+            rm -f /home/dev/.ssh/known_hosts || true
+            echo "[!!] Failed to decode SKUA_SSH_KNOWN_HOSTS_B64"
+        fi
+    fi
+fi
+
+if [ -d /home/dev/.ssh-mount ] && [ "$(ls -A /home/dev/.ssh-mount 2>/dev/null)" ]; then
+    mkdir -p /home/dev/.ssh
+    cp /home/dev/.ssh-mount/* /home/dev/.ssh/ 2>/dev/null || true
+    chmod 700 /home/dev/.ssh
+    chmod 600 /home/dev/.ssh/* 2>/dev/null || true
+fi
+
+if [ -d /home/dev/.ssh ] && [ "$(ls -A /home/dev/.ssh 2>/dev/null)" ]; then
+    if [ -n "$SSH_KEY_NAME" ] && [ -f "/home/dev/.ssh/${SSH_KEY_NAME}" ]; then
+        SSH_KEY="/home/dev/.ssh/${SSH_KEY_NAME}"
+    else
+        SSH_KEY=$(find /home/dev/.ssh -maxdepth 1 -type f ! -name '*.pub' ! -name 'known_hosts' | head -1)
+    fi
+    if [ -n "$SSH_KEY" ]; then
+        SSH_KEY_BASENAME="$(basename "$SSH_KEY")"
+        KH_OPT=""
+        [ -f /home/dev/.ssh/known_hosts ] && KH_OPT="-o UserKnownHostsFile=/home/dev/.ssh/known_hosts"
+        export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new $KH_OPT"
+        git config --global core.sshCommand "$GIT_SSH_COMMAND"
+        echo "[OK] SSH key loaded: ${SSH_KEY_BASENAME}"
+        echo "[OK] Git SSH command configured for SSH remotes"
+    else
+        echo "[--] SSH material found but no private key detected"
+    fi
+else
+    echo "[--] No SSH key provided"
+fi
+
+# ── Fix volume ownership (Docker creates named volumes as root) ───────
+DEV_GROUP="$(id -gn dev)"
+mkdir -p "$AUTH_DIR"
+sudo chown -R dev:"$DEV_GROUP" "$AUTH_DIR"
+
+# ── Seed Claude config defaults into persistent volume ──────────────
+if [ "$AUTH_DIR_REL" = ".claude" ] && [ -d /home/dev/.claude-defaults ]; then
+    for src in /home/dev/.claude-defaults/*; do
+        [ -f "$src" ] || continue
+        dest="${AUTH_DIR}/$(basename "$src")"
+        [ -f "$dest" ] || cp "$src" "$dest"
+    done
+fi
+
+# ── Symlink ~/.claude.json into the persistent volume ────────────────
+# Claude Code reads/writes ~/.claude.json (account metadata, onboarding
+# state, etc.) which lives OUTSIDE ~/.claude/. We store the real file
+# inside the persistent volume and symlink it so writes persist.
+if [ "$AUTH_DIR_REL" = ".claude" ]; then
+    rm -f /home/dev/.claude.json
+    if [ ! -f "${AUTH_DIR}/.claude.json" ]; then
+        # First run: create an empty JSON object so Claude can populate it
+        echo '{}' > "${AUTH_DIR}/.claude.json"
+    fi
+    ln -sf "${AUTH_DIR}/.claude.json" /home/dev/.claude.json
+fi
+
+# ── Shell aliases and command shims ──────────────────────────────────
+mkdir -p /home/dev/.local/bin
+
+ensure_bash_alias() {
+    alias_line="$1"
+    if ! grep -Fqx "$alias_line" /home/dev/.bashrc 2>/dev/null; then
+        printf '%s\n' "$alias_line" >> /home/dev/.bashrc
+    fi
+}
+
+install_command_shim() {
+    shim_name="$1"
+    shift
+    shim_path="/home/dev/.local/bin/${shim_name}"
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf 'exec'
+        for arg in "$@"; do
+            printf " '%s'" "$arg"
+        done
+        printf ' "$@"\n'
+    } > "$shim_path"
+    chmod +x "$shim_path"
+}
+
+ensure_bash_alias "alias claude-dsp='claude --dangerously-skip-permissions'"
+ensure_bash_alias "alias codex-dsp='codex --dangerously-bypass-approvals-and-sandbox'"
+install_command_shim "claude-dsp" "claude" "--dangerously-skip-permissions"
+install_command_shim "codex-dsp" "codex" "--dangerously-bypass-approvals-and-sandbox"
+
+graceful_tmux_shutdown() {
+    if [ "$TMUX_ENABLE" != "1" ] || ! command -v tmux >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        return 0
+    fi
+
+    tmux list-panes -t "$TMUX_SESSION" -F '#{pane_pid}' 2>/dev/null | while read -r pane_pid; do
+        [ -n "$pane_pid" ] || continue
+        kill -TERM "$pane_pid" 2>/dev/null || true
+    done
+
+    deadline=$((SECONDS + STOP_GRACE))
+    while tmux has-session -t "$TMUX_SESSION" 2>/dev/null; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+}
+
+handle_shutdown() {
+    graceful_tmux_shutdown
+    exit 0
+}
+
+trap handle_shutdown TERM INT HUP
+
+# ── Persistent Bash history for project shells ───────────────────────
+cat > "$SKUA_BASHRC_SNIPPET" <<EOF
+# Generated by skua entrypoint. Keeps Bash history scoped to this project.
+if [ -d "$PROJECT_DIR" ]; then
+    mkdir -p "$PROJECT_DIR/.skua" 2>/dev/null || true
+    export HISTFILE="$PROJECT_DIR/.skua/.bash_history"
+    export HISTSIZE=50000
+    export HISTFILESIZE=100000
+    shopt -s histappend 2>/dev/null || true
+    trap 'history -a' EXIT
+    case ";\${PROMPT_COMMAND:-};" in
+        *";history -a;history -n;"*) ;;
+        *)
+            if [ -n "\${PROMPT_COMMAND:-}" ]; then
+                PROMPT_COMMAND="history -a;history -n;\${PROMPT_COMMAND}"
+            else
+                PROMPT_COMMAND="history -a;history -n"
+            fi
+            export PROMPT_COMMAND
+            ;;
+    esac
+fi
+EOF
+
+if ! grep -Fq '[ -f /home/dev/.bashrc.skua ] && . /home/dev/.bashrc.skua' /home/dev/.bashrc 2>/dev/null; then
+    printf '\n[ -f /home/dev/.bashrc.skua ] && . /home/dev/.bashrc.skua\n' >> /home/dev/.bashrc
+fi
+
+# ── Check tool availability ──────────────────────────────────────────
+if command -v "$AGENT_COMMAND" &>/dev/null; then
+    echo "[OK] ${AGENT_NAME} available"
+else
+    echo "[!!] ${AGENT_NAME} command not found: ${AGENT_COMMAND}"
+fi
+
+# ── Check auth status ────────────────────────────────────────────────
+NEEDS_LOGIN=()
+PRIMARY_AUTH_FILE=""
+IFS=',' read -r -a AUTH_FILES <<< "$AUTH_FILES_RAW"
+if [ ${#AUTH_FILES[@]} -gt 0 ] && [ -n "${AUTH_FILES[0]}" ]; then
+    PRIMARY_AUTH_FILE="$AUTH_DIR/${AUTH_FILES[0]}"
+fi
+
+if [ -n "$PRIMARY_AUTH_FILE" ] && [ -f "$PRIMARY_AUTH_FILE" ]; then
+    echo "[OK] ${AGENT_NAME} authenticated (persistent)"
+else
+    if [ -n "$PRIMARY_AUTH_FILE" ]; then
+        echo "[--] ${AGENT_NAME} not logged in (${PRIMARY_AUTH_FILE} missing)"
+    else
+        echo "[--] ${AGENT_NAME} auth file not configured"
+    fi
+    NEEDS_LOGIN+=("$AGENT_LOGIN_COMMAND")
+fi
+
+# ── Agent monitoring setup ────────────────────────────────────────────
+# Run the agent-specific entrypoint hook (if present) to configure activity
+# monitoring.  The hook writes to /tmp/skua-agent-status so that
+# `skua list --agent` can display real-time agent state.
+AGENT_HOOK="/home/dev/.entrypoint.d/${AGENT_NAME}.sh"
+if [ -f "$AGENT_HOOK" ]; then
+    bash "$AGENT_HOOK" || true
+fi
+
+if [ -x /home/dev/.entrypoint.d/check_monitoring.sh ]; then
+    /home/dev/.entrypoint.d/check_monitoring.sh || true
+fi
+
+echo ""
+
+# ── Project ──────────────────────────────────────────────────────────
+if [ -d "$PROJECT_DIR" ] && [ "$(ls -A "$PROJECT_DIR" 2>/dev/null)" ]; then
+    echo "Project: ${PROJECT_NAME}"
+    echo "Path: ${PROJECT_DIR}"
+    cd "$PROJECT_DIR"
+    if [ -f "$IMAGE_REQUEST_FILE" ]; then
+        echo "Image adapt request: ${IMAGE_REQUEST_FILE}"
+    fi
+    if [ -f "$ADAPT_GUIDE_FILE" ]; then
+        echo "Adapt guide: ${ADAPT_GUIDE_FILE}"
+    fi
+else
+    echo "No project mounted."
+fi
+
+echo ""
+
+# ── Startup info for first tmux session creation ──────────────────────
+cat > "$STARTUP_INFO_FILE" <<EOF
+============================================
+  ____  _  ___   _    _       
+ / ___|| |/ / | | |  / \      
+ \___ \| ' /| | | | / _ \      
+  ___) | . \| |_| |/ ___ \    
+ |____/|_|\_\\___//_/   \_\   
+    skua — Dockerized Agents      
+============================================
+
+Agent: ${AGENT_NAME}
+Auth:  ${AUTH_DIR_REL}
+Credential: ${CREDENTIAL_NAME:-"(none)"}
+SSH key: ${SSH_KEY_BASENAME}
+Project: ${PROJECT_NAME}
+Path: ${PROJECT_DIR}
+
+tmux quickstart:
+  Ctrl-b d      Detach
+  Ctrl-b c      New window
+  Ctrl-b n/p    Next/prev window
+  Ctrl-b w      Window picker
+
+Agent commands:
+  Start agent:      ${AGENT_NAME}
+  Skip permissions: ${AGENT_NAME}-dsp
+
+============================================
+EOF
+
+# ── Login prompts if needed ──────────────────────────────────────────
+if [ ${#NEEDS_LOGIN[@]} -gt 0 ]; then
+    echo "── First-time setup ──────────────────────"
+    for login_cmd in "${NEEDS_LOGIN[@]}"; do
+        echo "  Run '$login_cmd' to authenticate"
+        echo "  (copy the URL into your host browser)"
+    done
+    echo ""
+    echo "  Auth is saved to Docker volumes and"
+    echo "  persists across container restarts."
+    echo "───────────────────────────────────────────"
+    echo ""
+fi
+
+#echo "Usage:"
+#if [ "$AGENT_NAME" = "claude" ]; then
+#    echo "  claude         -> Start Claude"
+#    echo "  claude-dsp     -> Start with --dangerously-skip-permissions"
+#elif [ "$AGENT_NAME" = "codex" ]; then
+#    echo "  codex          -> Start Codex"
+#    echo "  codex-dsp      -> Start with --dangerously-bypass-approvals-and-sandbox"
+#else
+#    echo "  ${AGENT_COMMAND}         -> Start ${AGENT_NAME}"
+#fi
+#echo "  ~/.entrypoint.d/check_monitoring.sh -> Verify tcpdump monitoring permissions"
+#if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
+#    echo "  tmux attach -t ${TMUX_SESSION} -> Reattach session"
+#    echo "  tmux detach: Ctrl-b then d"
+#fi
+#echo ""
+#echo "============================================"
+#echo ""
+#
+# Drop into interactive shell or run provided command
+if [ $# -eq 0 ]; then
+    if [ "$TMUX_ENABLE" = "1" ] && command -v tmux &>/dev/null; then
+        TMUX_START_DIR="/home/dev"
+        if [ -d "$PROJECT_DIR" ]; then
+            TMUX_START_DIR="$PROJECT_DIR"
+        fi
+
+        if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+            tmux new-session -d -s "$TMUX_SESSION" -c "$TMUX_START_DIR" "exec /bin/bash -i"
+        fi
+
+        # Keep PID 1 alive while the tmux session exists.
+        while tmux has-session -t "$TMUX_SESSION" 2>/dev/null; do
+            sleep 1
+        done
+        exit 0
+    fi
+    exec /bin/bash -i
+else
+    exec "$@"
+fi

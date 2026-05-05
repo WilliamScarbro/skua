@@ -49,6 +49,18 @@ codex login     # copy the URL into your host browser
 codex           # start coding
 ```
 
+Other bundled agents work the same way — swap the `--agent` flag and the login/run commands, for example:
+
+```bash
+skua add myapp --dir ~/projects/myapp --agent pi
+skua build myapp
+skua run myapp
+
+# Inside the container:
+pi --login
+pi
+```
+
 Subsequent `skua run` invocations reuse saved credentials — no re-login needed.
 Detach and keep the session running with `Ctrl-b`, then `d`. Re-run `skua run myapp` to reattach.
 

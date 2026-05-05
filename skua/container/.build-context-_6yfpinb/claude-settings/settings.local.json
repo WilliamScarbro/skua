@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(ssh qar \"curl -fsSL https://ollama.com/install.sh | sh\")",
+      "Bash(curl:*)",
+      "Bash(ssh:*)",
+      "Bash(claude config:*)"
+    ]
+  }
+}
