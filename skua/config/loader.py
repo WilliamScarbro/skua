@@ -45,8 +45,9 @@ class ConfigStore:
         ├── security/                # SecurityProfile resources
         ├── agents/                  # AgentConfig resources
         ├── projects/                # Project resources
-        ├── claude-data/             # legacy/default persistence (bind mode)
-        └── agent-data/              # non-Claude persistence (bind mode)
+        ├── claude-data/             # persisted Claude auth/sessions (bind mode)
+        ├── agent-data/              # persisted non-Claude auth/sessions (bind mode)
+        └── repos/                   # local repo clones
     """
 
     def __init__(self, config_dir: Optional[Path] = None):
@@ -236,15 +237,24 @@ class ConfigStore:
 
     # ── Persistence paths ────────────────────────────────────────────
 
-    def project_data_dir(self, project_name: str, agent_name: str = "claude") -> Path:
-        """Return the bind-mount persistence directory for a project/agent."""
+    def project_home_dir(self, project_name: str, agent_name: str = "claude") -> Path:
+        """Return the bind-mount auth directory for a project/agent.
+
+        Maps to the historical ``claude-data/<project>`` (or
+        ``agent-data/<agent>/<project>`` for non-claude agents) layout so
+        existing on-disk sessions remain reachable without a migration.
+        """
         if not agent_name or agent_name == "claude":
             return self.config_dir / "claude-data" / project_name
         return self.config_dir / "agent-data" / agent_name / project_name
 
+    def project_data_dir(self, project_name: str, agent_name: str = "claude") -> Path:
+        """Backward-compatible alias for the persisted project auth directory."""
+        return self.project_home_dir(project_name, agent_name)
+
     def claude_data_dir(self, project_name: str) -> Path:
         """Backward-compatible Claude data path helper."""
-        return self.project_data_dir(project_name, "claude")
+        return self.project_home_dir(project_name, "claude")
 
     def repos_dir(self) -> Path:
         """Return the base directory for cloned repositories."""

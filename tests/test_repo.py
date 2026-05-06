@@ -131,12 +131,14 @@ class TestConfigStoreRepoPaths(unittest.TestCase):
             self.store.repo_dir("proj-b"),
         )
 
-    def test_project_data_dir_claude_legacy_path(self):
+    def test_project_home_dir_claude_path(self):
         expected = Path(self.tmpdir) / "claude-data" / "myproject"
+        self.assertEqual(self.store.project_home_dir("myproject", "claude"), expected)
         self.assertEqual(self.store.project_data_dir("myproject", "claude"), expected)
 
-    def test_project_data_dir_non_claude_path(self):
+    def test_project_home_dir_non_claude_path(self):
         expected = Path(self.tmpdir) / "agent-data" / "codex" / "myproject"
+        self.assertEqual(self.store.project_home_dir("myproject", "codex"), expected)
         self.assertEqual(self.store.project_data_dir("myproject", "codex"), expected)
 
 
@@ -248,7 +250,7 @@ class TestCompositeProjects(unittest.TestCase):
             security=sec,
             agent=agent,
             image_name="skua-base-claude",
-            data_dir=Path("/tmp/auth"),
+            home_dir=Path("/tmp/home"),
             source_mounts=[
                 {"name": "a", "source": "/tmp/a", "target": "/home/dev/a", "primary": True},
                 {"name": "b", "source": "/tmp/b", "target": "/home/dev/b", "primary": False},
@@ -393,7 +395,9 @@ class TestDockerfileAgentInstall(unittest.TestCase):
             install=AgentInstallSpec(commands=["npm install -g @openai/codex"]),
         )
         dockerfile = generate_dockerfile(agent=agent)
-        self.assertIn("npm install -g --prefix /home/dev/.local @openai/codex", dockerfile)
+        # Installs as root to /usr/local/bin — no --prefix needed
+        self.assertIn("npm install -g @openai/codex", dockerfile)
+        self.assertNotIn("--prefix /home/dev/.local", dockerfile)
 
     def test_tmux_is_included_in_default_runtime_packages(self):
         from skua.docker import generate_dockerfile
@@ -547,8 +551,8 @@ class TestRunCommandEnv(unittest.TestCase):
                 runtime=AgentRuntimeSpec(command="codex"),
                 auth=AgentAuthSpec(dir=".codex", files=["auth.json"], login_command="codex login"),
             )
-            data_dir = Path(tmpdir) / "data"
-            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
+            home_dir = Path(tmpdir) / "home"
+            cmd = build_run_command(project, env, sec, agent, "skua-base-codex", home_dir)
             joined = " ".join(cmd)
             self.assertIn("SKUA_AGENT_NAME=codex", joined)
             self.assertIn("SKUA_AGENT_COMMAND=codex", joined)
@@ -556,7 +560,7 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn("SKUA_AUTH_DIR=.codex", joined)
             self.assertIn("SKUA_AUTH_FILES=auth.json", joined)
             self.assertIn("SKUA_CREDENTIAL_NAME=(none)", joined)
-            self.assertIn(f"{data_dir}:/home/dev/.codex", joined)
+            self.assertIn(f"{home_dir}:/home/dev/.codex", joined)
             self.assertIn("SKUA_PROJECT_NAME=p1", joined)
             self.assertIn("SKUA_PROJECT_DIR=/home/dev/p1", joined)
 
@@ -613,8 +617,8 @@ class TestRunCommandEnv(unittest.TestCase):
             data_dir = Path(tmpdir) / "data"
             cmd = build_run_command(project, env, sec, agent, "skua-base-codex", data_dir)
             joined = " ".join(cmd)
-            self.assertIn(f"{key_a}:/home/dev/.ssh-mount/id_ed25519:ro", joined)
-            self.assertIn(f"{key_b}:/home/dev/.ssh-mount/id_rsa:ro", joined)
+            self.assertIn(f"{key_a}:/tmp/skua-ssh-mount/id_ed25519:ro", joined)
+            self.assertIn(f"{key_b}:/tmp/skua-ssh-mount/id_rsa:ro", joined)
             self.assertIn("SKUA_SSH_KEY_NAME=id_ed25519", joined)
 
     def test_build_run_command_remote_host_embeds_ssh_material(self):
@@ -657,7 +661,7 @@ class TestRunCommandEnv(unittest.TestCase):
             self.assertIn(f"SKUA_SSH_KEY_B64={expected_key_b64}", joined)
             self.assertIn(f"SKUA_SSH_PUB_KEY_B64={expected_pub_b64}", joined)
             self.assertIn(f"SKUA_SSH_KNOWN_HOSTS_B64={expected_kh_b64}", joined)
-            self.assertNotIn("/home/dev/.ssh-mount", joined)
+            self.assertNotIn("/tmp/skua-ssh-mount", joined)
 
     def test_build_run_command_mounts_host_directory_name(self):
         from skua.docker import build_run_command
@@ -1172,7 +1176,7 @@ class TestContainerAttachCommand(unittest.TestCase):
         args = mock_execvp.call_args[0][1]
         joined = " ".join(args)
         self.assertIn('tmux attach-session -t "$session"', joined)
-        self.assertIn('/home/dev/.entrypoint.d/tmux-attach-banner.sh', joined)
+        self.assertIn('/opt/skua/entrypoint/tmux-attach-banner.sh', joined)
         self.assertIn('/bin/bash -i', joined)
         self.assertNotIn("tmux send-keys", joined)
 

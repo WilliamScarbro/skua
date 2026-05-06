@@ -35,6 +35,7 @@ from skua.docker import (
     _project_mount_path,
     _source_mount_path,
     _sanitize_mount_name,
+    project_home_volume_name,
     image_rebuild_needed,
 )
 from skua.project_adapt import ensure_adapt_workspace
@@ -643,17 +644,18 @@ def _resolve_source_mounts(store: ConfigStore, project) -> list:
     return mounts
 
 
-def _seed_auth_from_host(data_dir: Path, cred, agent, overwrite: bool = False) -> int:
-    """Seed missing auth files from the host into the container persistence directory.
+def _seed_auth_from_host(home_dir: Path, cred, agent, overwrite: bool = False) -> int:
+    """Seed missing auth files from the host into the persisted auth directory.
 
-    Uses :func:`resolve_credential_sources` to determine which host files map
-    to which destination names, so all credential-resolution logic lives in one
-    place (``skua.commands.credential``).
+    The bind path *is* the in-container auth directory (mounted at
+    ``/home/dev/<auth_dir>``), so destination names are written directly
+    under ``home_dir`` rather than into a nested ``<auth_dir>`` subfolder.
     """
     sources = resolve_credential_sources(cred, agent)
+    home_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
     for src, dest_name in sources:
-        dest = data_dir / dest_name
+        dest = home_dir / Path(dest_name).name
         if dest.exists() and not overwrite:
             continue
         if src.is_file():
@@ -663,10 +665,14 @@ def _seed_auth_from_host(data_dir: Path, cred, agent, overwrite: bool = False) -
 
 
 def _seed_auth_into_remote_volume(project_name: str, agent_name: str, cred, agent, overwrite: bool = False) -> int:
-    """Seed auth files from local host into a remote Docker named volume."""
+    """Seed auth files from local host into a remote Docker auth volume.
+
+    The named volume is mounted as the in-container auth directory, so files
+    are written directly at ``/auth/<dest_name>``.
+    """
     sources = resolve_credential_sources(cred, agent)
     copied = 0
-    vol_name = f"skua-{project_name}-{agent_name}"
+    vol_name = project_home_volume_name(project_name, agent_name)
 
     for src, dest_name in sources:
         if not src.is_file():
@@ -1130,7 +1136,7 @@ def cmd_run(args, lock_project: bool = True):
                 sys.exit(1)
 
     # Build persistence path
-    data_dir = store.project_data_dir(name, project.agent)
+    home_dir = store.project_home_dir(name, project.agent)
 
     # Resolve credential (None is fine — resolve_credential_sources falls back to agent default dir)
     cred = None
@@ -1144,7 +1150,7 @@ def cmd_run(args, lock_project: bool = True):
 
     # Seed/sync persisted auth files from host if needed
     if env.persistence.mode == "bind":
-        data_dir.mkdir(parents=True, exist_ok=True)
+        home_dir.mkdir(parents=True, exist_ok=True)
         _maybe_refresh_local_credentials(agent=agent, cred=cred)
         # Credential files are live-mounted into the container — no copy needed
     elif host:
@@ -1167,7 +1173,7 @@ def cmd_run(args, lock_project: bool = True):
         security=sec,
         agent=agent,
         image_name=image_name,
-        data_dir=data_dir,
+        home_dir=home_dir,
         repo_volume=repo_volume,
         source_mounts=source_mounts,
         cred_sources=cred_sources,
@@ -1205,9 +1211,9 @@ def cmd_run(args, lock_project: bool = True):
     print(f"  SSH key:     {ssh_display}")
     print(f"  Network:     {env.network.mode}")
     if env.persistence.mode == "bind":
-        print(f"  Auth dir:    {data_dir} -> /home/dev/{auth_dir}")
+        print(f"  Auth dir:    {home_dir} -> /home/dev/{auth_dir}")
     else:
-        print(f"  Auth dir:    volume skua-{name}-{project.agent} -> /home/dev/{auth_dir}")
+        print(f"  Auth dir:    volume {project_home_volume_name(name, project.agent)} -> /home/dev/{auth_dir}")
     print()
 
     detached_cmd = _detached_run_command(docker_cmd)
@@ -1216,6 +1222,9 @@ def cmd_run(args, lock_project: bool = True):
         sys.exit(1)
     if not wait_for_running_container(container_name):
         print(f"Error: container '{container_name}' did not start correctly.")
+        print("Container logs:")
+        subprocess.run(["docker", "logs", "--tail", "100", container_name])
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         sys.exit(1)
     if no_attach:
         print("Container started in detached mode.")

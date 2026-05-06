@@ -263,8 +263,8 @@ def _sanitize_mount_name(name: str) -> str:
 
 
 def project_home_volume_name(project_name: str, agent_name: str) -> str:
-    """Return the Docker volume name used for a project's persisted home."""
-    return f"skua-{project_name}-{agent_name}-home"
+    """Return the Docker volume name used for a project's persisted auth/home."""
+    return f"skua-{project_name}-{agent_name}"
 
 
 def _repo_name_from_url(repo_url: str) -> str:
@@ -1207,17 +1207,17 @@ def build_run_command(
     docker_cmd.extend(["-e", f"SKUA_AUTH_FILES={','.join(auth_files)}"])
     docker_cmd.extend(["-e", f"SKUA_CREDENTIAL_NAME={project.credential or '(none)'}"])
 
+    auth_mount = f"/home/dev/{auth_dir}"
     if environment.persistence.mode == "bind":
         home_dir.mkdir(parents=True, exist_ok=True)
-        (home_dir / auth_dir).mkdir(parents=True, exist_ok=True)
-        docker_cmd.extend(["-v", f"{home_dir}:/home/dev"])
+        docker_cmd.extend(["-v", f"{home_dir}:{auth_mount}"])
         for src_path, dest_name in (cred_sources or []):
             safe_dest = Path(dest_name).name.strip()
             if safe_dest and Path(src_path).is_file():
-                docker_cmd.extend(["-v", f"{src_path}:/home/dev/{auth_dir}/{safe_dest}"])
+                docker_cmd.extend(["-v", f"{src_path}:{auth_mount}/{safe_dest}"])
     else:
         vol_name = project_home_volume_name(project.name, project.agent)
-        docker_cmd.extend(["-v", f"{vol_name}:/home/dev"])
+        docker_cmd.extend(["-v", f"{vol_name}:{auth_mount}"])
 
     # Network mode
     net = environment.network.mode

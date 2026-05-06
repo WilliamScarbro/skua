@@ -162,7 +162,7 @@ class TestRemoveCommand(unittest.TestCase):
                                     mock_remove.assert_not_called()
                                     self.assertIsNotNone(store.load_project("qar"))
 
-    def test_remove_local_bind_project_deletes_data_dir_when_confirmed(self):
+    def test_remove_local_bind_project_deletes_home_dir_when_confirmed(self):
         from skua.commands.remove import cmd_remove
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -177,15 +177,15 @@ class TestRemoveCommand(unittest.TestCase):
                     host="",
                 )
             )
-            data_dir = store.project_data_dir("localproj", "claude")
-            data_dir.mkdir(parents=True)
-            (data_dir / "auth.json").write_text("{}")
+            home_dir = store.project_home_dir("localproj", "claude")
+            home_dir.mkdir(parents=True)
+            (home_dir / "auth.json").write_text("{}")
 
             with mock.patch("skua.commands.remove.ConfigStore", return_value=store):
                 with mock.patch("skua.commands.remove.is_container_running", return_value=False):
                     with mock.patch("skua.commands.remove.confirm", return_value=True):
                         cmd_remove(self._args("localproj"))
-                        self.assertFalse(data_dir.exists())
+                        self.assertFalse(home_dir.exists())
                         self.assertIsNone(store.load_project("localproj"))
 
 

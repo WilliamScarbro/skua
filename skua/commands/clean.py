@@ -3,8 +3,10 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 from skua.config import ConfigStore
+from skua.docker import project_home_volume_name
 from skua.utils import confirm
 
 
@@ -42,17 +44,17 @@ def _clean_project(store, project, env):
         auth_files = [".credentials.json", ".claude.json"]
 
     if persist_mode == "bind":
-        data_dir = store.project_data_dir(name, project.agent)
-        if data_dir.exists():
+        home_dir = store.project_home_dir(name, project.agent)
+        if home_dir.exists():
             for fname in auth_files:
-                f = data_dir / fname
+                f = home_dir / Path(fname).name
                 if f.exists():
                     f.unlink()
             print(f"Cleaned agent data for '{name}' ({project.agent}).")
         else:
             print(f"No data to clean for '{name}'.")
     else:
-        vol_name = f"skua-{name}-{project.agent}"
+        vol_name = project_home_volume_name(name, project.agent)
         result = subprocess.run(
             ["docker", "volume", "rm", vol_name],
             capture_output=True, text=True
