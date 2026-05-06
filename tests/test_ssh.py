@@ -107,20 +107,20 @@ class TestSSHKeyMounting(unittest.TestCase):
         """Build the standard SSH mount list matching skua's behavior."""
         key_path = Path(SSH_KEY).resolve()
         key_name = key_path.name
-        mounts = [(str(key_path), f"/home/dev/.ssh-mount/{key_name}", "ro")]
+        mounts = [(str(key_path), f"/tmp/skua-ssh-mount/{key_name}", "ro")]
         pub = Path(f"{key_path}.pub")
         if pub.is_file():
-            mounts.append((str(pub), f"/home/dev/.ssh-mount/{key_name}.pub", "ro"))
+            mounts.append((str(pub), f"/tmp/skua-ssh-mount/{key_name}.pub", "ro"))
         known = key_path.parent / "known_hosts"
         if known.is_file():
-            mounts.append((str(known), "/home/dev/.ssh-mount/known_hosts", "ro"))
+            mounts.append((str(known), "/tmp/skua-ssh-mount/known_hosts", "ro"))
         return mounts
 
     def test_key_is_mounted(self):
         """Private key file exists inside the container."""
         key_name = Path(SSH_KEY).name
         result = docker_run(
-            f"test -f /home/dev/.ssh-mount/{key_name} && echo OK",
+            f"test -f /tmp/skua-ssh-mount/{key_name} && echo OK",
             mounts=self._ssh_mounts(),
         )
         self.assertEqual(result.stdout.strip(), "OK", result.stderr)
@@ -132,7 +132,7 @@ class TestSSHKeyMounting(unittest.TestCase):
             self.skipTest("No .pub file for this key")
         key_name = Path(SSH_KEY).name
         result = docker_run(
-            f"test -f /home/dev/.ssh-mount/{key_name}.pub && echo OK",
+            f"test -f /tmp/skua-ssh-mount/{key_name}.pub && echo OK",
             mounts=self._ssh_mounts(),
         )
         self.assertEqual(result.stdout.strip(), "OK", result.stderr)
@@ -143,7 +143,7 @@ class TestSSHKeyMounting(unittest.TestCase):
         if not known.is_file():
             self.skipTest("No known_hosts file")
         result = docker_run(
-            "test -f /home/dev/.ssh-mount/known_hosts && echo OK",
+            "test -f /tmp/skua-ssh-mount/known_hosts && echo OK",
             mounts=self._ssh_mounts(),
         )
         self.assertEqual(result.stdout.strip(), "OK", result.stderr)
@@ -192,13 +192,13 @@ class TestSSHGitOperations(unittest.TestCase):
     def _ssh_mounts(self):
         key_path = Path(SSH_KEY).resolve()
         key_name = key_path.name
-        mounts = [(str(key_path), f"/home/dev/.ssh-mount/{key_name}", "ro")]
+        mounts = [(str(key_path), f"/tmp/skua-ssh-mount/{key_name}", "ro")]
         pub = Path(f"{key_path}.pub")
         if pub.is_file():
-            mounts.append((str(pub), f"/home/dev/.ssh-mount/{key_name}.pub", "ro"))
+            mounts.append((str(pub), f"/tmp/skua-ssh-mount/{key_name}.pub", "ro"))
         known = key_path.parent / "known_hosts"
         if known.is_file():
-            mounts.append((str(known), "/home/dev/.ssh-mount/known_hosts", "ro"))
+            mounts.append((str(known), "/tmp/skua-ssh-mount/known_hosts", "ro"))
         return mounts
 
     def test_ssh_github_auth(self):
@@ -257,10 +257,10 @@ class TestNoSSHKey(unittest.TestCase):
             raise unittest.SkipTest(f"Docker image '{IMAGE_NAME}' not found. Run 'skua build' first.")
 
     def test_no_ssh_mount_dir(self):
-        """Without SSH mounts, .ssh-mount is empty or absent and entrypoint handles it."""
+        """Without SSH mounts, the transient SSH mount dir is empty or absent and entrypoint handles it."""
         result = docker_run(
-            'if [ -d /home/dev/.ssh-mount ]; then '
-            '  count=$(ls -A /home/dev/.ssh-mount 2>/dev/null | wc -l); '
+            'if [ -d /tmp/skua-ssh-mount ]; then '
+            '  count=$(ls -A /tmp/skua-ssh-mount 2>/dev/null | wc -l); '
             '  echo "exists:empty=$([[ $count -eq 0 ]] && echo yes || echo no)"; '
             'else '
             '  echo "not-found"; '
@@ -270,7 +270,7 @@ class TestNoSSHKey(unittest.TestCase):
         # Either the dir doesn't exist or it exists but is empty
         self.assertTrue(
             output == "not-found" or "empty=yes" in output,
-            f"Expected empty or missing .ssh-mount, got: {output}"
+            f"Expected empty or missing transient SSH mount dir, got: {output}"
         )
 
     def test_git_ssh_command_not_set(self):

@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 from skua.config import ConfigStore
-from skua.docker import image_name_for_agent, is_container_running
+from skua.docker import image_name_for_agent, is_container_running, project_home_volume_name
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 from skua.utils import confirm
 
@@ -73,7 +73,7 @@ def cmd_remove(args, lock_project: bool = True):
             sys.exit(1)
 
     if host:
-        auth_vol = f"skua-{name}-{project.agent}"
+        auth_vol = project_home_volume_name(name, project.agent)
         repo_vols = []
         if getattr(project, "sources", None):
             from skua.commands.run import _project_sources, _source_volume_name
@@ -106,13 +106,13 @@ def cmd_remove(args, lock_project: bool = True):
         # Offer to clean local data
         persist_mode = env.persistence.mode if env else "bind"
         if persist_mode == "bind":
-            data_dir = store.project_data_dir(name, project.agent)
-            if data_dir.exists():
-                if confirm(f"Also remove {project.agent} data at {data_dir}?"):
-                    shutil.rmtree(data_dir)
-                    print("  Agent data removed.")
+            home_dir = store.project_home_dir(name, project.agent)
+            if home_dir.exists():
+                if confirm(f"Also remove persisted home at {home_dir}?"):
+                    shutil.rmtree(home_dir)
+                    print("  Persisted home removed.")
         else:
-            vol_name = f"skua-{name}-{project.agent}"
+            vol_name = project_home_volume_name(name, project.agent)
             if confirm(f"Also remove Docker volume '{vol_name}'?"):
                 _run_docker_remove(["docker", "volume", "rm", vol_name], f"volume '{vol_name}'")
                 print("  Docker volume removed.")

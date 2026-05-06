@@ -9,7 +9,7 @@
 #
 # Requires $AUTH_DIR to be set (done by entrypoint.sh before this is called).
 
-HOOKS_DIR="/home/dev/.entrypoint.d/hooks"
+HOOKS_DIR="${SKUA_ENTRYPOINT_DIR:-/opt/skua/entrypoint}/hooks"
 STATUS_FILE="/tmp/skua-agent-status"
 
 # Initialise status file so skua list shows "idle" from first boot

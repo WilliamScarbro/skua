@@ -5,6 +5,8 @@ set -e
 AGENT_NAME="${SKUA_AGENT_NAME:-agent}"
 AGENT_COMMAND="${SKUA_AGENT_COMMAND:-$AGENT_NAME}"
 AGENT_LOGIN_COMMAND="${SKUA_AGENT_LOGIN_COMMAND:-$AGENT_COMMAND login}"
+SKUA_ENTRYPOINT_DIR="${SKUA_ENTRYPOINT_DIR:-/opt/skua/entrypoint}"
+SKUA_DEFAULTS_DIR="${SKUA_DEFAULTS_DIR:-/opt/skua/defaults}"
 AUTH_DIR_REL="${SKUA_AUTH_DIR:-.claude}"
 AUTH_DIR="/home/dev/${AUTH_DIR_REL#/}"
 AUTH_FILES_RAW="${SKUA_AUTH_FILES:-}"
@@ -29,6 +31,11 @@ echo "Agent: ${AGENT_NAME}"
 echo "Auth:  ${AUTH_DIR_REL}"
 echo "Credential: ${CREDENTIAL_NAME:-"(none)"}"
 echo ""
+
+# ── Fix persisted home ownership early (must happen before any writes to $HOME) ──
+# Docker creates named volumes owned by root; fix before git config, SSH setup, etc.
+DEV_GROUP="$(id -gn dev)"
+sudo chown dev:"$DEV_GROUP" /home/dev
 
 # ── Configure git identity from env vars ─────────────────────────────
 if [ -n "$GIT_AUTHOR_NAME" ]; then
@@ -75,9 +82,9 @@ if [ -n "${SKUA_SSH_KEY_B64:-}" ] || [ -n "${SKUA_SSH_PUB_KEY_B64:-}" ] || [ -n 
     fi
 fi
 
-if [ -d /home/dev/.ssh-mount ] && [ "$(ls -A /home/dev/.ssh-mount 2>/dev/null)" ]; then
+if [ -d /tmp/skua-ssh-mount ] && [ "$(ls -A /tmp/skua-ssh-mount 2>/dev/null)" ]; then
     mkdir -p /home/dev/.ssh
-    cp /home/dev/.ssh-mount/* /home/dev/.ssh/ 2>/dev/null || true
+    cp /tmp/skua-ssh-mount/* /home/dev/.ssh/ 2>/dev/null || true
     chmod 700 /home/dev/.ssh
     chmod 600 /home/dev/.ssh/* 2>/dev/null || true
 fi
@@ -103,14 +110,12 @@ else
     echo "[--] No SSH key provided"
 fi
 
-# ── Fix volume ownership (Docker creates named volumes as root) ───────
-DEV_GROUP="$(id -gn dev)"
 mkdir -p "$AUTH_DIR"
 sudo chown -R dev:"$DEV_GROUP" "$AUTH_DIR"
 
-# ── Seed Claude config defaults into persistent volume ──────────────
-if [ "$AUTH_DIR_REL" = ".claude" ] && [ -d /home/dev/.claude-defaults ]; then
-    for src in /home/dev/.claude-defaults/*; do
+# ── Seed Claude config defaults into persisted home ─────────────────
+if [ "$AUTH_DIR_REL" = ".claude" ] && [ -d "$SKUA_DEFAULTS_DIR/claude-settings" ]; then
+    for src in "$SKUA_DEFAULTS_DIR"/claude-settings/*; do
         [ -f "$src" ] || continue
         dest="${AUTH_DIR}/$(basename "$src")"
         [ -f "$dest" ] || cp "$src" "$dest"
@@ -132,6 +137,21 @@ fi
 
 # ── Shell aliases and command shims ──────────────────────────────────
 mkdir -p /home/dev/.local/bin
+
+# Fresh persisted homes start empty, so restore the standard user shell
+# bootstrap once so interactive shells keep the default Debian colors/prompt.
+if [ ! -f /home/dev/.bashrc ]; then
+    if [ -f /etc/skel/.bashrc ]; then
+        cp /etc/skel/.bashrc /home/dev/.bashrc
+    else
+        cat > /home/dev/.bashrc <<'EOF'
+if [ -f /etc/bash.bashrc ]; then
+    . /etc/bash.bashrc
+fi
+EOF
+    fi
+    chown dev:"$DEV_GROUP" /home/dev/.bashrc
+fi
 
 ensure_bash_alias() {
     alias_line="$1"
@@ -249,13 +269,13 @@ fi
 # Run the agent-specific entrypoint hook (if present) to configure activity
 # monitoring.  The hook writes to /tmp/skua-agent-status so that
 # `skua list --agent` can display real-time agent state.
-AGENT_HOOK="/home/dev/.entrypoint.d/${AGENT_NAME}.sh"
+AGENT_HOOK="${SKUA_ENTRYPOINT_DIR}/${AGENT_NAME}.sh"
 if [ -f "$AGENT_HOOK" ]; then
     bash "$AGENT_HOOK" || true
 fi
 
-if [ -x /home/dev/.entrypoint.d/check_monitoring.sh ]; then
-    /home/dev/.entrypoint.d/check_monitoring.sh || true
+if [ -x "$SKUA_ENTRYPOINT_DIR/check_monitoring.sh" ]; then
+    "$SKUA_ENTRYPOINT_DIR/check_monitoring.sh" || true
 fi
 
 echo ""
@@ -316,8 +336,8 @@ if [ ${#NEEDS_LOGIN[@]} -gt 0 ]; then
         echo "  (copy the URL into your host browser)"
     done
     echo ""
-    echo "  Auth is saved to Docker volumes and"
-    echo "  persists across container restarts."
+    echo "  Auth and home-directory state are saved in the"
+    echo "  persisted home and survive container restarts."
     echo "───────────────────────────────────────────"
     echo ""
 fi

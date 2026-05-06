@@ -802,7 +802,7 @@ def _run_agent_adapt_session(
     """Start an adapt container session and ask the agent to update image-request.yaml."""
     print("[adapt] Preparing base agent image...")
     image_name = _ensure_base_agent_image(store, project, sec, agent)
-    data_dir = store.project_data_dir(project.name, project.agent)
+    home_dir = store.project_home_dir(project.name, project.agent)
 
     cred = None
     if project.credential:
@@ -817,7 +817,7 @@ def _run_agent_adapt_session(
         security=sec,
         agent=agent,
         image_name=image_name,
-        data_dir=data_dir,
+        home_dir=home_dir,
         cred_sources=cred_sources,
     )
     print("[adapt] Checking auth...")

@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: BUSL-1.1
 # Build artifacts
 .build-context/
+.build-context-*/
+*.egg-info/
 __pycache__/
 *.deb
 deb-build/
 packaging/deb-build/
+
+# Test scratch (created by MagicMock-using tests that don't tempdir properly)
+MagicMock/
 
 # Editor / IDE
 *.swp

@@ -217,7 +217,7 @@ def cmd_add(args):
     if not host:
         env = store.load_environment(env_name)
         if env and env.persistence.mode == "bind":
-            store.project_data_dir(name, agent_name).mkdir(parents=True, exist_ok=True)
+            store.project_home_dir(name, agent_name).mkdir(parents=True, exist_ok=True)
     if project_dir and Path(project_dir).is_dir():
         ensure_adapt_workspace(Path(project_dir), name, agent_name)
 

@@ -72,8 +72,8 @@ class TestProjectAdaptHelpers(unittest.TestCase):
             auth_file = src_dir / "auth.json"
             auth_file.write_text('{"token":"live"}')
 
-            data_dir = tmp / "project-auth"
-            data_dir.mkdir(parents=True, exist_ok=True)
+            home_dir = tmp / "project-home"
+            home_dir.mkdir(parents=True, exist_ok=True)
 
             agent = AgentConfig(
                 name="codex",
@@ -93,7 +93,7 @@ class TestProjectAdaptHelpers(unittest.TestCase):
                 security=sec,
                 agent=agent,
                 image_name="test-image",
-                data_dir=data_dir,
+                home_dir=home_dir,
                 cred_sources=cred_sources,
             )
             cmd_str = " ".join(cmd)

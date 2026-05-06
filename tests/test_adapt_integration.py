@@ -77,7 +77,7 @@ class TestAdaptIntegration(unittest.TestCase):
                 Project(name="proj", directory=str(project_dir), agent="mock-agent", security="open")
             )
 
-            auth_file = store.project_data_dir("proj", "mock-agent") / "token"
+            auth_file = store.project_home_dir("proj", "mock-agent") / "token"
             auth_file.parent.mkdir(parents=True, exist_ok=True)
             auth_file.write_text("ok\n")
 
