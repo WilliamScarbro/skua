@@ -10,6 +10,12 @@ from skua.docker import get_running_skua_containers
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 from skua.utils import confirm
 
+# docker stop sends SIGTERM, then SIGKILLs after this many seconds. The entrypoint's
+# trap (SKUA_STOP_GRACE, default 15s) needs the full grace window to TERM tmux panes
+# and let bash run its `history -a` EXIT trap; we give it a buffer on top so the
+# trap finishes well before SIGKILL would truncate writes.
+DOCKER_STOP_TIMEOUT = 30
+
 
 def _repo_dir(project, store: ConfigStore) -> Path:
     if project.directory:
@@ -117,7 +123,7 @@ def cmd_stop(args, lock_project: bool = True) -> bool:
         print("Stop cancelled.")
         return False
 
-    cmd = ["docker", "stop", "--time", "15", container_name]
+    cmd = ["docker", "stop", "--time", str(DOCKER_STOP_TIMEOUT), container_name]
     if host:
         cmd = ["ssh", host, *cmd]
     result = subprocess.run(cmd)

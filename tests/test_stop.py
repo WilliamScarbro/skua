@@ -49,7 +49,10 @@ class TestStopCommand(unittest.TestCase):
         result = cmd_stop(SimpleNamespace(name="demo", force=True), lock_project=False)
 
         self.assertTrue(result)
-        mock_run.assert_called_once_with(["docker", "stop", "--time", "15", "skua-demo"])
+        from skua.commands.stop import DOCKER_STOP_TIMEOUT
+        mock_run.assert_called_once_with(
+            ["docker", "stop", "--time", str(DOCKER_STOP_TIMEOUT), "skua-demo"]
+        )
 
     @mock.patch("skua.commands.stop.subprocess.run")
     @mock.patch("skua.commands.stop.get_running_skua_containers", return_value=["skua-demo"])
@@ -65,8 +68,9 @@ class TestStopCommand(unittest.TestCase):
         result = cmd_stop(SimpleNamespace(name="demo", force=True), lock_project=False)
 
         self.assertTrue(result)
+        from skua.commands.stop import DOCKER_STOP_TIMEOUT
         mock_run.assert_called_once_with(
-            ["ssh", "docker.example.com", "docker", "stop", "--time", "15", "skua-demo"]
+            ["ssh", "docker.example.com", "docker", "stop", "--time", str(DOCKER_STOP_TIMEOUT), "skua-demo"]
         )
 
 
@@ -84,6 +88,21 @@ class TestEntrypointPersistenceHooks(unittest.TestCase):
         self.assertIn("graceful_tmux_shutdown()", text)
         self.assertIn("kill -TERM \"$pane_pid\"", text)
         self.assertIn("trap handle_shutdown TERM INT HUP", text)
+
+    def test_docker_stop_timeout_exceeds_entrypoint_grace(self):
+        """docker stop must outlast the entrypoint's grace window so bash can flush history."""
+        import re
+        from skua.commands.stop import DOCKER_STOP_TIMEOUT
+
+        entrypoint = Path(__file__).resolve().parent.parent / "skua" / "container" / "entrypoint.sh"
+        text = entrypoint.read_text()
+        match = re.search(r'STOP_GRACE="\$\{SKUA_STOP_GRACE:-(\d+)\}"', text)
+        self.assertIsNotNone(match, "entrypoint must define STOP_GRACE default")
+        grace_default = int(match.group(1))
+        self.assertGreater(
+            DOCKER_STOP_TIMEOUT, grace_default,
+            "docker stop --time must exceed entrypoint STOP_GRACE so history -a can flush",
+        )
 
 
 if __name__ == "__main__":
