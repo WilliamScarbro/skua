@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from skua.commands.run import cmd_run
 from skua.commands.stop import cmd_stop
 from skua.config import ConfigStore
+from skua.docker import wait_for_container_removed
 from skua.project_lock import ProjectBusyError, format_project_busy_error, project_operation_lock
 
 
@@ -21,6 +22,15 @@ def cmd_restart(args):
     try:
         with project_operation_lock(store, name, "restarting"):
             if not cmd_stop(SimpleNamespace(name=name, force=True), lock_project=False):
+                return
+            project = store.resolve_project(name)
+            host = (getattr(project, "host", "") or "") if project else ""
+            container_name = f"skua-{name}"
+            if not wait_for_container_removed(container_name, host=host):
+                print(
+                    f"Error: container '{container_name}' did not exit cleanly; "
+                    "remove it manually before retrying."
+                )
                 return
             cmd_run(
                 SimpleNamespace(name=name, no_attach=no_attach, replace_process=replace_process),

@@ -17,6 +17,9 @@ from urllib.request import urlopen
 
 from skua.config.resources import Environment, SecurityProfile, AgentConfig, Project, ssh_private_keys
 
+SKUA_ENTRYPOINT_DIR = "/opt/skua/entrypoint"
+SKUA_DEFAULTS_DIR = "/opt/skua/defaults"
+
 
 def is_container_running(name: str) -> bool:
     """Check if a Docker container with the given name is running."""
@@ -28,6 +31,18 @@ def is_container_running(name: str) -> bool:
         return bool(result.stdout.strip())
     except FileNotFoundError:
         return False
+
+
+def container_exists(name: str, host: str = "") -> bool:
+    """Check whether a container with the given name exists (any state)."""
+    cmd = ["docker", "ps", "-aq", "--filter", f"name=^{name}$"]
+    if host:
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, *cmd]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return False
+    return bool(result.stdout.strip())
 
 
 def get_running_skua_containers(host: str = "") -> list | None:
@@ -247,6 +262,11 @@ def _sanitize_mount_name(name: str) -> str:
     return cleaned
 
 
+def project_home_volume_name(project_name: str, agent_name: str) -> str:
+    """Return the Docker volume name used for a project's persisted home."""
+    return f"skua-{project_name}-{agent_name}-home"
+
+
 def _repo_name_from_url(repo_url: str) -> str:
     """Extract repository name from common git URL formats."""
     repo = (repo_url or "").strip()
@@ -326,12 +346,13 @@ DEFAULT_PACKAGES = [
 
 # Agent install commands keyed by agent name (fallback when no AgentConfig found)
 DEFAULT_AGENT_INSTALLS = {
-    "claude": ["curl -fsSL https://claude.ai/install.sh | bash"],
-    "codex": ["npm install -g --prefix /home/dev/.local @openai/codex"],
+    "claude": ["npm install -g --prefix /usr/local @anthropic-ai/claude-code"],
+    "codex": ["npm install -g --prefix /usr/local @openai/codex"],
 }
 
 # Agent-required packages keyed by agent name.
 DEFAULT_AGENT_REQUIRED_PACKAGES = {
+    "claude": ["nodejs", "npm"],
     "codex": ["nodejs", "npm"],
 }
 
@@ -405,9 +426,14 @@ def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
     normalized = []
     for cmd in commands or []:
         c = (cmd or "").strip()
-        if agent_name == "codex":
-            if c == "npm install -g @openai/codex":
-                c = "npm install -g --prefix /home/dev/.local @openai/codex"
+        if agent_name in ("claude", "codex"):
+            # Legacy: agents were temporarily installed with --prefix /home/dev/.local
+            # (ran as dev user), which was hidden by the home volume mount at runtime.
+            # Redirect to /usr/local so binaries land outside the persisted home volume.
+            c = re.sub(r'--prefix\s+/home/dev/\.local', '--prefix /usr/local', c)
+            # Legacy curl installer for claude — replace with direct npm install.
+            if c == "curl -fsSL https://claude.ai/install.sh | bash":
+                c = "npm install -g --prefix /usr/local @anthropic-ai/claude-code"
         if c:
             normalized.append(c)
     return normalized
@@ -450,11 +476,9 @@ def agent_install_uses_floating_version(agent: AgentConfig = None) -> bool:
         cmd = str(raw_cmd or "").strip()
         if not cmd:
             continue
-        if "curl -fsSL" in cmd and "| bash" in cmd:
-            return True
-        if "@openai/codex@" in cmd:
+        if "@openai/codex@" in cmd or "@anthropic-ai/claude-code@" in cmd:
             continue
-        if "@openai/codex" in cmd and "npm install" in cmd:
+        if ("@openai/codex" in cmd or "@anthropic-ai/claude-code" in cmd) and "npm install" in cmd:
             return True
     return False
 
@@ -786,6 +810,8 @@ RUN set -eux; \\
     else \\
         useradd --uid "$USER_UID" --gid "$USER_GID" -m -s /bin/bash dev; \\
     fi; \\
+    mkdir -p /home/dev {SKUA_ENTRYPOINT_DIR}/hooks {SKUA_DEFAULTS_DIR}; \\
+    chown -R dev:"$USER_GID" /home/dev /opt/skua; \\
     echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 # ── Allow tcpdump for non-root (monitoring) ──────────────────────────
@@ -795,38 +821,37 @@ RUN set -eux; \
         setcap cap_net_raw,cap_net_admin=eip "$tcpdump_bin" || true; \
     fi
 
-# ── Install agent ────────────────────────────────────────────────────
-ENV NPM_CONFIG_PREFIX="/home/dev/.local"
-USER dev
+# ── Install agent (as root so binaries land in /usr/local/bin, outside
+#    the persisted home volume that overlays /home/dev at runtime) ────
+USER root
 {install_lines}
 WORKDIR /home/dev
-{extra_lines}
 
-# ── Non-sensitive config defaults (copied into volume on first run) ──
-COPY --chown=dev:dev claude-settings/ /home/dev/.claude-defaults/
-
-# ── Placeholder directories ─────────────────────────────────────────
-RUN mkdir -p /home/dev/.ssh /home/dev/project /home/dev/.claude /home/dev/.entrypoint.d/hooks
+# ── Non-sensitive config defaults (copied into home on first run) ──
+COPY --chown=dev:dev claude-settings/ {SKUA_DEFAULTS_DIR}/claude-settings/
 
 # ── Environment ──────────────────────────────────────────────────────
 ENV EDITOR=vim
+ENV NPM_CONFIG_PREFIX="/home/dev/.local"
 ENV PATH="/home/dev/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+USER dev
+{extra_lines}
 {sudo_removal}
 # ── Entrypoint ───────────────────────────────────────────────────────
-COPY --chown=dev:dev entrypoint.sh /home/dev/.entrypoint.d/entrypoint.sh
-RUN chmod +x /home/dev/.entrypoint.d/entrypoint.sh
-COPY --chown=dev:dev check_monitoring.sh /home/dev/.entrypoint.d/check_monitoring.sh
-RUN chmod +x /home/dev/.entrypoint.d/check_monitoring.sh
-COPY --chown=dev:dev tmux-attach-banner.sh /home/dev/.entrypoint.d/tmux-attach-banner.sh
-RUN chmod +x /home/dev/.entrypoint.d/tmux-attach-banner.sh
+COPY --chown=dev:dev entrypoint.sh {SKUA_ENTRYPOINT_DIR}/entrypoint.sh
+RUN chmod +x {SKUA_ENTRYPOINT_DIR}/entrypoint.sh
+COPY --chown=dev:dev check_monitoring.sh {SKUA_ENTRYPOINT_DIR}/check_monitoring.sh
+RUN chmod +x {SKUA_ENTRYPOINT_DIR}/check_monitoring.sh
+COPY --chown=dev:dev tmux-attach-banner.sh {SKUA_ENTRYPOINT_DIR}/tmux-attach-banner.sh
+RUN chmod +x {SKUA_ENTRYPOINT_DIR}/tmux-attach-banner.sh
 
-ENTRYPOINT ["/home/dev/.entrypoint.d/entrypoint.sh"]
+ENTRYPOINT ["{SKUA_ENTRYPOINT_DIR}/entrypoint.sh"]
 
 # ── Agent monitoring hooks ────────────────────────────────────────────
-COPY --chown=dev:dev hooks/ /home/dev/.entrypoint.d/hooks/
-RUN chmod +x /home/dev/.entrypoint.d/hooks/*.sh
-COPY --chown=dev:dev .entrypoint.d/ /home/dev/.entrypoint.d/
-RUN chmod +x /home/dev/.entrypoint.d/*.sh 2>/dev/null || true
+COPY --chown=dev:dev hooks/ {SKUA_ENTRYPOINT_DIR}/hooks/
+RUN chmod +x {SKUA_ENTRYPOINT_DIR}/hooks/*.sh
+COPY --chown=dev:dev .entrypoint.d/ {SKUA_ENTRYPOINT_DIR}/
+RUN chmod +x {SKUA_ENTRYPOINT_DIR}/*.sh 2>/dev/null || true
 """
     return dockerfile
 
@@ -949,8 +974,11 @@ def build_image(
             claude_home = Path.home() / ".claude"
             for fname in ("settings.json", "settings.local.json"):
                 src = claude_home / fname
-                if src.exists():
-                    shutil.copy2(src, settings_dir / fname)
+                if not src.exists():
+                    continue
+                (settings_dir / fname).write_bytes(
+                    _strip_host_hooks_from_settings(src.read_bytes())
+                )
 
         uid = os.getuid()
         gid = os.getgid()
@@ -1056,7 +1084,7 @@ def build_run_command(
     security: SecurityProfile,
     agent: AgentConfig,
     image_name: str,
-    data_dir: Path,
+    home_dir: Path,
     repo_volume: str = "",
     source_mounts: list = None,
     cred_sources: list = None,
@@ -1101,7 +1129,7 @@ def build_run_command(
                     key_b64 = base64.b64encode(key_path.read_bytes()).decode("ascii")
                     docker_cmd.extend(["-e", f"SKUA_SSH_KEY_B64={key_b64}"])
             else:
-                docker_cmd.extend(["-v", f"{key_path}:/home/dev/.ssh-mount/{key_name}:ro"])
+                docker_cmd.extend(["-v", f"{key_path}:/tmp/skua-ssh-mount/{key_name}:ro"])
 
             pub_key = Path(f"{key_path}.pub")
             if pub_key.is_file():
@@ -1110,7 +1138,7 @@ def build_run_command(
                         pub_b64 = base64.b64encode(pub_key.read_bytes()).decode("ascii")
                         docker_cmd.extend(["-e", f"SKUA_SSH_PUB_KEY_B64={pub_b64}"])
                 else:
-                    docker_cmd.extend(["-v", f"{pub_key}:/home/dev/.ssh-mount/{key_name}.pub:ro"])
+                    docker_cmd.extend(["-v", f"{pub_key}:/tmp/skua-ssh-mount/{key_name}.pub:ro"])
 
             known_hosts = key_path.parent / "known_hosts"
             if known_hosts.is_file() and not known_hosts_mounted:
@@ -1118,7 +1146,7 @@ def build_run_command(
                     known_hosts_b64 = base64.b64encode(known_hosts.read_bytes()).decode("ascii")
                     docker_cmd.extend(["-e", f"SKUA_SSH_KNOWN_HOSTS_B64={known_hosts_b64}"])
                 else:
-                    docker_cmd.extend(["-v", f"{known_hosts}:/home/dev/.ssh-mount/known_hosts:ro"])
+                    docker_cmd.extend(["-v", f"{known_hosts}:/tmp/skua-ssh-mount/known_hosts:ro"])
                 known_hosts_mounted = True
 
     # Project directory mounts (local bind-mounts or remote named volumes)
@@ -1147,12 +1175,11 @@ def build_run_command(
     ]
     docker_cmd.extend(["-e", f"SKUA_PROJECT_SOURCES={json.dumps(source_manifest, separators=(',', ':'))}"])
 
-    # Persistence mount
+    # Persisted home mount
     auth_dir = ".claude"
     if agent and agent.auth and agent.auth.dir:
         auth_dir = agent.auth.dir
     auth_dir = auth_dir.lstrip("/")
-    auth_mount = f"/home/dev/{auth_dir}"
     agent_name = (agent.name if agent and agent.name else project.agent) or "agent"
     agent_command = (
         agent.runtime.command
@@ -1181,15 +1208,16 @@ def build_run_command(
     docker_cmd.extend(["-e", f"SKUA_CREDENTIAL_NAME={project.credential or '(none)'}"])
 
     if environment.persistence.mode == "bind":
-        data_dir.mkdir(parents=True, exist_ok=True)
-        docker_cmd.extend(["-v", f"{data_dir}:{auth_mount}"])
+        home_dir.mkdir(parents=True, exist_ok=True)
+        (home_dir / auth_dir).mkdir(parents=True, exist_ok=True)
+        docker_cmd.extend(["-v", f"{home_dir}:/home/dev"])
         for src_path, dest_name in (cred_sources or []):
             safe_dest = Path(dest_name).name.strip()
             if safe_dest and Path(src_path).is_file():
-                docker_cmd.extend(["-v", f"{src_path}:{auth_mount}/{safe_dest}"])
+                docker_cmd.extend(["-v", f"{src_path}:/home/dev/{auth_dir}/{safe_dest}"])
     else:
-        vol_name = f"skua-{project.name}-{project.agent}"
-        docker_cmd.extend(["-v", f"{vol_name}:{auth_mount}"])
+        vol_name = project_home_volume_name(project.name, project.agent)
+        docker_cmd.extend(["-v", f"{vol_name}:/home/dev"])
 
     # Network mode
     net = environment.network.mode
@@ -1231,7 +1259,7 @@ def exec_into_container(container_name: str, replace_process: bool = True) -> bo
         '  tmux new-session -d -s "$session" "exec /bin/bash -i"; '
         'fi; '
         'exec tmux attach-session -t "$session" \\; '
-        'run-shell "/home/dev/.entrypoint.d/tmux-attach-banner.sh \\"$session\\""'
+        f'run-shell "{SKUA_ENTRYPOINT_DIR}/tmux-attach-banner.sh \\"$session\\""'
     )
     cmd = ["docker", "exec", "-it", container_name, "bash", "-lc", attach_cmd]
     if replace_process:
@@ -1244,6 +1272,20 @@ def exec_into_container(container_name: str, replace_process: bool = True) -> bo
 def run_container(docker_cmd: list):
     """Replace this process with docker run (execvp)."""
     os.execvp("docker", docker_cmd)
+
+
+def _strip_host_hooks_from_settings(raw: bytes) -> bytes:
+    """Return settings JSON with the hooks key removed.
+
+    Host hook paths (e.g. /home/user/.claude/hooks/...) don't exist inside
+    containers, so we strip them before baking settings into images.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        data.pop("hooks", None)
+        return json.dumps(data, indent=2).encode("utf-8")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return raw
 
 
 def _hash_with_marker(hasher, marker: str, value):
@@ -1303,7 +1345,7 @@ def compute_build_context_hash(
         _hash_with_marker(
             hasher,
             "claude-default:settings.json",
-            settings_json.read_bytes() if settings_json.exists() else None,
+            _strip_host_hooks_from_settings(settings_json.read_bytes()) if settings_json.exists() else None,
         )
 
         check_monitoring_path = container_dir / "check_monitoring.sh"
@@ -1413,3 +1455,13 @@ def wait_for_running_container(name: str, timeout_seconds: float = 10.0) -> bool
             return True
         time.sleep(0.2)
     return is_container_running(name)
+
+
+def wait_for_container_removed(name: str, host: str = "", timeout_seconds: float = 15.0) -> bool:
+    """Wait for a container to disappear from docker ps -a (e.g. after --rm cleanup)."""
+    deadline = time.time() + max(timeout_seconds, 0.1)
+    while time.time() < deadline:
+        if not container_exists(name, host=host):
+            return True
+        time.sleep(0.2)
+    return not container_exists(name, host=host)
