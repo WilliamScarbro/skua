@@ -354,6 +354,20 @@ class TestDashboardJobs(unittest.TestCase):
 
         self.assertEqual("", _lock_block_message("demo", "build"))
 
+    @mock.patch("skua.commands.dashboard.project_busy_error_if_locked")
+    def test_lock_block_message_empty_when_adapting(self, mock_busy):
+        from skua.commands.dashboard import _lock_block_message
+        from skua.project_lock import ProjectBusyError
+
+        mock_busy.return_value = ProjectBusyError(
+            project_name="demo",
+            operation="adapting",
+            owner="host:1234",
+            acquired_at="2026-03-06T00:00:00+00:00",
+        )
+        self.assertEqual("", _lock_block_message("demo", "build"))
+        self.assertEqual("", _lock_block_message("demo", "remove"))
+
     def test_extract_lock_busy_error(self):
         from skua.commands.dashboard import _extract_lock_busy_error
 

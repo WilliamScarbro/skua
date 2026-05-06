@@ -525,6 +525,8 @@ def _lock_block_message(project_name: str, action_key: str) -> str:
     busy = project_busy_error_if_locked(ConfigStore(), project_name)
     if busy is None:
         return ""
+    if str(busy.operation or "").strip() == "adapting":
+        return ""
     return format_project_busy_error(busy, label)
 
 
