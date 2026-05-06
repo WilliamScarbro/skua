@@ -177,6 +177,23 @@ EOF
     chown dev:"$DEV_GROUP" /home/dev/.bashrc
 fi
 
+# tmux spawns new windows as login shells, which read ~/.profile (or
+# ~/.bash_profile) instead of ~/.bashrc. Without a .profile that sources
+# .bashrc, the second-and-later panes get a bare shell with no aliases,
+# no history persistence, and no prompt customizations. Seed it once.
+if [ ! -f /home/dev/.profile ] && [ ! -f /home/dev/.bash_profile ]; then
+    if [ -f /etc/skel/.profile ]; then
+        cp /etc/skel/.profile /home/dev/.profile
+    else
+        cat > /home/dev/.profile <<'EOF'
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+EOF
+    fi
+    chown dev:"$DEV_GROUP" /home/dev/.profile
+fi
+
 ensure_bash_alias() {
     alias_line="$1"
     if ! grep -Fqx "$alias_line" /home/dev/.bashrc 2>/dev/null; then
