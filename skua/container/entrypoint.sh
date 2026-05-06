@@ -122,6 +122,30 @@ if [ "$AUTH_DIR_REL" = ".claude" ] && [ -d "$SKUA_DEFAULTS_DIR/claude-settings" 
     done
 fi
 
+# ── Strip host hook paths from persisted Claude settings ────────────
+# Settings copied from the host (or baked into older images) reference
+# host paths like /home/<user>/.claude/hooks/* that don't exist in the
+# container, causing Claude to log "Failed with non-blocking status code"
+# on every tool call. Drop the hooks key from any persisted settings on
+# every start so stale volumes self-heal.
+if [ "$AUTH_DIR_REL" = ".claude" ] && command -v jq >/dev/null 2>&1; then
+    for fname in settings.json settings.local.json; do
+        target="${AUTH_DIR}/${fname}"
+        [ -f "$target" ] || continue
+        tmp_settings="$(mktemp)"
+        if jq 'del(.hooks)' "$target" > "$tmp_settings" 2>/dev/null; then
+            if ! cmp -s "$target" "$tmp_settings"; then
+                mv "$tmp_settings" "$target"
+                echo "[--] Removed host hook paths from ${fname}"
+            else
+                rm -f "$tmp_settings"
+            fi
+        else
+            rm -f "$tmp_settings"
+        fi
+    done
+fi
+
 # ── Symlink ~/.claude.json into the persistent volume ────────────────
 # Claude Code reads/writes ~/.claude.json (account metadata, onboarding
 # state, etc.) which lives OUTSIDE ~/.claude/. We store the real file
