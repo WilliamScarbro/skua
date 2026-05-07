@@ -59,7 +59,7 @@ from skua.docker import (
     resolve_project_image_inputs,
 )
 from skua.project_lock import format_project_busy_error, project_busy_error_if_locked
-from skua.usage import agent_usage_summary, format_burn_rate, format_cost, format_remaining, format_tokens
+from skua.usage import agent_usage_summary, format_tokens, render_bar
 from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
 
 _OSC52_MAX_BYTES = 100_000
@@ -2313,7 +2313,17 @@ def cmd_dashboard(args):
             lines = []
             for agent_name in ("claude", "codex"):
                 entry = data.get(agent_name) or {}
-                lines.append(self._format_usage_line(agent_name, entry))
+                if not entry:
+                    lines.append(self._usage_status_line(agent_name, "(no data)", style="dim"))
+                    continue
+                if not entry.get("ok", False):
+                    lines.append(self._usage_status_line(
+                        agent_name, entry.get("error") or "unavailable", style="red"))
+                    continue
+                windows = entry.get("windows") or {}
+                lines.append(self._format_usage_bar(agent_name, "5h", windows.get("5h")))
+                lines.append(self._format_usage_bar(agent_name, "7d", windows.get("7d")))
+
             body = Text()
             for idx, line in enumerate(lines):
                 body.append_text(line)
@@ -2321,34 +2331,43 @@ def cmd_dashboard(args):
                     body.append("\n")
             return Group(header, body)
 
-        def _format_usage_line(self, agent_name: str, entry: dict):
-            label_style = "bold cyan" if agent_name == "claude" else "bold magenta"
+        def _agent_label_style(self, agent_name: str) -> str:
+            return "bold cyan" if agent_name == "claude" else "bold magenta"
+
+        def _usage_status_line(self, agent_name: str, message: str, style: str = "dim"):
             line = Text()
-            line.append(f"{agent_name:<6} ", style=label_style)
-            if not entry:
-                line.append("(no data)", style="dim")
-                return line
-            if not entry.get("ok", False):
-                line.append(entry.get("error") or "unavailable", style="red")
-                return line
-            tokens = int(entry.get("tokens") or 0)
-            if tokens == 0 and entry.get("no_active"):
-                line.append("idle (no active block)", style="dim")
-                return line
-            line.append(f"{format_tokens(tokens):>8} tokens", style="white")
-            cost = float(entry.get("cost_usd") or 0.0)
-            if cost > 0:
-                line.append(f"  {format_cost(cost):>8}", style="white")
-            burn = float(entry.get("burn_rate_tpm") or 0.0)
-            if burn > 0:
-                line.append(f"  burn {format_burn_rate(burn)}", style="dim")
-            remaining = int(entry.get("remaining_minutes") or 0)
-            if remaining > 0:
-                line.append(f"  resets in {format_remaining(remaining)}", style="dim")
-            window_h = entry.get("window_hours")
-            if window_h and not remaining:
-                line.append(f"  ({window_h}h window)", style="dim")
+            line.append(f"{agent_name:<7}", style=self._agent_label_style(agent_name))
+            line.append("       ")
+            line.append(message, style=style)
             return line
+
+        def _format_usage_bar(self, agent_name: str, window: str, window_data):
+            window_data = window_data or {}
+            total = int(window_data.get("total_tokens") or 0)
+            limit = int(window_data.get("limit") or 0)
+            fraction = float(window_data.get("fraction") or 0.0)
+            width = self._usage_bar_width()
+            bar_text = render_bar(fraction, width)
+            pct = int(round(min(1.0, fraction) * 100))
+            bar_style = self._usage_bar_style(fraction)
+            line = Text()
+            line.append(f"{agent_name:<7}", style=self._agent_label_style(agent_name))
+            line.append(f"{window:<3} ", style="white")
+            line.append(bar_text, style=bar_style)
+            line.append(f"  {format_tokens(total)}/{format_tokens(limit)} ({pct:>3}%)", style="white")
+            return line
+
+        def _usage_bar_width(self) -> int:
+            term_w = max(40, (getattr(self, "size", None).width or 80))
+            # Reserve room for label + counts (about 32 chars).
+            return max(8, min(40, term_w - 32))
+
+        def _usage_bar_style(self, fraction: float) -> str:
+            if fraction >= 0.90:
+                return "bold red"
+            if fraction >= 0.70:
+                return "yellow"
+            return "green"
 
         def _sync_selected_project_from_widget(self, row: int | None) -> None:
             if self._suspend_project_widget_sync or not isinstance(row, int):

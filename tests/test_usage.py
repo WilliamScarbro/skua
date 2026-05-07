@@ -2,9 +2,10 @@
 """Tests for skua.usage agent usage helpers."""
 
 import json
-import subprocess
+import os
 import sys
 import tempfile
+import time as _time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,18 +15,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from skua import usage
 
 
-def _ccusage_payload(**overrides) -> str:
-    block = {
-        "id": "2026-05-07T16:00:00.000Z",
-        "isActive": True,
-        "totalTokens": 8_790_260,
-        "costUSD": 6.9238,
-        "burnRate": {"tokensPerMinute": 35987.7},
-        "projection": {"totalTokens": 10_640_129, "totalCost": 8.38, "remainingMinutes": 51},
-        "models": ["claude-opus-4-7"],
-    }
-    block.update(overrides)
-    return json.dumps({"blocks": [block]})
+def _claude_assistant_line(*, ts: str, input_t=10, output_t=5, cache_create=2, cache_read=3):
+    return json.dumps({
+        "timestamp": ts,
+        "type": "assistant",
+        "message": {
+            "model": "claude-opus-4-7",
+            "usage": {
+                "input_tokens": input_t,
+                "output_tokens": output_t,
+                "cache_creation_input_tokens": cache_create,
+                "cache_read_input_tokens": cache_read,
+            },
+        },
+    })
+
+
+def _codex_token_count_line(*, ts, input_t=10, output_t=5, cached=0):
+    return json.dumps({
+        "timestamp": ts,
+        "type": "token_count",
+        "info": {
+            "total_token_usage": {
+                "input_tokens": input_t,
+                "output_tokens": output_t,
+                "cached_input_tokens": cached,
+            },
+        },
+    })
+
+
+def _iso(ts_seconds: float) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class TestFormatters(unittest.TestCase):
@@ -35,20 +57,13 @@ class TestFormatters(unittest.TestCase):
         self.assertEqual(usage.format_tokens(1500), "1.5k")
         self.assertEqual(usage.format_tokens(8_790_260), "8.79M")
 
-    def test_format_cost_pads_to_two_decimals(self):
-        self.assertEqual(usage.format_cost(0), "$0.00")
-        self.assertEqual(usage.format_cost(6.9238), "$6.92")
-        self.assertEqual(usage.format_cost(1234.5), "$1,234.50")
-
-    def test_format_remaining_handles_zero_and_hours(self):
-        self.assertEqual(usage.format_remaining(0), "—")
-        self.assertEqual(usage.format_remaining(45), "45m")
-        self.assertEqual(usage.format_remaining(125), "2h05m")
-
-    def test_format_burn_rate(self):
-        self.assertEqual(usage.format_burn_rate(0), "—")
-        self.assertEqual(usage.format_burn_rate(750), "750/min")
-        self.assertEqual(usage.format_burn_rate(35987.7), "36.0k/min")
+    def test_render_bar_proportional(self):
+        self.assertEqual(usage.render_bar(0, 10), "░" * 10)
+        self.assertEqual(usage.render_bar(1, 10), "█" * 10)
+        self.assertEqual(usage.render_bar(0.5, 10), "█" * 5 + "░" * 5)
+        # Out of range clamps.
+        self.assertEqual(usage.render_bar(1.5, 4), "█" * 4)
+        self.assertEqual(usage.render_bar(-0.5, 4), "░" * 4)
 
 
 class TestClaudeUsage(unittest.TestCase):
@@ -58,54 +73,82 @@ class TestClaudeUsage(unittest.TestCase):
     def tearDown(self):
         usage.clear_cache()
 
-    def test_parses_active_block(self):
-        proc = mock.Mock(returncode=0, stdout=_ccusage_payload(), stderr="")
-        with mock.patch("skua.usage.subprocess.run", return_value=proc):
-            result = usage.claude_usage()
+    def test_returns_error_when_dir_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = Path(tmp) / "missing"
+            with mock.patch("skua.usage._claude_projects_dir", return_value=absent):
+                result = usage.claude_usage()
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
+
+    def test_buckets_into_5h_and_7d(self):
+        now = _time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / "p1"
+            projects.mkdir(parents=True)
+            jsonl = projects / "session.jsonl"
+            lines = [
+                _claude_assistant_line(ts=_iso(now - 60), input_t=100, output_t=50,
+                                       cache_create=20, cache_read=30),
+                _claude_assistant_line(ts=_iso(now - 4 * 3600), input_t=200, output_t=80,
+                                       cache_create=0, cache_read=0),
+                _claude_assistant_line(ts=_iso(now - 6 * 3600), input_t=400, output_t=160,
+                                       cache_create=0, cache_read=0),
+                _claude_assistant_line(ts=_iso(now - 9 * 24 * 3600), input_t=99999,
+                                       output_t=99999, cache_create=0, cache_read=0),
+            ]
+            jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with mock.patch("skua.usage._claude_projects_dir", return_value=projects.parent):
+                result = usage.claude_usage()
+        self.assertTrue(result["ok"], result)
+        w5 = result["windows"]["5h"]
+        w7 = result["windows"]["7d"]
+        # 5h: only the first two events qualify (within 5h)
+        self.assertEqual(w5["input_tokens"], 100 + 200)
+        self.assertEqual(w5["output_tokens"], 50 + 80)
+        self.assertEqual(w5["cached_tokens"], 20 + 30)
+        # 7d: includes the 6h-old one too, excludes the 9-day-old one
+        self.assertEqual(w7["input_tokens"], 100 + 200 + 400)
+        self.assertEqual(w7["output_tokens"], 50 + 80 + 160)
+        self.assertEqual(w7["cached_tokens"], 20 + 30)
+        # fraction is bounded
+        self.assertGreaterEqual(w5["fraction"], 0.0)
+        self.assertLessEqual(w5["fraction"], 1.0)
+
+    def test_skips_lines_without_usage_or_timestamp(self):
+        now = _time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects" / "p"
+            projects.mkdir(parents=True)
+            jsonl = projects / "session.jsonl"
+            jsonl.write_text(
+                "\n".join([
+                    json.dumps({"type": "user", "timestamp": _iso(now)}),
+                    "not json",
+                    _claude_assistant_line(ts=_iso(now), input_t=7, output_t=3,
+                                           cache_create=0, cache_read=0),
+                    json.dumps({"message": {"usage": {"input_tokens": 1}}}),  # no timestamp
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch("skua.usage._claude_projects_dir", return_value=projects.parent):
+                result = usage.claude_usage()
         self.assertTrue(result["ok"])
-        self.assertEqual(result["tokens"], 8_790_260)
-        self.assertAlmostEqual(result["cost_usd"], 6.9238)
-        self.assertEqual(result["remaining_minutes"], 51)
-        self.assertAlmostEqual(result["burn_rate_tpm"], 35987.7)
-        self.assertEqual(result["models"], ["claude-opus-4-7"])
-
-    def test_no_active_block(self):
-        proc = mock.Mock(returncode=0, stdout=json.dumps({"blocks": []}), stderr="")
-        with mock.patch("skua.usage.subprocess.run", return_value=proc):
-            result = usage.claude_usage()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["tokens"], 0)
-        self.assertTrue(result.get("no_active"))
-
-    def test_missing_npx_returns_error_stub(self):
-        with mock.patch("skua.usage.subprocess.run", side_effect=FileNotFoundError):
-            result = usage.claude_usage()
-        self.assertFalse(result["ok"])
-        self.assertIn("npx", result["error"].lower())
-
-    def test_ccusage_timeout(self):
-        with mock.patch(
-            "skua.usage.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="npx", timeout=1),
-        ):
-            result = usage.claude_usage()
-        self.assertFalse(result["ok"])
-        self.assertIn("timed out", result["error"])
-
-    def test_garbage_output_handled(self):
-        proc = mock.Mock(returncode=0, stdout="not json", stderr="")
-        with mock.patch("skua.usage.subprocess.run", return_value=proc):
-            result = usage.claude_usage()
-        self.assertFalse(result["ok"])
-        self.assertIn("parseable", result["error"])
+        self.assertEqual(result["windows"]["5h"]["total_tokens"], 10)
 
     def test_results_are_cached(self):
-        proc = mock.Mock(returncode=0, stdout=_ccusage_payload(), stderr="")
-        with mock.patch("skua.usage.subprocess.run", return_value=proc) as run:
-            usage.claude_usage()
-            usage.claude_usage()
-            usage.claude_usage()
-        self.assertEqual(run.call_count, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp) / "projects"
+            projects.mkdir()
+            with mock.patch("skua.usage._claude_projects_dir", return_value=projects) as patched:
+                usage.claude_usage()
+                usage.claude_usage()
+                usage.claude_usage()
+            self.assertEqual(patched.call_count, 1)
+
+    def test_env_override_changes_limit(self):
+        with mock.patch.dict(os.environ, {"SKUA_USAGE_LIMIT_CLAUDE_5H": "1000"}):
+            self.assertEqual(usage.usage_limit("claude", "5h"), 1000)
 
 
 class TestCodexUsage(unittest.TestCase):
@@ -115,97 +158,40 @@ class TestCodexUsage(unittest.TestCase):
     def tearDown(self):
         usage.clear_cache()
 
-    def _write_rollout(self, dir_path: Path, lines: list[str]) -> Path:
-        path = dir_path / "rollout-2026-05-07.jsonl"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return path
-
     def test_returns_error_when_codex_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch("skua.usage._codex_sessions_dir", return_value=Path(tmp) / "absent"):
+            absent = Path(tmp) / "absent"
+            with mock.patch("skua.usage._codex_sessions_dir", return_value=absent):
                 result = usage.codex_usage()
         self.assertFalse(result["ok"])
-        self.assertIn("codex", result["error"].lower())
+        self.assertIn("not found", result["error"])
 
     def test_aggregates_token_count_events(self):
+        now = _time.time()
         with tempfile.TemporaryDirectory() as tmp:
             sessions = Path(tmp) / "sessions"
             sessions.mkdir()
-            self._write_rollout(
-                sessions,
-                [
-                    json.dumps({
-                        "type": "token_count",
-                        "info": {
-                            "total_token_usage": {
-                                "input_tokens": 1000,
-                                "output_tokens": 500,
-                                "cached_input_tokens": 200,
-                            },
-                        },
-                    }),
-                    json.dumps({"type": "ignore_me"}),
-                    json.dumps({
-                        "event": {
-                            "type": "token_count",
-                            "usage": {"input_tokens": 50, "output_tokens": 25},
-                        }
-                    }),
-                ],
+            (sessions / "rollout.jsonl").write_text(
+                "\n".join([
+                    _codex_token_count_line(ts=_iso(now - 30), input_t=1000,
+                                            output_t=500, cached=200),
+                    _codex_token_count_line(ts=_iso(now - 6 * 3600), input_t=300,
+                                            output_t=100, cached=0),
+                    _codex_token_count_line(ts=_iso(now - 8 * 24 * 3600), input_t=99,
+                                            output_t=99, cached=0),
+                ]) + "\n",
+                encoding="utf-8",
             )
             with mock.patch("skua.usage._codex_sessions_dir", return_value=sessions):
                 result = usage.codex_usage()
         self.assertTrue(result["ok"])
-        self.assertEqual(result["tokens"], 1000 + 500 + 50 + 25)
-        self.assertEqual(result["input_tokens"], 1050)
-        self.assertEqual(result["output_tokens"], 525)
-        self.assertEqual(result["cached_tokens"], 200)
-        self.assertEqual(result["window_hours"], 5)
-
-    def test_skips_files_outside_window(self):
-        import os
-        import time as _time
-
-        with tempfile.TemporaryDirectory() as tmp:
-            sessions = Path(tmp) / "sessions"
-            sessions.mkdir()
-            stale = self._write_rollout(
-                sessions,
-                [
-                    json.dumps({
-                        "type": "token_count",
-                        "info": {"total_token_usage": {"input_tokens": 999, "output_tokens": 999}},
-                    }),
-                ],
-            )
-            old = _time.time() - (24 * 3600)
-            os.utime(stale, (old, old))
-            with mock.patch("skua.usage._codex_sessions_dir", return_value=sessions):
-                result = usage.codex_usage()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["tokens"], 0)
-        self.assertTrue(result.get("no_active"))
-
-    def test_malformed_lines_are_skipped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            sessions = Path(tmp) / "sessions"
-            sessions.mkdir()
-            self._write_rollout(
-                sessions,
-                [
-                    "not json",
-                    "",
-                    json.dumps({
-                        "type": "token_count",
-                        "input_tokens": 7,
-                        "output_tokens": 3,
-                    }),
-                ],
-            )
-            with mock.patch("skua.usage._codex_sessions_dir", return_value=sessions):
-                result = usage.codex_usage()
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["tokens"], 10)
+        w5 = result["windows"]["5h"]
+        w7 = result["windows"]["7d"]
+        self.assertEqual(w5["input_tokens"], 1000)
+        self.assertEqual(w5["output_tokens"], 500)
+        self.assertEqual(w5["cached_tokens"], 200)
+        self.assertEqual(w7["input_tokens"], 1000 + 300)
+        self.assertEqual(w7["output_tokens"], 500 + 100)
 
 
 class TestAgentUsageSummary(unittest.TestCase):
@@ -216,14 +202,17 @@ class TestAgentUsageSummary(unittest.TestCase):
         usage.clear_cache()
 
     def test_summary_returns_both_agents(self):
-        proc = mock.Mock(returncode=0, stdout=_ccusage_payload(), stderr="")
-        with mock.patch("skua.usage.subprocess.run", return_value=proc), \
-             mock.patch("skua.usage._codex_sessions_dir", return_value=Path("/no/such/path")):
+        with mock.patch("skua.usage._claude_projects_dir", return_value=Path("/no/such")), \
+             mock.patch("skua.usage._codex_sessions_dir", return_value=Path("/no/such")):
             data = usage.agent_usage_summary()
         self.assertIn("claude", data)
         self.assertIn("codex", data)
-        self.assertTrue(data["claude"]["ok"])
+        self.assertFalse(data["claude"]["ok"])
         self.assertFalse(data["codex"]["ok"])
+        # Even on error, window stubs are present so the renderer works.
+        for agent in ("claude", "codex"):
+            self.assertIn("5h", data[agent]["windows"])
+            self.assertIn("7d", data[agent]["windows"])
 
 
 if __name__ == "__main__":

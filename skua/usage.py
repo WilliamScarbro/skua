@@ -1,25 +1,38 @@
 # SPDX-License-Identifier: BUSL-1.1
-"""Local usage trackers for agent CLIs (claude, codex)."""
+"""Local usage trackers for agent CLIs (claude, codex).
+
+Parses local JSONL transcripts directly (no ccusage / network), producing
+two windowed totals per agent: a rolling 5-hour block and a rolling 7-day
+window. Designed for the dashboard's once-per-minute refresh.
+"""
 
 import json
 import os
-import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Cache fetched usage values for this many seconds. The dashboard schedules
-# a refresh once per minute, so a TTL just under that avoids redundant work
-# when several refresh paths fire close together.
+# a refresh once per minute, so a TTL just under that avoids redundant work.
 USAGE_CACHE_TTL_SECONDS = 55.0
 
-# Hard caps so a misbehaving CLI cannot stall the dashboard refresh thread.
-_CCUSAGE_TIMEOUT_SECONDS = 8.0
-_CODEX_PARSE_BUDGET_SECONDS = 1.5
+# Hard cap on JSONL parsing per fetch so one runaway session can't stall
+# the dashboard refresh thread. The 7-day window can touch many files.
+_PARSE_BUDGET_SECONDS = 2.5
 
-# Codex doesn't expose a billing-block window; we approximate by aggregating
-# the most recent five hours of rollouts, matching ccusage's claude window.
-_CODEX_WINDOW_SECONDS = 5 * 60 * 60
+WINDOW_5H_SECONDS = 5 * 60 * 60
+WINDOW_7D_SECONDS = 7 * 24 * 60 * 60
+
+# Default token caps used to render progress bars. These mirror typical
+# Claude Max / equivalent plan ceilings; users can override via env vars
+# SKUA_USAGE_LIMIT_<AGENT>_<WINDOW>.
+_DEFAULT_LIMITS = {
+    ("claude", "5h"): 50_000_000,
+    ("claude", "7d"): 1_000_000_000,
+    ("codex", "5h"): 10_000_000,
+    ("codex", "7d"): 200_000_000,
+}
 
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict = {}
@@ -43,84 +56,35 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
+def usage_limit(agent: str, window: str) -> int:
+    """Return the configured token cap for a (agent, window) pair."""
+    env_key = f"SKUA_USAGE_LIMIT_{agent.upper()}_{window.upper()}"
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_LIMITS.get((agent, window), 10_000_000)
+
+
+# ── claude (parses ~/.claude/projects) ───────────────────────────────────
+
+
+def _claude_projects_dir() -> Path:
+    home = os.environ.get("CLAUDE_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "projects"
+    return Path.home() / ".claude" / "projects"
+
+
 def claude_usage() -> dict:
-    """Return current Claude billing-block usage via ccusage, or an error stub.
-
-    Result shape:
-      {
-        "ok": bool,
-        "tokens": int,            # total tokens in the active 5h block
-        "cost_usd": float,
-        "burn_rate_tpm": float,   # tokens/minute
-        "remaining_minutes": int, # minutes left in the active block
-        "projection_tokens": int,
-        "projection_cost_usd": float,
-        "error": str,             # populated when ok is False
-      }
-    """
-    return _cached("claude", USAGE_CACHE_TTL_SECONDS, _fetch_claude_usage)
+    """Return windowed Claude token usage parsed from local transcripts."""
+    return _cached("claude", USAGE_CACHE_TTL_SECONDS,
+                   lambda: _scan_jsonl(_claude_projects_dir(), _extract_claude_usage, "claude"))
 
 
-def codex_usage() -> dict:
-    """Return Codex token usage aggregated from local rollouts.
-
-    Result shape mirrors ``claude_usage`` but only fields derivable from the
-    local JSONL are populated; ``cost_usd`` is reported when codex emits one.
-    """
-    return _cached("codex", USAGE_CACHE_TTL_SECONDS, _fetch_codex_usage)
-
-
-def agent_usage_summary() -> dict:
-    """Convenience: return a {agent_name: usage_dict} mapping for the dashboard."""
-    return {"claude": claude_usage(), "codex": codex_usage()}
-
-
-# ── claude (ccusage) ─────────────────────────────────────────────────────
-
-
-def _fetch_claude_usage() -> dict:
-    cmd = ["npx", "-y", "--quiet", "ccusage", "blocks", "--active", "--json", "-O"]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=_CCUSAGE_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        return _err("npx not installed; install Node.js to enable claude usage")
-    except subprocess.TimeoutExpired:
-        return _err("ccusage timed out")
-
-    if proc.returncode != 0:
-        first_line = (proc.stderr or proc.stdout or "").strip().splitlines()[:1]
-        detail = first_line[0] if first_line else f"exit {proc.returncode}"
-        return _err(f"ccusage failed: {detail}")
-
-    try:
-        data = json.loads(proc.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return _err("ccusage output not parseable")
-
-    blocks = data.get("blocks") or []
-    if not blocks:
-        return _ok(tokens=0, cost_usd=0.0, no_active=True)
-
-    block = blocks[0]
-    burn = block.get("burnRate") or {}
-    proj = block.get("projection") or {}
-    return _ok(
-        tokens=int(block.get("totalTokens") or 0),
-        cost_usd=float(block.get("costUSD") or 0.0),
-        burn_rate_tpm=float(burn.get("tokensPerMinute") or 0.0),
-        remaining_minutes=int(proj.get("remainingMinutes") or 0),
-        projection_tokens=int(proj.get("totalTokens") or 0),
-        projection_cost_usd=float(proj.get("totalCost") or 0.0),
-        models=list(block.get("models") or []),
-    )
-
-
-# ── codex (local rollouts) ───────────────────────────────────────────────
+# ── codex (parses ~/.codex/sessions) ─────────────────────────────────────
 
 
 def _codex_sessions_dir() -> Path:
@@ -130,34 +94,62 @@ def _codex_sessions_dir() -> Path:
     return Path.home() / ".codex" / "sessions"
 
 
-def _fetch_codex_usage() -> dict:
-    sessions = _codex_sessions_dir()
-    if not sessions.is_dir():
-        return _err("codex not installed (no ~/.codex/sessions)")
+def codex_usage() -> dict:
+    """Return windowed Codex token usage parsed from local rollouts."""
+    return _cached("codex", USAGE_CACHE_TTL_SECONDS,
+                   lambda: _scan_jsonl(_codex_sessions_dir(), _extract_codex_usage, "codex"))
 
-    cutoff = time.time() - _CODEX_WINDOW_SECONDS
-    deadline = time.monotonic() + _CODEX_PARSE_BUDGET_SECONDS
 
-    input_t = 0
-    output_t = 0
-    cached_t = 0
+def agent_usage_summary() -> dict:
+    """Return ``{agent: usage}`` for both supported agents."""
+    return {"claude": claude_usage(), "codex": codex_usage()}
+
+
+# ── core scanner ─────────────────────────────────────────────────────────
+
+
+def _scan_jsonl(root: Path, extractor, agent_name: str) -> dict:
+    """Walk ``root`` for *.jsonl files, extract per-event token usage, and
+    bucket totals into the 5h and 7d windows.
+    """
+    if not root.is_dir():
+        return _err(agent_name, f"no usage data ({root} not found)")
+
+    now = time.time()
+    cutoff_5h = now - WINDOW_5H_SECONDS
+    cutoff_7d = now - WINDOW_7D_SECONDS
+    deadline = time.monotonic() + _PARSE_BUDGET_SECONDS
+
+    bucket_5h = {"input": 0, "output": 0, "cached": 0}
+    bucket_7d = {"input": 0, "output": 0, "cached": 0}
     files_seen = 0
     files_read = 0
+    truncated = False
 
-    for path in sessions.rglob("*.jsonl"):
+    try:
+        files = list(root.rglob("*.jsonl"))
+    except OSError as exc:
+        return _err(agent_name, f"scan failed: {exc}")
+
+    # Newest first so the 5h window converges quickly even when truncated.
+    files.sort(key=_safe_mtime, reverse=True)
+
+    for path in files:
         if time.monotonic() > deadline:
+            truncated = True
             break
         try:
-            stat = path.stat()
+            mtime = path.stat().st_mtime
         except OSError:
             continue
-        if stat.st_mtime < cutoff:
+        if mtime < cutoff_7d:
             continue
         files_seen += 1
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     if time.monotonic() > deadline:
+                        truncated = True
                         break
                     line = line.strip()
                     if not line or line[0] != "{":
@@ -166,53 +158,97 @@ def _fetch_codex_usage() -> dict:
                         obj = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    delta = _extract_codex_tokens(obj)
-                    if delta is None:
+                    extracted = extractor(obj)
+                    if extracted is None:
                         continue
-                    input_t += delta[0]
-                    output_t += delta[1]
-                    cached_t += delta[2]
+                    ts, (inp, out, cached) = extracted
+                    if ts is None or ts < cutoff_7d:
+                        continue
+                    bucket_7d["input"] += inp
+                    bucket_7d["output"] += out
+                    bucket_7d["cached"] += cached
+                    if ts >= cutoff_5h:
+                        bucket_5h["input"] += inp
+                        bucket_5h["output"] += out
+                        bucket_5h["cached"] += cached
         except OSError:
             continue
         files_read += 1
 
-    total = input_t + output_t
-    if files_seen == 0:
-        return _ok(tokens=0, cost_usd=0.0, no_active=True)
-
     return _ok(
-        tokens=total,
-        input_tokens=input_t,
-        output_tokens=output_t,
-        cached_tokens=cached_t,
-        files=files_read,
-        window_hours=_CODEX_WINDOW_SECONDS // 3600,
+        agent=agent_name,
+        windows={
+            "5h": _window_dict(agent_name, "5h", bucket_5h),
+            "7d": _window_dict(agent_name, "7d", bucket_7d),
+        },
+        files_seen=files_seen,
+        files_read=files_read,
+        truncated=truncated,
     )
 
 
-def _extract_codex_tokens(obj) -> tuple[int, int, int] | None:
-    """Pull (input, output, cached) token counts from a codex rollout entry.
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
-    Codex's rollout JSONL has evolved, so this tries several known shapes:
-      - {"type": "token_count", "info": {"total_token_usage": {...}}}
-      - {"type": "token_count", "input_tokens": ..., "output_tokens": ...}
-      - {"event": {"type": "token_count", ...}}
-      - {"usage": {"input_tokens": ..., "output_tokens": ...}}
-    """
+
+def _window_dict(agent: str, window: str, bucket: dict) -> dict:
+    inp = int(bucket.get("input", 0))
+    out = int(bucket.get("output", 0))
+    cached = int(bucket.get("cached", 0))
+    total = inp + out + cached
+    limit = usage_limit(agent, window)
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cached_tokens": cached,
+        "total_tokens": total,
+        "limit": limit,
+        "fraction": min(1.0, total / limit) if limit > 0 else 0.0,
+    }
+
+
+# ── claude extractor ─────────────────────────────────────────────────────
+
+
+def _extract_claude_usage(obj):
+    """Pull (timestamp, (input, output, cached)) from a Claude transcript line."""
     if not isinstance(obj, dict):
         return None
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    inp = _i(usage, "input_tokens")
+    out = _i(usage, "output_tokens")
+    cached = _i(usage, "cache_read_input_tokens") + _i(usage, "cache_creation_input_tokens")
+    if inp == 0 and out == 0 and cached == 0:
+        return None
+    ts = _parse_timestamp(obj.get("timestamp"))
+    return ts, (inp, out, cached)
 
+
+# ── codex extractor ──────────────────────────────────────────────────────
+
+
+def _extract_codex_usage(obj):
+    """Pull (timestamp, (input, output, cached)) from a Codex rollout line."""
+    if not isinstance(obj, dict):
+        return None
     candidates = [obj]
-    inner = obj.get("event")
-    if isinstance(inner, dict):
-        candidates.append(inner)
-    payload = obj.get("payload")
-    if isinstance(payload, dict):
-        candidates.append(payload)
+    for k in ("event", "payload"):
+        v = obj.get(k)
+        if isinstance(v, dict):
+            candidates.append(v)
 
     for cand in candidates:
         if not isinstance(cand, dict):
             continue
+
         if cand.get("type") not in ("token_count", "usage", None):
             continue
 
@@ -220,29 +256,28 @@ def _extract_codex_tokens(obj) -> tuple[int, int, int] | None:
         if isinstance(info, dict):
             usage = info.get("total_token_usage") or info.get("last_token_usage")
             if isinstance(usage, dict):
-                return _coerce_usage_triple(usage)
+                triple = _coerce_usage_triple(usage)
+                if triple:
+                    return _parse_timestamp(obj.get("timestamp")), triple
 
         usage = cand.get("usage")
         if isinstance(usage, dict):
-            return _coerce_usage_triple(usage)
+            triple = _coerce_usage_triple(usage)
+            if triple:
+                return _parse_timestamp(obj.get("timestamp")), triple
 
         if cand.get("type") == "token_count":
-            return _coerce_usage_triple(cand)
+            triple = _coerce_usage_triple(cand)
+            if triple:
+                return _parse_timestamp(obj.get("timestamp")), triple
 
     return None
 
 
-def _coerce_usage_triple(usage: dict) -> tuple[int, int, int] | None:
-    def _i(*keys):
-        for k in keys:
-            v = usage.get(k)
-            if isinstance(v, (int, float)):
-                return int(v)
-        return 0
-
-    inp = _i("input_tokens", "prompt_tokens", "input")
-    out = _i("output_tokens", "completion_tokens", "output")
-    cached = _i("cached_input_tokens", "cache_read_input_tokens", "cached_tokens")
+def _coerce_usage_triple(d: dict):
+    inp = _i(d, "input_tokens", "prompt_tokens", "input")
+    out = _i(d, "output_tokens", "completion_tokens", "output")
+    cached = _i(d, "cached_input_tokens", "cache_read_input_tokens", "cached_tokens")
     if inp == 0 and out == 0 and cached == 0:
         return None
     return inp, out, cached
@@ -251,35 +286,61 @@ def _coerce_usage_triple(usage: dict) -> tuple[int, int, int] | None:
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
-def _ok(**fields) -> dict:
-    base = {
+def _i(d: dict, *keys) -> int:
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)):
+            return int(v)
+    return 0
+
+
+def _parse_timestamp(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # ms → s heuristic: anything past year ~3000 is treated as ms
+        v = float(value)
+        return v / 1000.0 if v > 1e11 else v
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def _ok(*, agent: str, windows: dict, files_seen: int, files_read: int, truncated: bool) -> dict:
+    return {
         "ok": True,
-        "tokens": 0,
-        "cost_usd": 0.0,
-        "burn_rate_tpm": 0.0,
-        "remaining_minutes": 0,
-        "projection_tokens": 0,
-        "projection_cost_usd": 0.0,
+        "agent": agent,
+        "windows": windows,
+        "files_seen": files_seen,
+        "files_read": files_read,
+        "truncated": truncated,
         "error": "",
     }
-    base.update(fields)
-    return base
 
 
-def _err(message: str) -> dict:
+def _err(agent: str, message: str) -> dict:
+    blank = _window_dict(agent, "5h", {})
+    blank7 = _window_dict(agent, "7d", {})
     return {
         "ok": False,
-        "tokens": 0,
-        "cost_usd": 0.0,
-        "burn_rate_tpm": 0.0,
-        "remaining_minutes": 0,
-        "projection_tokens": 0,
-        "projection_cost_usd": 0.0,
+        "agent": agent,
+        "windows": {"5h": blank, "7d": blank7},
+        "files_seen": 0,
+        "files_read": 0,
+        "truncated": False,
         "error": message,
     }
 
 
-# ── formatting helpers (used by the dashboard) ───────────────────────────
+# ── formatting helpers ───────────────────────────────────────────────────
 
 
 def format_tokens(n: int) -> str:
@@ -291,24 +352,9 @@ def format_tokens(n: int) -> str:
     return str(n)
 
 
-def format_cost(usd: float) -> str:
-    return f"${float(usd or 0.0):,.2f}"
-
-
-def format_remaining(minutes: int) -> str:
-    minutes = int(minutes or 0)
-    if minutes <= 0:
-        return "—"
-    h, m = divmod(minutes, 60)
-    if h:
-        return f"{h}h{m:02d}m"
-    return f"{m}m"
-
-
-def format_burn_rate(tpm: float) -> str:
-    tpm = float(tpm or 0.0)
-    if tpm <= 0:
-        return "—"
-    if tpm >= 1000:
-        return f"{tpm / 1000:.1f}k/min"
-    return f"{tpm:.0f}/min"
+def render_bar(fraction: float, width: int) -> str:
+    """Return a unicode progress bar of ``width`` cells for [0, 1]."""
+    width = max(1, int(width))
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(fraction * width))
+    return "█" * filled + "░" * (width - filled)
