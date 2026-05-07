@@ -439,6 +439,52 @@ def _normalize_agent_install_commands(agent_name: str, commands: list) -> list:
     return normalized
 
 
+def _pin_agent_install_command(agent_name: str, command: str, version: str) -> str:
+    """Pin the agent's npm package to a specific version inside an install command.
+
+    The label baked into a built image is meaningful only when it matches the
+    actual binary inside the image. Floating installs (no `@<version>`) let
+    `npm install` pick whatever is "latest" at the moment Docker runs that RUN
+    layer, while the label is chosen earlier. Pinning ties them together: the
+    Dockerfile RUN line names the version explicitly, and the same value is
+    written to the label, so the build cannot drift between them.
+    """
+    if not version or not command:
+        return command
+    pkg = AGENT_VERSION_NPM_PACKAGES.get(str(agent_name or "").strip().lower(), "")
+    if not pkg or "npm install" not in command:
+        return command
+    if f"{pkg}@" in command:
+        return command  # already pinned
+    if pkg not in command:
+        return command
+    return command.replace(pkg, f"{pkg}@{version}")
+
+
+def _resolve_agent_versions(agent: AgentConfig = None, agents: list = None) -> dict:
+    """Return mapping of agent name -> resolved upstream client version.
+
+    Used to resolve floating versions once per build so the Dockerfile install
+    pin and the image label cannot disagree about what got installed.
+    """
+    versions = {}
+    names = []
+    if agent and getattr(agent, "name", ""):
+        names.append(str(agent.name).strip().lower())
+    for item in agents or []:
+        if item and getattr(item, "name", ""):
+            names.append(str(item.name).strip().lower())
+    seen = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        version = latest_agent_client_version(name)
+        if version:
+            versions[name] = version
+    return versions
+
+
 def _render_run_instruction(command: str) -> str:
     """Render a shell command as a valid Docker RUN instruction.
 
@@ -543,22 +589,21 @@ def latest_agent_client_version(agent_name: str) -> str:
     return version
 
 
-def _build_agent_version_labels(agent: AgentConfig = None, agents: list = None) -> dict:
-    """Return image labels that record resolved upstream client versions."""
-    labels = {}
-    names = []
-    if agent and getattr(agent, "name", ""):
-        names.append(str(agent.name).strip().lower())
-    for item in agents or []:
-        if item and getattr(item, "name", ""):
-            names.append(str(item.name).strip().lower())
+def _build_agent_version_labels(
+    agent: AgentConfig = None,
+    agents: list = None,
+    agent_versions: dict = None,
+) -> dict:
+    """Return image labels that record resolved upstream client versions.
 
-    seen = set()
-    for name in names:
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        version = latest_agent_client_version(name)
+    Pass `agent_versions` to reuse the same map that pins the install command
+    in the Dockerfile — that's the only way to guarantee the label matches the
+    binary actually installed inside the image.
+    """
+    if agent_versions is None:
+        agent_versions = _resolve_agent_versions(agent=agent, agents=agents)
+    labels = {}
+    for name, version in agent_versions.items():
         if version:
             labels[_agent_version_label_key(name)] = version
     return labels
@@ -613,6 +658,9 @@ def image_rebuild_needed(
     if container_dir is None:
         return False, False, ""
 
+    # Resolve once so the hash compare uses the same pinned version that the
+    # subsequent build will bake into the image (and into its label).
+    resolved_versions = _resolve_agent_versions(agent=agent) if not layer_on_base else None
     if not image_matches_build_context(
         image_name=image_name,
         container_dir=container_dir,
@@ -622,6 +670,7 @@ def image_rebuild_needed(
         extra_packages=extra_packages,
         extra_commands=extra_commands,
         layer_on_base=layer_on_base,
+        agent_versions=resolved_versions,
     ):
         return True, False, "build context changed"
 
@@ -704,6 +753,7 @@ def generate_dockerfile(
     base_image: str = "debian:bookworm-slim",
     extra_packages: list = None,
     extra_commands: list = None,
+    agent_versions: dict = None,
 ) -> str:
     """Generate a Dockerfile from configuration.
 
@@ -714,6 +764,12 @@ def generate_dockerfile(
         base_image: Base Docker image.
         extra_packages: Additional apt packages to install.
         extra_commands: Additional RUN commands to execute.
+        agent_versions: Optional map of agent name -> resolved upstream version
+            used to pin floating npm install commands. When provided, the
+            generated RUN line installs that exact version, which the caller
+            should also write into the matching `skua.agent.version.<name>`
+            label so the build cannot ship an image whose installed binary
+            disagrees with its label.
     """
     packages = list(CORE_PACKAGES)
 
@@ -743,16 +799,24 @@ def generate_dockerfile(
     pkg_line = " \\\n    ".join(unique_packages)
 
     # Agent install commands
+    versions_map = agent_versions or {}
+
+    def _pin_for(name: str, cmds: list) -> list:
+        ver = versions_map.get(str(name or "").strip().lower(), "")
+        return [_pin_agent_install_command(name, c, ver) for c in cmds]
+
     install_cmds = []
     if selected_agents:
         for a in selected_agents:
             if a.install.commands:
-                install_cmds.extend(_normalize_agent_install_commands(a.name, a.install.commands))
+                cmds = _normalize_agent_install_commands(a.name, a.install.commands)
             else:
-                install_cmds.extend(DEFAULT_AGENT_INSTALLS.get(a.name, []))
+                cmds = list(DEFAULT_AGENT_INSTALLS.get(a.name, []))
+            install_cmds.extend(_pin_for(a.name, cmds))
     else:
         default_name = (agent.name if agent and agent.name else "claude")
-        install_cmds = DEFAULT_AGENT_INSTALLS.get(default_name, DEFAULT_AGENT_INSTALLS.get("claude", []))
+        cmds = list(DEFAULT_AGENT_INSTALLS.get(default_name, DEFAULT_AGENT_INSTALLS.get("claude", [])))
+        install_cmds = _pin_for(default_name, cmds)
 
     # Deduplicate commands while preserving order
     seen_cmds = set()
@@ -912,6 +976,14 @@ def build_image(
 
     Uses container_dir for entrypoint.sh and default agent settings.
     """
+    # Resolve floating client versions once and reuse for the install pin, the
+    # build-context hash, and the version label. Doing it three independent
+    # times let the Dockerfile RUN line drift away from the label, which then
+    # forced a redundant follow-up "client update" rebuild.
+    resolved_versions = (
+        None if layer_on_base else _resolve_agent_versions(agent=agent, agents=agents)
+    )
+
     context_hash = compute_build_context_hash(
         container_dir=container_dir,
         security=security,
@@ -921,6 +993,7 @@ def build_image(
         extra_packages=extra_packages,
         extra_commands=extra_commands,
         layer_on_base=layer_on_base,
+        agent_versions=resolved_versions,
     )
 
     build_path = Path(tempfile.mkdtemp(prefix=".build-context-", dir=container_dir))
@@ -940,6 +1013,7 @@ def build_image(
                 base_image=base_image,
                 extra_packages=extra_packages,
                 extra_commands=extra_commands,
+                agent_versions=resolved_versions,
             )
         (build_path / "Dockerfile").write_text(dockerfile_content)
 
@@ -989,7 +1063,9 @@ def build_image(
             "--label", f"{MANAGED_IMAGE_LABEL}=true",
             "--label", f"{BUILD_CONTEXT_HASH_LABEL}={context_hash}",
         ]
-        version_labels = _build_agent_version_labels(agent=agent, agents=agents)
+        version_labels = _build_agent_version_labels(
+            agent=agent, agents=agents, agent_versions=resolved_versions
+        )
         for key, value in sorted(version_labels.items()):
             cmd.extend(["--label", f"{key}={value}"])
         cmd.extend(["-t", image_name, str(build_path)])
@@ -1310,6 +1386,7 @@ def compute_build_context_hash(
     extra_packages: list = None,
     extra_commands: list = None,
     layer_on_base: bool = False,
+    agent_versions: dict = None,
 ) -> str:
     """Compute deterministic hash for skua-managed Docker build context."""
     if layer_on_base:
@@ -1326,6 +1403,7 @@ def compute_build_context_hash(
             base_image=base_image,
             extra_packages=extra_packages,
             extra_commands=extra_commands,
+            agent_versions=agent_versions,
         )
     entrypoint_path = container_dir / "entrypoint.sh"
 
@@ -1425,6 +1503,7 @@ def image_matches_build_context(
     extra_packages: list = None,
     extra_commands: list = None,
     layer_on_base: bool = False,
+    agent_versions: dict = None,
 ) -> bool:
     """Return True when image label hash matches current generated build context."""
     expected_hash = compute_build_context_hash(
@@ -1436,6 +1515,7 @@ def image_matches_build_context(
         extra_packages=extra_packages,
         extra_commands=extra_commands,
         layer_on_base=layer_on_base,
+        agent_versions=agent_versions,
     )
     actual_hash = _image_label(image_name, BUILD_CONTEXT_HASH_LABEL)
     return bool(actual_hash) and actual_hash == expected_hash

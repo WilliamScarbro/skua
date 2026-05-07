@@ -426,6 +426,73 @@ class TestDockerfileAgentInstall(unittest.TestCase):
         self.assertIn("RUN set -eux; \\\n    mkdir -p /tmp/demo; \\\n    ln -sf /tmp/demo /tmp/demo-link", dockerfile)
         self.assertNotIn("\nln -sf /tmp/demo /tmp/demo-link\n", dockerfile)
 
+    def test_generate_dockerfile_pins_default_install_when_version_provided(self):
+        from skua.docker import generate_dockerfile
+
+        agent = AgentConfig(name="claude", install=AgentInstallSpec(commands=[]))
+        dockerfile = generate_dockerfile(agent=agent, agent_versions={"claude": "1.2.3"})
+        self.assertIn("@anthropic-ai/claude-code@1.2.3", dockerfile)
+
+    def test_generate_dockerfile_pins_configured_floating_install(self):
+        from skua.docker import generate_dockerfile
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /home/dev/.local @openai/codex"]),
+        )
+        dockerfile = generate_dockerfile(agent=agent, agent_versions={"codex": "0.42.1"})
+        self.assertIn("@openai/codex@0.42.1", dockerfile)
+
+    def test_generate_dockerfile_leaves_install_unpinned_without_version_map(self):
+        import re as _re
+        from skua.docker import generate_dockerfile
+
+        agent = AgentConfig(name="claude", install=AgentInstallSpec(commands=[]))
+        dockerfile = generate_dockerfile(agent=agent)
+        # No "@<version>" suffix on the package reference.
+        self.assertIsNotNone(_re.search(r"@anthropic-ai/claude-code(?!@)", dockerfile))
+
+    def test_generate_dockerfile_does_not_double_pin_already_pinned_install(self):
+        from skua.docker import generate_dockerfile
+
+        agent = AgentConfig(
+            name="codex",
+            install=AgentInstallSpec(commands=["npm install -g --prefix /usr/local @openai/codex@0.20.0"]),
+        )
+        dockerfile = generate_dockerfile(agent=agent, agent_versions={"codex": "0.21.0"})
+        self.assertIn("@openai/codex@0.20.0", dockerfile)
+        self.assertNotIn("@openai/codex@0.21.0", dockerfile)
+
+    def test_compute_build_context_hash_changes_when_pinned_version_changes(self):
+        from skua.docker import compute_build_context_hash
+
+        agent = AgentConfig(name="claude", install=AgentInstallSpec(commands=[]))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            container_dir = Path(tmpdir)
+            (container_dir / "entrypoint.sh").write_text("#!/bin/sh\n")
+            h1 = compute_build_context_hash(
+                container_dir=container_dir,
+                agent=agent,
+                agent_versions={"claude": "1.0.5"},
+            )
+            h2 = compute_build_context_hash(
+                container_dir=container_dir,
+                agent=agent,
+                agent_versions={"claude": "1.0.6"},
+            )
+        self.assertNotEqual(h1, h2)
+
+    def test_build_agent_version_labels_uses_provided_map_without_resolving(self):
+        from skua.docker import _build_agent_version_labels
+
+        agent = AgentConfig(name="claude")
+        with mock.patch("skua.docker.latest_agent_client_version") as mock_latest:
+            labels = _build_agent_version_labels(
+                agent=agent, agent_versions={"claude": "1.2.3"}
+            )
+        self.assertEqual({"skua.agent.version.claude": "1.2.3"}, labels)
+        mock_latest.assert_not_called()
+
     def test_resolve_project_image_inputs_layers_extra_project_customizations_on_agent_image(self):
         from skua.docker import resolve_project_image_inputs
 
