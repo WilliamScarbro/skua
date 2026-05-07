@@ -59,6 +59,7 @@ from skua.docker import (
     resolve_project_image_inputs,
 )
 from skua.project_lock import format_project_busy_error, project_busy_error_if_locked
+from skua.usage import agent_usage_summary, format_burn_rate, format_cost, format_remaining, format_tokens
 from skua.utils import find_ssh_keys, parse_ssh_config_hosts, select_option
 
 _OSC52_MAX_BYTES = 100_000
@@ -1794,6 +1795,9 @@ def cmd_dashboard(args):
             height: auto;
             max-height: 12;
         }
+        #usage-tracker {
+            height: auto;
+        }
         #project-detail-title {
             height: auto;
             display: none;
@@ -1899,6 +1903,9 @@ def cmd_dashboard(args):
             self._ui_log_path = self.jobs.jobs_dir / "dashboard-ui.log"
             self._resume_mask_until = 0.0
             self._quit_armed_until = 0.0
+            self._usage_data: dict = {}
+            self._usage_inflight = False
+            self._usage_lock = threading.Lock()
 
         def _log_ui_event(self, event: str, **fields) -> None:
             try:
@@ -1930,6 +1937,7 @@ def cmd_dashboard(args):
                 yield Static(id="project-summary")
                 yield Static(id="jobs-header")
                 yield DataTable(id="jobs-table")
+                yield Static(id="usage-tracker")
                 yield Static(id="project-detail-title")
                 yield DataTable(id="project-detail-table")
                 yield Static(id="dashboard-footer")
@@ -1944,8 +1952,10 @@ def cmd_dashboard(args):
                 self._init_jobs_table()
                 self._init_detail_table()
             self._request_refresh()
+            self._request_usage_refresh()
             if refresh_seconds > 0:
                 self.set_interval(refresh_seconds, self._request_refresh)
+            self.set_interval(60.0, self._request_usage_refresh)
 
         def _init_project_table(self) -> None:
             if not self._use_project_widget:
@@ -2274,6 +2284,71 @@ def cmd_dashboard(args):
                 except Exception:
                     pass
             self._detail_widget_visible = True
+
+        def _hide_usage_tracker(self, usage_tracker) -> None:
+            try:
+                usage_tracker.styles.display = "none"
+            except Exception:
+                pass
+            try:
+                usage_tracker.update(Text(""))
+            except Exception:
+                pass
+
+        def _show_usage_tracker(self, usage_tracker) -> None:
+            try:
+                usage_tracker.styles.display = "block"
+            except Exception:
+                pass
+            usage_tracker.update(self._render_usage_panel())
+
+        def _render_usage_panel(self):
+            data = self._usage_data or {}
+            header = self._section_header("Usage")
+            if not data:
+                return Group(header, Text("collecting usage…", style="dim"))
+            if "_error" in data:
+                return Group(header, Text(f"usage refresh failed: {data['_error']}", style="red"))
+
+            lines = []
+            for agent_name in ("claude", "codex"):
+                entry = data.get(agent_name) or {}
+                lines.append(self._format_usage_line(agent_name, entry))
+            body = Text()
+            for idx, line in enumerate(lines):
+                body.append_text(line)
+                if idx < len(lines) - 1:
+                    body.append("\n")
+            return Group(header, body)
+
+        def _format_usage_line(self, agent_name: str, entry: dict):
+            label_style = "bold cyan" if agent_name == "claude" else "bold magenta"
+            line = Text()
+            line.append(f"{agent_name:<6} ", style=label_style)
+            if not entry:
+                line.append("(no data)", style="dim")
+                return line
+            if not entry.get("ok", False):
+                line.append(entry.get("error") or "unavailable", style="red")
+                return line
+            tokens = int(entry.get("tokens") or 0)
+            if tokens == 0 and entry.get("no_active"):
+                line.append("idle (no active block)", style="dim")
+                return line
+            line.append(f"{format_tokens(tokens):>8} tokens", style="white")
+            cost = float(entry.get("cost_usd") or 0.0)
+            if cost > 0:
+                line.append(f"  {format_cost(cost):>8}", style="white")
+            burn = float(entry.get("burn_rate_tpm") or 0.0)
+            if burn > 0:
+                line.append(f"  burn {format_burn_rate(burn)}", style="dim")
+            remaining = int(entry.get("remaining_minutes") or 0)
+            if remaining > 0:
+                line.append(f"  resets in {format_remaining(remaining)}", style="dim")
+            window_h = entry.get("window_hours")
+            if window_h and not remaining:
+                line.append(f"  ({window_h}h window)", style="dim")
+            return line
 
         def _sync_selected_project_from_widget(self, row: int | None) -> None:
             if self._suspend_project_widget_sync or not isinstance(row, int):
@@ -2616,6 +2691,27 @@ def cmd_dashboard(args):
                 self.call_from_thread(self._apply_snapshot, snapshot)
             except Exception as exc:  # pragma: no cover - defensive runtime guard
                 self.call_from_thread(self._apply_refresh_error, f"{type(exc).__name__}: {exc}")
+
+        def _request_usage_refresh(self) -> None:
+            with self._usage_lock:
+                if self._usage_inflight:
+                    return
+                self._usage_inflight = True
+            thread = threading.Thread(target=self._usage_worker, daemon=True)
+            thread.start()
+
+        def _usage_worker(self) -> None:
+            try:
+                data = agent_usage_summary()
+            except Exception as exc:  # pragma: no cover - defensive runtime guard
+                data = {"_error": f"{type(exc).__name__}: {exc}"}
+            self.call_from_thread(self._apply_usage, data)
+
+        def _apply_usage(self, data: dict) -> None:
+            with self._usage_lock:
+                self._usage_inflight = False
+            self._usage_data = data
+            self._refresh_view()
 
         def _apply_refresh_error(self, detail: str) -> None:
             with self._refresh_lock:
@@ -4089,6 +4185,8 @@ def cmd_dashboard(args):
                     Text(""),
                     self._section_header("Jobs"),
                     jobs_table,
+                    Text(""),
+                    self._render_usage_panel(),
                 ]
             )
             view.update(Group(*content))
@@ -4099,6 +4197,7 @@ def cmd_dashboard(args):
             project_summary = self.query_one("#project-summary", Static)
             jobs_header = self.query_one("#jobs-header", Static)
             jobs_table_view = self.query_one("#jobs-table")
+            usage_tracker = self.query_one("#usage-tracker", Static)
             footer = self.query_one("#dashboard-footer", Static)
             status_bar = self.query_one("#status-bar", Static)
             title = self._render_header_line("skua dashboard", f"auto-refresh: {refresh_label}")
@@ -4158,6 +4257,7 @@ def cmd_dashboard(args):
                     jobs_table_view.styles.display = "none"
                 except Exception:
                     pass
+                self._hide_usage_tracker(usage_tracker)
                 try:
                     footer.styles.display = "none"
                 except Exception:
@@ -4195,6 +4295,7 @@ def cmd_dashboard(args):
                     jobs_table_view.styles.display = "none"
                 except Exception:
                     pass
+                self._hide_usage_tracker(usage_tracker)
                 try:
                     footer.styles.display = "block"
                 except Exception:
@@ -4204,6 +4305,7 @@ def cmd_dashboard(args):
                 return
 
             if self.show_project_detail:
+                self._hide_usage_tracker(usage_tracker)
                 self._refresh_project_detail_widgets(
                     title=title,
                     focus_line=focus_line,
@@ -4264,6 +4366,7 @@ def cmd_dashboard(args):
                     jobs_table_view.styles.display = "none"
                 except Exception:
                     pass
+                self._hide_usage_tracker(usage_tracker)
                 try:
                     footer.styles.display = "none"
                 except Exception:
@@ -4324,6 +4427,7 @@ def cmd_dashboard(args):
             if self._jobs_table_sig != (("JOBS", "ACTION", "PROJECT", "STATUS", "AGE", "EXIT"), jobs_sig):
                 self._rebuild_jobs_table(jobs_view)
             self._set_jobs_cursor(self.selected_job)
+            self._show_usage_tracker(usage_tracker)
             footer.update(Text(""))
 
         def _render_header_line(self, left: str, right: str) -> Text:
